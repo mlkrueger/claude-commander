@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+use crate::claude::context;
 use crate::event::Event;
 use crate::pty::detector::PromptDetector;
 
@@ -31,6 +32,7 @@ pub struct Session {
     pub last_activity: Instant,
     pub needs_attention: bool,
     pub pty_size: PtySize,
+    pub context_percent: Option<f64>,
 }
 
 impl Session {
@@ -107,6 +109,7 @@ impl Session {
             last_activity: Instant::now(),
             needs_attention: false,
             pty_size,
+            context_percent: None,
         })
     }
 
@@ -154,6 +157,15 @@ impl Session {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         self.status = SessionStatus::Exited(-1);
+    }
+
+    pub fn refresh_context(&mut self) {
+        if matches!(self.status, SessionStatus::Exited(_)) {
+            return;
+        }
+        if let Some(pid) = self.child.process_id() {
+            self.context_percent = context::get_context_percent(pid);
+        }
     }
 
     pub fn elapsed_since_activity(&self) -> std::time::Duration {

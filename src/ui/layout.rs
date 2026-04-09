@@ -3,6 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 pub struct AppLayout {
     pub file_tree: Rect,
     pub main: Rect,
+    pub usage_graph: Rect,
     pub command_bar: Rect,
 }
 
@@ -24,9 +25,19 @@ impl AppLayout {
             ])
             .split(vert[0]);
 
+        // Split main area: session list on top, usage graph on bottom
+        let main_split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),     // session list (takes most space)
+                Constraint::Length(13), // usage graph + rate limit gauges
+            ])
+            .split(horiz[1]);
+
         Self {
             file_tree: horiz[0],
-            main: horiz[1],
+            main: main_split[0],
+            usage_graph: main_split[1],
             command_bar: vert[1],
         }
     }

@@ -3,3 +3,4 @@ pub mod editor;
 pub mod file_tree;
 pub mod session_list;
 pub mod session_view;
+pub mod usage_graph;
