@@ -15,12 +15,14 @@ use crate::ui::panels::command_bar::{CommandBar, CommandBarMode};
 use crate::ui::panels::editor::{EditorPanel, EditorState};
 use crate::ui::panels::file_tree::FileTreePanel;
 use crate::ui::panels::session_list::SessionListPanel;
+use crate::ui::panels::session_picker::SessionPickerPanel;
 use crate::ui::panels::session_view::SessionViewPanel;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     Dashboard,
     SessionView(usize),
+    SessionPicker(usize), // quick-pick overlay; usize = session we came from
     Editor,
     RenamePrompt,
     NewSessionPrompt,
@@ -53,6 +55,7 @@ pub struct App {
     pub editor: Option<EditorState>,
     pub git_status: Option<GitStatusMap>,
     pub last_git_refresh: Instant,
+    pub picker_selected: usize,
 }
 
 impl App {
@@ -79,6 +82,7 @@ impl App {
             editor: None,
             git_status,
             last_git_refresh: Instant::now(),
+            picker_selected: 0,
         }
     }
 
@@ -131,9 +135,17 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Ctrl+C quits from dashboard/editor, but is forwarded to the session in SessionView
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return;
+            match &self.mode {
+                AppMode::SessionView(_) | AppMode::SessionPicker(_) => {
+                    // Fall through to mode-specific handler (forwarded to PTY)
+                }
+                _ => {
+                    self.should_quit = true;
+                    return;
+                }
+            }
         }
 
         match &self.mode {
@@ -141,6 +153,10 @@ impl App {
             AppMode::SessionView(id) => {
                 let id = *id;
                 self.handle_session_view_key(key, id);
+            }
+            AppMode::SessionPicker(from_id) => {
+                let from_id = *from_id;
+                self.handle_session_picker_key(key, from_id);
             }
             AppMode::Editor => self.handle_editor_key(key),
             AppMode::RenamePrompt => self.handle_rename_key(key),
@@ -438,11 +454,60 @@ impl App {
             return;
         }
 
+        // Alt+S opens session quick-picker
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('s') {
+            if self.sessions.len() > 1 {
+                // Pre-select the current session in the picker
+                self.picker_selected = self
+                    .sessions
+                    .iter()
+                    .position(|s| s.id == session_id)
+                    .unwrap_or(0);
+                self.mode = AppMode::SessionPicker(session_id);
+            }
+            return;
+        }
+
         let bytes = key_event_to_bytes(&key);
         if !bytes.is_empty() {
             if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                 let _ = session.write(&bytes);
             }
+        }
+    }
+
+    fn handle_session_picker_key(&mut self, key: KeyEvent, from_session_id: usize) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = AppMode::SessionView(from_session_id);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.sessions.is_empty() {
+                    self.picker_selected = (self.picker_selected + 1) % self.sessions.len();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if !self.sessions.is_empty() {
+                    self.picker_selected = self
+                        .picker_selected
+                        .checked_sub(1)
+                        .unwrap_or(self.sessions.len() - 1);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(session) = self.sessions.get(self.picker_selected) {
+                    let id = session.id;
+                    // Resize to fit the session view
+                    if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+                        let inner_rows = self.terminal_rows.saturating_sub(3);
+                        let inner_cols = self.terminal_cols.saturating_sub(2);
+                        let _ = session.resize(inner_cols, inner_rows);
+                    }
+                    self.selected = self.picker_selected;
+                    self.mode = AppMode::SessionView(id);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -756,16 +821,36 @@ impl App {
                     }
                 }
             }
-            AppMode::SessionView(id) => {
+            AppMode::SessionView(id) | AppMode::SessionPicker(id) => {
                 let (main_area, cmd_area) = AppLayout::session_view(frame.area());
 
-                if let Some(session) = self.sessions.iter().find(|s| s.id == *id) {
+                // Render the underlying session view
+                let view_id = match &self.mode {
+                    AppMode::SessionPicker(_) => {
+                        // Show the "from" session behind the picker
+                        *id
+                    }
+                    _ => *id,
+                };
+                if let Some(session) = self.sessions.iter().find(|s| s.id == view_id) {
                     let view = SessionViewPanel::new(session);
                     frame.render_widget(view, main_area);
                 }
 
-                let command_bar = CommandBar::new(CommandBarMode::SessionView);
-                frame.render_widget(command_bar, cmd_area);
+                if matches!(self.mode, AppMode::SessionPicker(_)) {
+                    // Render picker overlay
+                    let picker = SessionPickerPanel::new(
+                        &self.sessions,
+                        self.picker_selected,
+                    );
+                    frame.render_widget(picker, main_area);
+
+                    let command_bar = CommandBar::new(CommandBarMode::SessionPicker);
+                    frame.render_widget(command_bar, cmd_area);
+                } else {
+                    let command_bar = CommandBar::new(CommandBarMode::SessionView);
+                    frame.render_widget(command_bar, cmd_area);
+                }
             }
         }
     }
