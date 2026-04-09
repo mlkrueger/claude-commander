@@ -128,4 +128,4 @@ Permission prompts (like "Allow once", "Yes/No") are detected by scanning the te
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE) for details.

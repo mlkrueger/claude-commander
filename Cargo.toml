@@ -2,6 +2,9 @@
 name = "ccom"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+description = "Terminal dashboard for managing multiple Claude Code sessions"
+repository = "https://github.com/mlkrueger/claude-commander"
 
 [dependencies]
 anyhow = "1.0.102"
