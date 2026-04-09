@@ -5,6 +5,11 @@ All notable changes to ccom (Claude Commander) will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-04-09
+
+### Fixed
+- **Mouse capture toggle not working** — `Ctrl+Shift+M` wasn't arriving reliably. Switched to `Alt+M` for consistency with other Alt keybindings.
+
 ## [0.2.2] - 2026-04-09
 
 ### Fixed
@@ -46,6 +51,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - PTY-based session management with automatic prompt detection.
 - Cross-platform build support (macOS, Linux).
 
+[0.2.3]: https://github.com/mlkrueger/claude-commander/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/mlkrueger/claude-commander/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/mlkrueger/claude-commander/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/mlkrueger/claude-commander/compare/v0.1.0...v0.2.0

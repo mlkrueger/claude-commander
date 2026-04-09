@@ -246,12 +246,8 @@ impl App {
             }
         }
 
-        // Ctrl+Shift+M: toggle mouse capture (allows native text selection when off)
-        if key
-            .modifiers
-            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-            && (key.code == KeyCode::Char('M') || key.code == KeyCode::Char('m'))
-        {
+        // Alt+M: toggle mouse capture (allows native text selection when off)
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
             self.toggle_mouse_capture = true;
             return;
         }
