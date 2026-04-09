@@ -5,6 +5,11 @@ All notable changes to ccom (Claude Commander) will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-04-09
+
+### Changed
+- **Back-to-dashboard keybind** — Changed from `Ctrl+O` to `Alt+O` so that `Ctrl+O` passes through to Claude Code for expanding/collapsing tool call output. All ccom-level controls now use the `Alt+` modifier consistently (`Alt+O`, `Alt+S`, `Alt+M`).
+
 ## [0.2.0] - 2026-04-09
 
 ### Added
@@ -32,5 +37,6 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - PTY-based session management with automatic prompt detection.
 - Cross-platform build support (macOS, Linux).
 
+[0.2.1]: https://github.com/mlkrueger/claude-commander/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/mlkrueger/claude-commander/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mlkrueger/claude-commander/releases/tag/v0.1.0
