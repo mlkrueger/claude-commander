@@ -67,7 +67,7 @@ impl Widget for CommandBar<'_> {
                 ("q", "quit"),
             ],
             CommandBarMode::SessionView => vec![
-                ("Ctrl+O", "back to dashboard"),
+                ("Alt+O", "back to dashboard"),
                 ("Alt+S", "switch session"),
                 ("All keys", "forwarded to session"),
             ],
@@ -79,7 +79,7 @@ impl Widget for CommandBar<'_> {
             CommandBarMode::Editor => vec![
                 ("Ctrl+S", "save"),
                 ("Ctrl+P", "send to claude"),
-                ("Ctrl+O", "close"),
+                ("Alt+O", "close"),
                 ("Arrows", "navigate"),
             ],
             CommandBarMode::Setup => vec![

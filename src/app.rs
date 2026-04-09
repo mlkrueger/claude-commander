@@ -517,8 +517,8 @@ impl App {
                     }
                 }
             }
-            // Ctrl+O: back to dashboard (same as session view)
-            KeyCode::Char('o') if ctrl => {
+            // Alt+O: back to dashboard (same as session view)
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.editor = None;
                 self.mode = AppMode::Dashboard;
             }
@@ -661,8 +661,8 @@ impl App {
     }
 
     fn handle_session_view_key(&mut self, key: KeyEvent, session_id: usize) {
-        // Ctrl+O returns to dashboard (Esc is forwarded to session)
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+        // Alt+O returns to dashboard (Ctrl+O is forwarded to session for Claude Code expand/collapse)
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('o') {
             self.mode = AppMode::Dashboard;
             return;
         }
