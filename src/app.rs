@@ -1,21 +1,26 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
+use ratatui::layout::Rect;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::claude::launcher;
+use crate::claude::rate_limit::{self, RateLimitInfo};
+use crate::setup::{self, SetupItem};
 use crate::event::Event;
 use crate::fs::git::{self, GitStatusMap};
 use crate::fs::tree::FileTree;
 use crate::pty::detector::PromptDetector;
 use crate::pty::session::{Session, SessionStatus};
 use crate::ui::layout::AppLayout;
-use crate::ui::panels::command_bar::{CommandBar, CommandBarMode};
+use crate::ui::panels::command_bar::{self, CommandBar, CommandBarMode};
 use crate::ui::panels::editor::{EditorPanel, EditorState};
 use crate::ui::panels::file_tree::FileTreePanel;
 use crate::ui::panels::session_list::SessionListPanel;
 use crate::ui::panels::session_view::SessionViewPanel;
+use crate::ui::panels::usage_graph::UsageGraphPanel;
+use crate::ui::theme::{Theme, ThemeName};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
@@ -23,8 +28,45 @@ pub enum AppMode {
     SessionView(usize),
     Editor,
     RenamePrompt,
-    NewSessionPrompt,
+    NewSessionModal,
     SendFilePrompt, // choose which session to send file path to
+    Setup,          // setup/onboarding: show missing configs, offer to fix
+    QuitConfirm,
+}
+
+pub struct NewSessionState {
+    pub dir_input: String,
+    pub flags_input: String,
+    pub focused: usize, // 0 = directory, 1 = flags
+    pub status_message: Option<String>,
+}
+
+impl NewSessionState {
+    fn new() -> Self {
+        Self {
+            dir_input: String::new(),
+            flags_input: String::new(),
+            focused: 0,
+            status_message: None,
+        }
+    }
+
+    fn with_dir(dir: String) -> Self {
+        let mut s = Self::new();
+        s.dir_input = dir;
+        s
+    }
+
+    fn field_count(&self) -> usize {
+        2
+    }
+
+    fn extra_args(&self) -> Vec<String> {
+        self.flags_input
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,20 +91,41 @@ pub struct App {
     pub last_attention_check: Instant,
     pub terminal_cols: u16,
     pub terminal_rows: u16,
+    pub session_view_scroll: usize,
+    pub user_scrolled: bool, // true when user has scrolled up from bottom
+    pub show_help: bool,
     pub status_message: Option<String>,
     pub editor: Option<EditorState>,
     pub git_status: Option<GitStatusMap>,
     pub last_git_refresh: Instant,
+    pub last_usage_refresh: Instant,
+    pub rate_limit: Option<RateLimitInfo>,
+    pub setup_items: Vec<SetupItem>,
+    pub setup_selected: usize,
+    pub setup_banner_dismissed: bool,
+    pub mouse_captured: bool,
+    pub toggle_mouse_capture: bool, // signal to main loop to flip terminal mouse mode
+    pub new_session: Option<NewSessionState>,
+    pub theme: Theme,
+    pub tick_count: u64,
 }
 
 impl App {
     pub fn new(event_tx: mpsc::Sender<Event>, working_dir: PathBuf) -> Self {
         let file_tree = FileTree::new(working_dir.clone());
         let git_status = git::get_git_status(&working_dir);
+        let rate_limit = rate_limit::get_rate_limit_info()
+            .or_else(rate_limit::get_rate_limit_from_telemetry);
+        let setup_items = setup::missing_items();
+        let initial_mode = if setup::is_first_launch() && !setup_items.is_empty() {
+            AppMode::Setup
+        } else {
+            AppMode::Dashboard
+        };
         Self {
             sessions: Vec::new(),
             selected: 0,
-            mode: AppMode::Dashboard,
+            mode: initial_mode,
             focus: PanelFocus::SessionList,
             file_tree,
             file_tree_scroll: 0,
@@ -75,30 +138,60 @@ impl App {
             last_attention_check: Instant::now(),
             terminal_cols: 80,
             terminal_rows: 24,
+            session_view_scroll: 0,
+            user_scrolled: false,
+            show_help: false,
             status_message: None,
             editor: None,
             git_status,
             last_git_refresh: Instant::now(),
+            last_usage_refresh: Instant::now() - Duration::from_secs(60),
+            rate_limit,
+            setup_items,
+            setup_selected: 0,
+            setup_banner_dismissed: false,
+            mouse_captured: true,
+            toggle_mouse_capture: false,
+            new_session: None,
+            theme: Theme::new(ThemeName::Default),
+            tick_count: 0,
         }
     }
 
     pub fn handle_event(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.handle_key(key),
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::PtyOutput { session_id, .. } => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                     session.last_activity = Instant::now();
                 }
+                // Auto-scroll to bottom only when user hasn't manually scrolled up
+                if let AppMode::SessionView(id) = self.mode {
+                    if id == session_id && !self.user_scrolled {
+                        self.session_view_scroll = 0;
+                    }
+                }
             }
             Event::Tick => {
+                self.tick_count = self.tick_count.wrapping_add(1);
                 if self.last_attention_check.elapsed() > Duration::from_secs(1) {
                     self.check_all_attention();
                     self.last_attention_check = Instant::now();
                 }
-                // Refresh git status every 5 seconds
+                // Refresh git status and context usage every 5 seconds
                 if self.last_git_refresh.elapsed() > Duration::from_secs(5) {
                     self.git_status = git::get_git_status(&self.file_tree.root.path);
                     self.last_git_refresh = Instant::now();
+                    for session in &mut self.sessions {
+                        session.refresh_context();
+                    }
+                }
+                // Refresh usage graph and rate limits every 30 seconds
+                if self.last_usage_refresh.elapsed() > Duration::from_secs(30) {
+                    self.rate_limit = rate_limit::get_rate_limit_info()
+                        .or_else(rate_limit::get_rate_limit_from_telemetry);
+                    self.last_usage_refresh = Instant::now();
                 }
                 for session in &mut self.sessions {
                     if !matches!(session.status, SessionStatus::Exited(_)) {
@@ -136,6 +229,22 @@ impl App {
             return;
         }
 
+        // Alt+M: toggle mouse capture (allows native text selection when off)
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
+            self.toggle_mouse_capture = true;
+            return;
+        }
+
+        // t: cycle color theme (available in dashboard modes)
+        if key.code == KeyCode::Char('t')
+            && matches!(self.mode, AppMode::Dashboard)
+        {
+            let next = self.theme.name.next();
+            self.theme = Theme::new(next);
+            self.status_message = Some(format!("Theme: {}", next.label()));
+            return;
+        }
+
         match &self.mode {
             AppMode::Dashboard => self.handle_dashboard_key(key),
             AppMode::SessionView(id) => {
@@ -144,12 +253,101 @@ impl App {
             }
             AppMode::Editor => self.handle_editor_key(key),
             AppMode::RenamePrompt => self.handle_rename_key(key),
-            AppMode::NewSessionPrompt => self.handle_new_session_key(key),
+            AppMode::NewSessionModal => self.handle_new_session_modal_key(key),
             AppMode::SendFilePrompt => self.handle_send_file_key(key),
+            AppMode::Setup => self.handle_setup_key(key),
+            AppMode::QuitConfirm => self.handle_quit_confirm_key(key),
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let scroll_lines: usize = 3;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => match &self.mode {
+                AppMode::Dashboard => match self.focus {
+                    PanelFocus::SessionList => {
+                        if !self.sessions.is_empty() {
+                            self.selected = self.selected.saturating_sub(scroll_lines)
+                                .min(self.sessions.len().saturating_sub(1));
+                            self.update_file_tree_for_selected();
+                        }
+                    }
+                    PanelFocus::FileTree => {
+                        for _ in 0..scroll_lines {
+                            self.file_tree.move_up();
+                        }
+                        self.adjust_file_tree_scroll();
+                    }
+                },
+                AppMode::SessionView(id) => {
+                    let id = *id;
+                    if let Some(session) = self.sessions.iter().find(|s| s.id == id) {
+                        // Probe max scrollback by setting a large value and reading back
+                        let mut parser = session.parser.lock().unwrap();
+                        parser.screen_mut().set_scrollback(usize::MAX);
+                        let max_scroll = parser.screen().scrollback();
+                        let desired = self.session_view_scroll + scroll_lines;
+                        self.session_view_scroll = desired.min(max_scroll);
+                        self.user_scrolled = self.session_view_scroll > 0;
+                        // Reset so rendering sets it properly
+                        parser.screen_mut().set_scrollback(0);
+                    }
+                }
+                AppMode::Editor => {
+                    if let Some(editor) = &mut self.editor {
+                        for _ in 0..scroll_lines {
+                            editor.move_up();
+                        }
+                        let visible = self.terminal_rows.saturating_sub(4) as usize;
+                        editor.ensure_cursor_visible(visible);
+                    }
+                }
+                _ => {}
+            },
+            MouseEventKind::ScrollDown => match &self.mode {
+                AppMode::Dashboard => match self.focus {
+                    PanelFocus::SessionList => {
+                        if !self.sessions.is_empty() {
+                            self.selected = (self.selected + scroll_lines)
+                                .min(self.sessions.len().saturating_sub(1));
+                            self.update_file_tree_for_selected();
+                        }
+                    }
+                    PanelFocus::FileTree => {
+                        for _ in 0..scroll_lines {
+                            self.file_tree.move_down();
+                        }
+                        self.adjust_file_tree_scroll();
+                    }
+                },
+                AppMode::SessionView(_) => {
+                    self.session_view_scroll = self.session_view_scroll.saturating_sub(scroll_lines);
+                    self.user_scrolled = self.session_view_scroll > 0;
+                }
+                AppMode::Editor => {
+                    if let Some(editor) = &mut self.editor {
+                        for _ in 0..scroll_lines {
+                            editor.move_down();
+                        }
+                        let visible = self.terminal_rows.saturating_sub(4) as usize;
+                        editor.ensure_cursor_visible(visible);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
         }
     }
 
     fn handle_dashboard_key(&mut self, key: KeyEvent) {
+        // If help modal is showing, close it on Esc or ?
+        if self.show_help {
+            if key.code == KeyCode::Esc || key.code == KeyCode::Char('?') {
+                self.show_help = false;
+            }
+            return;
+        }
+
         // Tab switches panel focus
         if key.code == KeyCode::Tab {
             self.focus = match self.focus {
@@ -176,7 +374,7 @@ impl App {
 
     fn handle_session_list_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.mode = AppMode::QuitConfirm,
             KeyCode::Down => {
                 if !self.sessions.is_empty() {
                     self.selected = (self.selected + 1) % self.sessions.len();
@@ -200,12 +398,14 @@ impl App {
                         let inner_cols = self.terminal_cols.saturating_sub(2);
                         let _ = session.resize(inner_cols, inner_rows);
                     }
+                    self.session_view_scroll = 0;
+                    self.user_scrolled = false;
                     self.mode = AppMode::SessionView(id);
                 }
             }
             KeyCode::Char('n') => {
-                self.input_buffer.clear();
-                self.mode = AppMode::NewSessionPrompt;
+                self.new_session = Some(NewSessionState::new());
+                self.mode = AppMode::NewSessionModal;
             }
             KeyCode::Char('a') => self.approve_selected(),
             KeyCode::Char('d') => self.deny_selected(),
@@ -218,13 +418,21 @@ impl App {
             KeyCode::Char('K') => self.kill_selected(),
             KeyCode::Char('c') => self.send_commit_prompt(),
             KeyCode::Char('x') => self.clear_dead_sessions(),
+            KeyCode::Char('S') => {
+                self.setup_items = setup::missing_items();
+                self.setup_selected = 0;
+                self.mode = AppMode::Setup;
+            }
+            KeyCode::Char('?') => {
+                self.show_help = !self.show_help;
+            }
             _ => {}
         }
     }
 
     fn handle_file_tree_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.mode = AppMode::QuitConfirm,
             KeyCode::Down => {
                 self.file_tree.move_down();
                 self.adjust_file_tree_scroll();
@@ -250,14 +458,16 @@ impl App {
                 }
             }
             KeyCode::Char('n') => {
-                // Spawn new session at selected directory
+                // Open new session modal pre-filled with selected directory
                 if let Some(path) = self.file_tree.selected_path() {
                     let dir = if path.is_dir() {
                         path.to_path_buf()
                     } else {
                         path.parent().unwrap_or(path).to_path_buf()
                     };
-                    self.spawn_session(dir);
+                    self.new_session =
+                        Some(NewSessionState::with_dir(dir.display().to_string()));
+                    self.mode = AppMode::NewSessionModal;
                     self.focus = PanelFocus::SessionList;
                 }
             }
@@ -271,6 +481,9 @@ impl App {
                         self.open_editor(path.to_path_buf());
                     }
                 }
+            }
+            KeyCode::Char('?') => {
+                self.show_help = !self.show_help;
             }
             _ => {}
         }
@@ -469,49 +682,111 @@ impl App {
         }
     }
 
-    fn handle_new_session_key(&mut self, key: KeyEvent) {
+    fn handle_new_session_modal_key(&mut self, key: KeyEvent) {
+        let focused = match &self.new_session {
+            Some(s) => s.focused,
+            None => return,
+        };
+
         match key.code {
-            KeyCode::Enter => {
-                let dir = if self.input_buffer.is_empty() {
-                    self.working_dir.clone()
-                } else {
-                    PathBuf::from(shellexpand::tilde(&self.input_buffer).to_string())
-                };
-                if dir.is_dir() {
-                    self.spawn_session(dir);
-                    self.input_buffer.clear();
-                    self.status_message = None;
-                    self.mode = AppMode::Dashboard;
-                } else {
-                    self.status_message = Some(format!("Directory not found: {}", dir.display()));
-                }
-            }
             KeyCode::Esc => {
-                self.input_buffer.clear();
-                self.status_message = None;
+                self.new_session = None;
                 self.mode = AppMode::Dashboard;
             }
-            KeyCode::Tab => {
+            KeyCode::Enter => {
+                self.spawn_from_modal();
+            }
+            KeyCode::Up => {
+                if let Some(state) = &mut self.new_session {
+                    if state.focused > 0 {
+                        state.focused -= 1;
+                        state.status_message = None;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some(state) = &mut self.new_session {
+                    if state.focused < state.field_count() - 1 {
+                        state.focused += 1;
+                        state.status_message = None;
+                    }
+                }
+            }
+            KeyCode::Tab if focused == 0 => {
                 self.tab_complete_path();
             }
             KeyCode::Backspace => {
-                self.input_buffer.pop();
-                self.status_message = None;
+                if let Some(state) = &mut self.new_session {
+                    if focused == 0 {
+                        state.dir_input.pop();
+                    } else {
+                        state.flags_input.pop();
+                    }
+                    state.status_message = None;
+                }
             }
             KeyCode::Char(c) => {
-                self.input_buffer.push(c);
-                self.status_message = None;
+                if let Some(state) = &mut self.new_session {
+                    if focused == 0 {
+                        state.dir_input.push(c);
+                    } else {
+                        state.flags_input.push(c);
+                    }
+                    state.status_message = None;
+                }
             }
             _ => {}
         }
     }
 
+    fn handle_quit_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.should_quit = true;
+            }
+            _ => {
+                self.mode = AppMode::Dashboard;
+            }
+        }
+    }
+
+    fn spawn_from_modal(&mut self) {
+        let state = match self.new_session.take() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let dir = if state.dir_input.is_empty() {
+            self.working_dir.clone()
+        } else {
+            PathBuf::from(shellexpand::tilde(&state.dir_input).to_string())
+        };
+
+        if !dir.is_dir() {
+            let msg = format!("Not a directory: {}", dir.display());
+            self.new_session = Some(NewSessionState {
+                status_message: Some(msg),
+                ..state
+            });
+            return;
+        }
+
+        let extra_args = state.extra_args();
+        self.spawn_session_with_prompt(dir, extra_args, None);
+        self.mode = AppMode::Dashboard;
+    }
+
     fn tab_complete_path(&mut self) {
-        let expanded = shellexpand::tilde(&self.input_buffer).to_string();
+        let state = match &self.new_session {
+            Some(s) => s,
+            None => return,
+        };
+
+        let expanded = shellexpand::tilde(&state.dir_input).to_string();
         let path = PathBuf::from(&expanded);
 
         // Split into parent dir and partial name
-        let (search_dir, prefix) = if path.is_dir() && self.input_buffer.ends_with('/') {
+        let (search_dir, prefix) = if path.is_dir() && state.dir_input.ends_with('/') {
             (path.clone(), String::new())
         } else {
             let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
@@ -541,20 +816,18 @@ impl App {
             return;
         }
 
+        let state = self.new_session.as_mut().unwrap();
         if matches.len() == 1 {
-            // Single match: complete it
             let completed = search_dir.join(&matches[0]);
-            // Convert back to tilde form if possible
             let home = dirs::home_dir().unwrap_or_default();
             let display = if completed.starts_with(&home) {
                 format!("~{}/", completed.strip_prefix(&home).unwrap().display())
             } else {
                 format!("{}/", completed.display())
             };
-            self.input_buffer = display;
-            self.status_message = None;
+            state.dir_input = display;
+            state.status_message = None;
         } else {
-            // Multiple matches: complete common prefix and show options
             let common = common_prefix(&matches);
             if common.len() > prefix.len() {
                 let completed = search_dir.join(&common);
@@ -564,21 +837,34 @@ impl App {
                 } else {
                     format!("{}", completed.display())
                 };
-                self.input_buffer = display;
+                state.dir_input = display;
             }
-            // Show matches in status
             let display_matches: Vec<&str> = matches.iter().map(|s| s.as_str()).collect();
-            self.status_message = Some(display_matches.join("  "));
+            state.status_message = Some(display_matches.join("  "));
         }
     }
 
     pub fn spawn_session(&mut self, working_dir: PathBuf) {
+        self.spawn_session_with_prompt(working_dir, vec![], None);
+    }
+
+    pub fn spawn_session_with_prompt(
+        &mut self,
+        working_dir: PathBuf,
+        extra_args: Vec<String>,
+        initial_prompt: Option<String>,
+    ) {
         let id = self.next_session_id;
         self.next_session_id += 1;
         let label = format!("claude-{id}");
 
         let cmd = launcher::claude_command();
-        let args = launcher::claude_args();
+        let mut args: Vec<String> = launcher::claude_args().into_iter().map(String::from).collect();
+        args.extend(extra_args);
+        if let Some(ref prompt) = initial_prompt {
+            args.push(prompt.clone());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let cols = self.terminal_cols.saturating_sub(34).max(40); // account for file tree
         let rows = self.terminal_rows.saturating_sub(3).max(10);
@@ -588,7 +874,7 @@ impl App {
             label,
             working_dir,
             cmd,
-            &args,
+            &arg_refs,
             self.event_tx.clone(),
             cols,
             rows,
@@ -637,6 +923,63 @@ impl App {
         }
     }
 
+    fn handle_setup_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.setup_banner_dismissed = true;
+                setup::mark_initialized();
+                self.mode = AppMode::Dashboard;
+            }
+            KeyCode::Up => {
+                self.setup_selected = self.setup_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if !self.setup_items.is_empty() {
+                    self.setup_selected =
+                        (self.setup_selected + 1).min(self.setup_items.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('y') => {
+                // Fix all missing items by spawning a setup session
+                self.spawn_setup_session();
+            }
+            _ => {}
+        }
+    }
+
+    fn spawn_setup_session(&mut self) {
+        let missing: Vec<String> = self
+            .setup_items
+            .iter()
+            .filter(|i| i.status == setup::SetupStatus::Missing)
+            .map(|i| i.fix_prompt.clone())
+            .collect();
+
+        if missing.is_empty() {
+            self.status_message = Some("All setup items are configured!".to_string());
+            setup::mark_initialized();
+            self.mode = AppMode::Dashboard;
+            return;
+        }
+
+        // Build a combined prompt and pass it as an initial arg to claude
+        let prompt = missing.join("\n\n---\n\n");
+
+        // Spawn session in the home directory (settings are global)
+        let home = dirs::home_dir().unwrap_or_else(|| self.working_dir.clone());
+        self.spawn_session_with_prompt(home, vec![], Some(prompt));
+
+        let session_id = self.sessions.last().map(|s| s.id);
+
+        if let Some(id) = session_id {
+            setup::mark_initialized();
+            self.mode = AppMode::SessionView(id);
+        } else {
+            self.status_message = Some("Failed to spawn setup session".to_string());
+            self.mode = AppMode::Dashboard;
+        }
+    }
+
     fn check_all_attention(&mut self) {
         for session in &mut self.sessions {
             if !matches!(session.status, SessionStatus::Exited(_)) {
@@ -675,33 +1018,38 @@ impl App {
     }
 
     pub fn draw(&self, frame: &mut Frame) {
+        let th = &self.theme;
+        let tick = self.tick_count;
+
         match &self.mode {
             AppMode::Editor | AppMode::SendFilePrompt => {
                 let (main_area, cmd_area) = AppLayout::session_view(frame.area());
 
                 if let Some(editor) = &self.editor {
-                    let panel = EditorPanel::new(editor);
+                    let panel = EditorPanel::new(editor, th, tick);
                     frame.render_widget(panel, main_area);
 
-                    // Show editor message if any, otherwise command bar
                     if let Some(msg) = &editor.message {
                         let line = ratatui::text::Line::styled(
                             msg.clone(),
-                            ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+                            ratatui::style::Style::default().fg(th.status_warn),
                         );
                         frame.render_widget(line, cmd_area);
                     } else if self.mode == AppMode::SendFilePrompt {
                         let labels: Vec<String> =
                             self.sessions.iter().map(|s| s.label.clone()).collect();
-                        let bar = CommandBar::new(CommandBarMode::SendFile(labels));
+                        let bar = CommandBar::new(CommandBarMode::SendFile(labels), th);
                         frame.render_widget(bar, cmd_area);
                     } else {
-                        let bar = CommandBar::new(CommandBarMode::Editor);
+                        let bar = CommandBar::new(CommandBarMode::Editor, th);
                         frame.render_widget(bar, cmd_area);
                     }
                 }
             }
-            AppMode::Dashboard | AppMode::RenamePrompt | AppMode::NewSessionPrompt => {
+            AppMode::Dashboard
+            | AppMode::RenamePrompt
+            | AppMode::NewSessionModal
+            | AppMode::QuitConfirm => {
                 let layout = AppLayout::new(frame.area());
 
                 // File tree (left panel)
@@ -710,6 +1058,8 @@ impl App {
                     &self.file_tree,
                     self.focus == PanelFocus::FileTree,
                     &session_dirs,
+                    th,
+                    tick,
                 )
                 .with_scroll(self.file_tree_scroll)
                 .with_git_status(self.git_status.as_ref());
@@ -720,8 +1070,47 @@ impl App {
                     &self.sessions,
                     self.selected,
                     self.focus == PanelFocus::SessionList,
+                    th,
+                    tick,
                 );
                 frame.render_widget(session_list, layout.main);
+
+                // Setup banner
+                let show_banner = !self.setup_banner_dismissed && !self.setup_items.is_empty();
+                let usage_area = if show_banner && layout.usage_graph.height > 1 {
+                    let banner = ratatui::text::Line::from(vec![
+                        ratatui::text::Span::styled(
+                            " Setup needed ",
+                            ratatui::style::Style::default()
+                                .fg(th.selected_fg)
+                                .bg(th.status_warn),
+                        ),
+                        ratatui::text::Span::styled(
+                            format!(" {} item(s) — press S to configure", self.setup_items.len()),
+                            ratatui::style::Style::default().fg(th.status_warn),
+                        ),
+                    ]);
+                    let banner_area = ratatui::layout::Rect {
+                        x: layout.usage_graph.x,
+                        y: layout.usage_graph.y,
+                        width: layout.usage_graph.width,
+                        height: 1,
+                    };
+                    frame.render_widget(banner, banner_area);
+                    ratatui::layout::Rect {
+                        x: layout.usage_graph.x,
+                        y: layout.usage_graph.y + 1,
+                        width: layout.usage_graph.width,
+                        height: layout.usage_graph.height - 1,
+                    }
+                } else {
+                    layout.usage_graph
+                };
+
+                // Usage graph (bottom panel)
+                let usage_panel = UsageGraphPanel::new(th, tick)
+                    .with_rate_limit(self.rate_limit.as_ref());
+                frame.render_widget(usage_panel, usage_area);
 
                 // Command bar
                 match &self.mode {
@@ -730,44 +1119,404 @@ impl App {
                         let line = ratatui::text::Line::raw(prompt);
                         frame.render_widget(line, layout.command_bar);
                     }
-                    AppMode::NewSessionPrompt => {
-                        let prompt = if let Some(msg) = &self.status_message {
-                            ratatui::text::Line::styled(
-                                format!("Dir: {}_ | {msg}", self.input_buffer),
-                                ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
-                            )
-                        } else {
-                            let display_dir = if self.input_buffer.is_empty() {
-                                format!("{} (default, Tab=complete)", self.working_dir.display())
-                            } else {
-                                format!("{}_ (Tab=complete)", self.input_buffer)
-                            };
-                            ratatui::text::Line::raw(format!("New session dir: {display_dir}"))
-                        };
-                        frame.render_widget(prompt, layout.command_bar);
-                    }
                     _ => {
                         let bar_mode = match self.focus {
                             PanelFocus::SessionList => CommandBarMode::Dashboard,
                             PanelFocus::FileTree => CommandBarMode::FileTree,
                         };
-                        let command_bar = CommandBar::new(bar_mode);
+                        let command_bar = CommandBar::new(bar_mode, th);
                         frame.render_widget(command_bar, layout.command_bar);
                     }
+                }
+
+                // Modal overlays
+                if self.show_help {
+                    self.draw_help_modal(frame);
+                } else if self.mode == AppMode::NewSessionModal {
+                    self.draw_new_session_modal(frame);
+                } else if self.mode == AppMode::QuitConfirm {
+                    self.draw_quit_confirm(frame);
                 }
             }
             AppMode::SessionView(id) => {
                 let (main_area, cmd_area) = AppLayout::session_view(frame.area());
 
-                if let Some(session) = self.sessions.iter().find(|s| s.id == *id) {
-                    let view = SessionViewPanel::new(session);
+                let context_pct = if let Some(session) = self.sessions.iter().find(|s| s.id == *id) {
+                    let view = SessionViewPanel::new(session, th, tick)
+                        .with_scroll(self.session_view_scroll);
                     frame.render_widget(view, main_area);
-                }
+                    session.context_percent
+                } else {
+                    None
+                };
 
-                let command_bar = CommandBar::new(CommandBarMode::SessionView);
+                let usage = command_bar::UsageStats {
+                    context_pct,
+                    session_pct: self.rate_limit.as_ref().and_then(|r| r.session_pct),
+                    weekly_pct: self.rate_limit.as_ref().and_then(|r| r.weekly_pct),
+                };
+                let command_bar = CommandBar::new(CommandBarMode::SessionView, th)
+                    .with_usage(usage);
                 frame.render_widget(command_bar, cmd_area);
             }
+            AppMode::Setup => {
+                let (main_area, cmd_area) = AppLayout::session_view(frame.area());
+                self.draw_setup_screen(frame, main_area);
+
+                let bar = CommandBar::new(CommandBarMode::Setup, th);
+                frame.render_widget(bar, cmd_area);
+            }
         }
+    }
+
+    fn draw_setup_screen(&self, frame: &mut Frame, area: Rect) {
+        use ratatui::style::{Color, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Paragraph};
+        let th = &self.theme;
+
+        let block = Block::default()
+            .title(" Setup ")
+            .borders(Borders::ALL)
+            .border_style(th.border_focused());
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if th.is_rainbow() {
+            crate::ui::theme::paint_rainbow_border(frame.buffer_mut(), area, self.tick_count);
+        }
+
+        let mut lines = Vec::new();
+
+        if self.setup_items.is_empty() {
+            lines.push(Line::styled(
+                "  All configurations are in place!",
+                Style::default().fg(Color::Green),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  Press Esc to return.",
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            lines.push(Line::styled(
+                "  The following configurations are needed for full functionality:",
+                Style::default().fg(Color::Yellow),
+            ));
+            lines.push(Line::raw(""));
+
+            for (i, item) in self.setup_items.iter().enumerate() {
+                let marker = if i == self.setup_selected {
+                    " > "
+                } else {
+                    "   "
+                };
+                let (icon, color) = match item.status {
+                    setup::SetupStatus::Ok => ("OK", Color::Green),
+                    setup::SetupStatus::Missing => ("MISSING", Color::Red),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(marker, Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("[{icon}] "),
+                        Style::default().fg(color),
+                    ),
+                    Span::styled(&item.name, Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!(" — {}", item.description),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+
+            let missing_count = self
+                .setup_items
+                .iter()
+                .filter(|i| i.status == setup::SetupStatus::Missing)
+                .count();
+
+            if missing_count > 0 {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "  Press Enter or 'y' to fix — this will start a Claude session",
+                    Style::default().fg(Color::Cyan),
+                ));
+                lines.push(Line::styled(
+                    "  that configures the missing items for you.",
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+        }
+
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
+    }
+
+    fn draw_new_session_modal(&self, frame: &mut Frame) {
+        use ratatui::style::Style;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear};
+        let th = &self.theme;
+
+        let state = match &self.new_session {
+            Some(s) => s,
+            None => return,
+        };
+
+        let area = frame.area();
+        let width = 60u16.min(area.width.saturating_sub(4));
+        let height = 10u16.min(area.height.saturating_sub(2));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let modal_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, modal_area);
+
+        let block = Block::default()
+            .title(" New Session ")
+            .borders(Borders::ALL)
+            .border_style(th.border_focused());
+        let inner = block.inner(modal_area);
+        frame.render_widget(block, modal_area);
+        if th.is_rainbow() {
+            crate::ui::theme::paint_rainbow_border(frame.buffer_mut(), modal_area, self.tick_count);
+        }
+
+        let mut row = inner.y;
+        let field_width = inner.width.saturating_sub(4);
+
+        // Directory field
+        let dir_focused = state.focused == 0;
+        let dir_style = if dir_focused {
+            Style::default().fg(th.accent)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        let dir_label = Line::styled("  Directory:", dir_style);
+        frame.render_widget(dir_label, Rect::new(inner.x, row, inner.width, 1));
+        row += 1;
+
+        let dir_text = if state.dir_input.is_empty() {
+            format!("{} (default)", self.working_dir.display())
+        } else if dir_focused {
+            format!("{}█", state.dir_input)
+        } else {
+            state.dir_input.clone()
+        };
+        let dir_display = if dir_text.len() > field_width as usize {
+            let skip = dir_text.len() - field_width as usize + 1;
+            format!("  …{}", &dir_text[skip..])
+        } else {
+            format!("  > {dir_text}")
+        };
+        let cursor_style = if dir_focused {
+            Style::default().fg(th.text)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        let dir_line = Line::styled(dir_display, cursor_style);
+        frame.render_widget(dir_line, Rect::new(inner.x, row, inner.width, 1));
+        row += 2;
+
+        // Flags field
+        let flags_focused = state.focused == 1;
+        let flags_style = if flags_focused {
+            Style::default().fg(th.accent)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        let flags_label = Line::styled("  Flags:", flags_style);
+        frame.render_widget(flags_label, Rect::new(inner.x, row, inner.width, 1));
+        row += 1;
+
+        let flags_text = if state.flags_input.is_empty() && !flags_focused {
+            "(none)".to_string()
+        } else if flags_focused {
+            format!("{}█", state.flags_input)
+        } else {
+            state.flags_input.clone()
+        };
+        let flags_display = if flags_text.len() > field_width as usize {
+            let skip = flags_text.len() - field_width as usize + 1;
+            format!("  …{}", &flags_text[skip..])
+        } else {
+            format!("  > {flags_text}")
+        };
+        let fcursor_style = if flags_focused {
+            Style::default().fg(th.text)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        let flags_line = Line::styled(flags_display, fcursor_style);
+        frame.render_widget(flags_line, Rect::new(inner.x, row, inner.width, 1));
+        row += 2;
+
+        if let Some(msg) = &state.status_message {
+            let msg_display = if msg.len() + 2 > inner.width as usize {
+                format!("  {}…", &msg[..inner.width as usize - 3])
+            } else {
+                format!("  {msg}")
+            };
+            let line = Line::styled(msg_display, Style::default().fg(th.status_warn));
+            frame.render_widget(line, Rect::new(inner.x, row, inner.width, 1));
+        } else {
+            let help = Line::from(vec![
+                Span::styled("  [Enter]", th.shortcut_key()),
+                Span::styled(" Create ", th.shortcut_desc()),
+                Span::styled("[Tab]", th.shortcut_key()),
+                Span::styled(" Complete ", th.shortcut_desc()),
+                Span::styled("[Esc]", th.shortcut_key()),
+                Span::styled(" Cancel", th.shortcut_desc()),
+            ]);
+            frame.render_widget(help, Rect::new(inner.x, row, inner.width, 1));
+        }
+    }
+
+    fn draw_quit_confirm(&self, frame: &mut Frame) {
+        use ratatui::style::Style;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear};
+        let th = &self.theme;
+
+        let area = frame.area();
+        let width = 50u16.min(area.width.saturating_sub(4));
+        let height = 7u16.min(area.height.saturating_sub(2));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let modal_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, modal_area);
+
+        let block = Block::default()
+            .title(" Quit ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(th.status_warn));
+        let inner = block.inner(modal_area);
+        frame.render_widget(block, modal_area);
+        if th.is_rainbow() {
+            crate::ui::theme::paint_rainbow_border(frame.buffer_mut(), modal_area, self.tick_count);
+        }
+
+        let has_running = self
+            .sessions
+            .iter()
+            .any(|s| !matches!(s.status, SessionStatus::Exited(_)));
+        let msg = if has_running {
+            "  Quit ccom? Running sessions will be killed."
+        } else {
+            "  Quit ccom?"
+        };
+        let line = Line::styled(msg, Style::default().fg(th.text));
+        frame.render_widget(line, Rect::new(inner.x, inner.y + 1, inner.width, 1));
+
+        let help = Line::from(vec![
+            Span::styled("  [y]", Style::default().fg(th.status_warn)),
+            Span::styled(" Yes  ", th.shortcut_desc()),
+            Span::styled("[n/Esc]", th.shortcut_key()),
+            Span::styled(" No", th.shortcut_desc()),
+        ]);
+        frame.render_widget(help, Rect::new(inner.x, inner.y + 3, inner.width, 1));
+    }
+
+    fn draw_help_modal(&self, frame: &mut Frame) {
+        use ratatui::style::Style;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+        let th = &self.theme;
+
+        let sections: &[(&str, &[(&str, &str)])] = &[
+            (
+                "Session Management",
+                &[
+                    ("n", "New session"),
+                    ("Enter", "View selected session"),
+                    ("a", "Approve tool request"),
+                    ("d", "Deny tool request"),
+                    ("c", "Send commit prompt"),
+                    ("K", "Kill session"),
+                    ("x", "Clear dead sessions"),
+                    ("r", "Rename session"),
+                ],
+            ),
+            (
+                "Navigation",
+                &[
+                    ("↑/↓", "Navigate list"),
+                    ("Tab", "Switch panel (sessions/files)"),
+                    ("S", "Open setup screen"),
+                ],
+            ),
+            (
+                "File Tree",
+                &[
+                    ("Enter/→", "Expand directory"),
+                    ("←", "Collapse directory"),
+                    ("e", "Edit file"),
+                    ("n", "New session in directory"),
+                    ("R", "Refresh tree"),
+                ],
+            ),
+            (
+                "General",
+                &[
+                    ("t", "Cycle color theme"),
+                    ("Alt+m", "Toggle mouse capture"),
+                    ("?", "Toggle this help"),
+                    ("q", "Quit"),
+                    ("Ctrl+C", "Force quit"),
+                ],
+            ),
+        ];
+
+        // Calculate height: 1 per section header + 1 per entry + 1 blank between sections + border
+        let content_lines: u16 = sections
+            .iter()
+            .map(|(_, entries)| 1 + entries.len() as u16)
+            .sum::<u16>()
+            + (sections.len() as u16).saturating_sub(1); // blank lines between sections
+        let height = (content_lines + 3).min(frame.area().height.saturating_sub(2)); // +3 for borders + bottom hint
+        let width = 48u16.min(frame.area().width.saturating_sub(4));
+        let area = frame.area();
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let modal_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, modal_area);
+
+        let block = Block::default()
+            .title(" Keyboard Shortcuts ")
+            .borders(Borders::ALL)
+            .border_style(th.border_focused());
+        let inner = block.inner(modal_area);
+        frame.render_widget(block, modal_area);
+        if th.is_rainbow() {
+            crate::ui::theme::paint_rainbow_border(frame.buffer_mut(), modal_area, self.tick_count);
+        }
+
+        let mut lines = Vec::new();
+        for (i, (section, entries)) in sections.iter().enumerate() {
+            if i > 0 {
+                lines.push(Line::raw(""));
+            }
+            lines.push(Line::styled(
+                format!(" {section}"),
+                Style::default().fg(th.status_warn),
+            ));
+            for (key, desc) in *entries {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("   {key:>10}"), th.shortcut_key()),
+                    Span::styled(format!("  {desc}"), Style::default().fg(th.text)),
+                ]));
+            }
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            " Press ? or Esc to close",
+            th.shortcut_desc(),
+        ));
+
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
     }
 }
 

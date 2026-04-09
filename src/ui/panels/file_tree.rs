@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use crate::fs::git::{self, GitStatusMap};
 use crate::fs::tree::FileTree;
-use crate::ui::theme;
+use crate::ui::theme::{self, Theme};
 
 pub struct FileTreePanel<'a> {
     tree: &'a FileTree,
@@ -14,16 +14,20 @@ pub struct FileTreePanel<'a> {
     session_dirs: &'a [PathBuf],
     scroll_offset: usize,
     git_status: Option<&'a GitStatusMap>,
+    theme: &'a Theme,
+    tick: u64,
 }
 
 impl<'a> FileTreePanel<'a> {
-    pub fn new(tree: &'a FileTree, focused: bool, session_dirs: &'a [PathBuf]) -> Self {
+    pub fn new(tree: &'a FileTree, focused: bool, session_dirs: &'a [PathBuf], theme: &'a Theme, tick: u64) -> Self {
         Self {
             tree,
             focused,
             session_dirs,
             scroll_offset: 0,
             git_status: None,
+            theme,
+            tick,
         }
     }
 
@@ -40,10 +44,11 @@ impl<'a> FileTreePanel<'a> {
 
 impl Widget for FileTreePanel<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let th = self.theme;
         let border_style = if self.focused {
-            theme::BORDER_FOCUSED
+            th.border_focused()
         } else {
-            theme::BORDER
+            th.border()
         };
 
         let title = format!(
@@ -64,6 +69,10 @@ impl Widget for FileTreePanel<'_> {
 
         let inner = block.inner(area);
         Widget::render(block, area, buf);
+
+        if th.is_rainbow() {
+            theme::paint_rainbow_border(buf, area, self.tick);
+        }
 
         let visible = self.tree.visible_nodes();
         let max_lines = inner.height as usize;
@@ -113,7 +122,7 @@ impl Widget for FileTreePanel<'_> {
 
             // Color: selection overrides, then git status, then default
             let base_style = if is_selected {
-                theme::SELECTED
+                th.selected()
             } else if let Some(gs) = git_file_status {
                 if is_dir {
                     Style::default().fg(gs.color()).add_modifier(Modifier::BOLD)
@@ -140,7 +149,7 @@ impl Widget for FileTreePanel<'_> {
                 buf.set_string(inner.x, y, truncated, base_style);
                 if is_selected {
                     for x in (inner.x + truncated.len() as u16)..inner.right() {
-                        buf[(x, y)].set_style(theme::SELECTED);
+                        buf[(x, y)].set_style(th.selected());
                     }
                 }
             }

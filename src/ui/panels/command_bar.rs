@@ -3,7 +3,14 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
-use crate::ui::theme;
+use crate::ui::theme::Theme;
+
+/// Optional usage stats to display right-aligned on the command bar.
+pub struct UsageStats {
+    pub context_pct: Option<f64>,
+    pub session_pct: Option<f64>,
+    pub weekly_pct: Option<f64>,
+}
 
 pub enum CommandBarMode {
     Dashboard,
@@ -11,42 +18,51 @@ pub enum CommandBarMode {
     SessionView,
     Editor,
     SendFile(Vec<String>), // session labels
+    Setup,
 }
 
-pub struct CommandBar {
+pub struct CommandBar<'a> {
     mode: CommandBarMode,
+    usage: Option<UsageStats>,
+    theme: &'a Theme,
 }
 
-impl CommandBar {
-    pub fn new(mode: CommandBarMode) -> Self {
-        Self { mode }
+impl<'a> CommandBar<'a> {
+    pub fn new(mode: CommandBarMode, theme: &'a Theme) -> Self {
+        Self { mode, usage: None, theme }
+    }
+
+    pub fn with_usage(mut self, usage: UsageStats) -> Self {
+        self.usage = Some(usage);
+        self
     }
 }
 
-impl Widget for CommandBar {
+impl Widget for CommandBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let th = self.theme;
+
         let shortcuts = match self.mode {
             CommandBarMode::Dashboard => vec![
                 ("n", "new"),
                 ("Enter", "view"),
                 ("a", "approve"),
                 ("d", "deny"),
-                ("c", "commit"),
-                ("K", "kill"),
-                ("x", "clear"),
-                ("r", "rename"),
+                ("t", "theme"),
                 ("\u{2191}\u{2193}", "nav"),
                 ("Tab", "files"),
+                ("?", "help"),
                 ("q", "quit"),
             ],
             CommandBarMode::FileTree => vec![
                 ("\u{2191}\u{2193}", "navigate"),
                 ("Enter/\u{2192}", "expand"),
                 ("\u{2190}", "collapse"),
-                ("e", "edit file"),
-                ("n", "new session here"),
-                ("R", "refresh"),
+                ("e", "edit"),
+                ("n", "new here"),
+                ("t", "theme"),
                 ("Tab", "sessions"),
+                ("?", "help"),
                 ("q", "quit"),
             ],
             CommandBarMode::SessionView => vec![
@@ -59,11 +75,13 @@ impl Widget for CommandBar {
                 ("Ctrl+O", "close"),
                 ("Arrows", "navigate"),
             ],
+            CommandBarMode::Setup => vec![
+                ("Enter/y", "fix"),
+                ("\u{2191}\u{2193}", "nav"),
+                ("Esc", "back"),
+            ],
             CommandBarMode::SendFile(ref labels) => {
-                let _shortcuts: Vec<(&str, &str)> = vec![("Esc", "cancel")];
-                // We can't easily return borrowed strs from labels here,
-                // so this is handled specially below
-                return render_send_file(area, buf, labels);
+                return render_send_file(area, buf, labels, th);
             }
         };
 
@@ -72,8 +90,8 @@ impl Widget for CommandBar {
             .enumerate()
             .flat_map(|(i, (key, desc))| {
                 let mut s = vec![
-                    Span::styled(format!("[{key}]"), theme::SHORTCUT_KEY),
-                    Span::styled(format!(" {desc}"), theme::SHORTCUT_DESC),
+                    Span::styled(format!("[{key}]"), th.shortcut_key()),
+                    Span::styled(format!(" {desc}"), th.shortcut_desc()),
                 ];
                 if i < shortcuts.len() - 1 {
                     s.push(Span::raw("  "));
@@ -84,21 +102,76 @@ impl Widget for CommandBar {
 
         let line = Line::from(spans);
         buf.set_line(area.x, area.y, &line, area.width);
+
+        // Render right-aligned usage stats if present
+        if let Some(usage) = &self.usage {
+            let mut parts: Vec<Span> = Vec::new();
+
+            if let Some(ctx) = usage.context_pct {
+                let color = pct_color(ctx, th);
+                parts.push(Span::styled("ctx:", th.shortcut_desc()));
+                parts.push(Span::styled(
+                    format!("{:.0}%", ctx),
+                    ratatui::style::Style::default().fg(color),
+                ));
+            }
+            if let Some(s) = usage.session_pct {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                let color = pct_color(s, th);
+                parts.push(Span::styled("5h:", th.shortcut_desc()));
+                parts.push(Span::styled(
+                    format!("{:.0}%", s),
+                    ratatui::style::Style::default().fg(color),
+                ));
+            }
+            if let Some(w) = usage.weekly_pct {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                let color = pct_color(w, th);
+                parts.push(Span::styled("7d:", th.shortcut_desc()));
+                parts.push(Span::styled(
+                    format!("{:.0}%", w),
+                    ratatui::style::Style::default().fg(color),
+                ));
+            }
+
+            if !parts.is_empty() {
+                let usage_line = Line::from(parts);
+                let usage_width = usage_line.width() as u16;
+                if usage_width < area.width {
+                    let x = area.x + area.width - usage_width;
+                    buf.set_line(x, area.y, &usage_line, usage_width);
+                }
+            }
+        }
     }
 }
 
-fn render_send_file(area: Rect, buf: &mut Buffer, labels: &[String]) {
-    let mut spans = vec![Span::styled("Send file to: ", theme::SHORTCUT_DESC)];
+fn pct_color(pct: f64, th: &Theme) -> ratatui::style::Color {
+    if pct > 80.0 {
+        th.status_err
+    } else if pct > 50.0 {
+        th.status_warn
+    } else {
+        th.status_ok
+    }
+}
+
+fn render_send_file(area: Rect, buf: &mut Buffer, labels: &[String], th: &Theme) {
+    let mut spans = vec![Span::styled("Send file to: ", th.shortcut_desc())];
     for (i, label) in labels.iter().enumerate() {
-        spans.push(Span::styled(format!("[{i}]"), theme::SHORTCUT_KEY));
-        spans.push(Span::styled(format!(" {label}"), theme::SHORTCUT_DESC));
+        spans.push(Span::styled(format!("[{i}]"), th.shortcut_key()));
+        spans.push(Span::styled(format!(" {label}"), th.shortcut_desc()));
         if i < labels.len() - 1 {
             spans.push(Span::raw("  "));
         }
     }
     spans.push(Span::raw("  "));
-    spans.push(Span::styled("[Esc]", theme::SHORTCUT_KEY));
-    spans.push(Span::styled(" cancel", theme::SHORTCUT_DESC));
+    spans.push(Span::styled("[Esc]", th.shortcut_key()));
+    spans.push(Span::styled(" cancel", th.shortcut_desc()));
 
     let line = Line::from(spans);
     buf.set_line(area.x, area.y, &line, area.width);

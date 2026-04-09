@@ -4,7 +4,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 use std::path::PathBuf;
 
-use crate::ui::theme;
+use crate::ui::theme::{self, Theme};
 
 pub struct EditorState {
     pub file_path: PathBuf,
@@ -203,16 +203,19 @@ fn char_to_byte_pos(s: &str, char_idx: usize) -> usize {
 
 pub struct EditorPanel<'a> {
     state: &'a EditorState,
+    theme: &'a Theme,
+    tick: u64,
 }
 
 impl<'a> EditorPanel<'a> {
-    pub fn new(state: &'a EditorState) -> Self {
-        Self { state }
+    pub fn new(state: &'a EditorState, theme: &'a Theme, tick: u64) -> Self {
+        Self { state, theme, tick }
     }
 }
 
 impl Widget for EditorPanel<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let th = self.theme;
         let modified_marker = if self.state.modified { " [+]" } else { "" };
         let title = format!(
             " {}{modified_marker} ",
@@ -226,10 +229,14 @@ impl Widget for EditorPanel<'_> {
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(theme::BORDER_FOCUSED);
+            .border_style(th.border_focused());
 
         let inner = block.inner(area);
         Widget::render(block, area, buf);
+
+        if th.is_rainbow() {
+            theme::paint_rainbow_border(buf, area, self.tick);
+        }
 
         let gutter_width = 4u16; // line number width
         let text_area_width = inner.width.saturating_sub(gutter_width + 1); // +1 for separator
