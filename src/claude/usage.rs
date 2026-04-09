@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 /// Daily usage summary
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct DailyUsage {
     pub date: String,
     pub messages: u64,
@@ -13,6 +14,7 @@ pub struct DailyUsage {
 
 /// Compute daily usage from all Claude Code session JSONL files.
 /// Returns last `days` days of usage, sorted by date.
+#[allow(dead_code)]
 pub fn get_daily_usage(days: usize) -> Vec<DailyUsage> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
@@ -32,7 +34,11 @@ pub fn get_daily_usage(days: usize) -> Vec<DailyUsage> {
         .unwrap_or_default();
 
     for project_entry in entries.flatten() {
-        if !project_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !project_entry
+            .file_type()
+            .map(|t| t.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
         let Ok(files) = fs::read_dir(project_entry.path()) else {
@@ -82,6 +88,7 @@ pub fn get_daily_usage(days: usize) -> Vec<DailyUsage> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn parse_jsonl_usage(path: &PathBuf, cutoff: &str, daily: &mut BTreeMap<String, DailyUsage>) {
     let Ok(file) = fs::File::open(path) else {
         return;
@@ -117,6 +124,7 @@ fn parse_jsonl_usage(path: &PathBuf, cutoff: &str, daily: &mut BTreeMap<String, 
 }
 
 /// Extract date (YYYY-MM-DD) from a timestamp field in the line
+#[allow(dead_code)]
 fn extract_date(line: &str) -> Option<String> {
     // Look for "timestamp":"2026-..." pattern
     let idx = line.find("\"timestamp\":\"")?;
@@ -133,13 +141,16 @@ fn extract_date(line: &str) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 fn extract_usage_number(line: &str, key: &str) -> Option<u64> {
     let usage_idx = line.find("\"usage\"")?;
     let usage_section = &line[usage_idx..];
     let idx = usage_section.find(key)?;
     let start = idx + key.len();
     let rest = usage_section[start..].trim_start();
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     if end == 0 {
         return None;
     }
@@ -162,13 +173,7 @@ mod tests {
     #[test]
     fn test_extract_usage_number() {
         let line = r#"{"message":{"usage":{"output_tokens":5000,"input_tokens":100}}}"#;
-        assert_eq!(
-            extract_usage_number(line, "\"output_tokens\":"),
-            Some(5000)
-        );
-        assert_eq!(
-            extract_usage_number(line, "\"input_tokens\":"),
-            Some(100)
-        );
+        assert_eq!(extract_usage_number(line, "\"output_tokens\":"), Some(5000));
+        assert_eq!(extract_usage_number(line, "\"input_tokens\":"), Some(100));
     }
 }

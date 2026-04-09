@@ -28,10 +28,7 @@ mod git_tests {
             PathBuf::from("/project/src/main.rs"),
             GitFileStatus::Modified,
         );
-        map.insert(
-            PathBuf::from("/project/src/lib.rs"),
-            GitFileStatus::Staged,
-        );
+        map.insert(PathBuf::from("/project/src/lib.rs"), GitFileStatus::Staged);
 
         let result = ccom::fs::git::dir_has_changes(&PathBuf::from("/project/src"), &map);
         assert!(result.is_some());
@@ -41,14 +38,8 @@ mod git_tests {
     fn test_dir_has_changes_worst_status() {
         use ccom::fs::git::GitFileStatus;
         let mut map = HashMap::new();
-        map.insert(
-            PathBuf::from("/project/a.rs"),
-            GitFileStatus::Untracked,
-        );
-        map.insert(
-            PathBuf::from("/project/b.rs"),
-            GitFileStatus::Modified,
-        );
+        map.insert(PathBuf::from("/project/a.rs"), GitFileStatus::Untracked);
+        map.insert(PathBuf::from("/project/b.rs"), GitFileStatus::Modified);
 
         let result = ccom::fs::git::dir_has_changes(&PathBuf::from("/project"), &map);
         // Modified has higher priority than Untracked

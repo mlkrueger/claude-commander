@@ -38,7 +38,7 @@ impl Widget for SessionPickerPanel<'_> {
         Clear.render(popup_area, buf);
 
         let block = Block::default()
-            .title(" Switch Session (Alt+S) ")
+            .title(" Switch Session (C-S-s) ")
             .borders(Borders::ALL)
             .border_style(self.theme.border_focused());
 

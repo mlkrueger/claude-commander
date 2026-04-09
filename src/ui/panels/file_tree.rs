@@ -19,7 +19,13 @@ pub struct FileTreePanel<'a> {
 }
 
 impl<'a> FileTreePanel<'a> {
-    pub fn new(tree: &'a FileTree, focused: bool, session_dirs: &'a [PathBuf], theme: &'a Theme, tick: u64) -> Self {
+    pub fn new(
+        tree: &'a FileTree,
+        focused: bool,
+        session_dirs: &'a [PathBuf],
+        theme: &'a Theme,
+        tick: u64,
+    ) -> Self {
         Self {
             tree,
             focused,

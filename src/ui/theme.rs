@@ -96,7 +96,7 @@ impl Theme {
             },
             ThemeName::Tron => Self {
                 name,
-                accent: Color::Rgb(0, 255, 255),   // bright cyan
+                accent: Color::Rgb(0, 255, 255), // bright cyan
                 dim: Color::Rgb(0, 60, 80),
                 text: Color::Rgb(200, 240, 255),
                 selected_bg: Color::Rgb(255, 160, 0), // tron orange
@@ -168,7 +168,9 @@ impl Theme {
     }
 
     pub fn attention(&self) -> Style {
-        Style::new().fg(self.status_warn).add_modifier(Modifier::BOLD)
+        Style::new()
+            .fg(self.status_warn)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn running(&self) -> Style {

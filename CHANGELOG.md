@@ -5,6 +5,15 @@ All notable changes to ccom (Claude Commander) will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-04-09
+
+### Fixed
+- **Keybindings not working** — `Ctrl+\` and `Ctrl+]` never reached the app (OS SIGQUIT / terminal swallowing). Switched to reliable Alt keybindings: `Alt+D` for dashboard, `Alt+S` for session picker.
+- **Filter key repeat/release events** — Only handle `KeyEventKind::Press`, ignoring crossterm 0.29 Release/Repeat events.
+
+### Changed
+- **Mouse capture toggle** — Changed from `Alt+M` to `Ctrl+Shift+M`.
+
 ## [0.2.1] - 2026-04-09
 
 ### Changed
@@ -37,6 +46,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - PTY-based session management with automatic prompt detection.
 - Cross-platform build support (macOS, Linux).
 
+[0.2.2]: https://github.com/mlkrueger/claude-commander/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/mlkrueger/claude-commander/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/mlkrueger/claude-commander/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mlkrueger/claude-commander/releases/tag/v0.1.0

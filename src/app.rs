@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use std::path::{Path, PathBuf};
@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 
 use crate::claude::launcher;
 use crate::claude::rate_limit::{self, RateLimitInfo};
-use crate::setup::{self, SetupItem};
 use crate::event::Event;
 use crate::fs::git::{self, GitStatusMap};
 use crate::fs::tree::FileTree;
 use crate::pty::detector::PromptDetector;
 use crate::pty::session::{Session, SessionStatus};
+use crate::setup::{self, SetupItem};
 use crate::ui::layout::AppLayout;
 use crate::ui::panels::command_bar::{self, CommandBar, CommandBarMode};
 use crate::ui::panels::editor::{EditorPanel, EditorState};
@@ -117,8 +117,8 @@ impl App {
     pub fn new(event_tx: mpsc::Sender<Event>, working_dir: PathBuf) -> Self {
         let file_tree = FileTree::new(working_dir.clone());
         let git_status = git::get_git_status(&working_dir);
-        let rate_limit = rate_limit::get_rate_limit_info()
-            .or_else(rate_limit::get_rate_limit_from_telemetry);
+        let rate_limit =
+            rate_limit::get_rate_limit_info().or_else(rate_limit::get_rate_limit_from_telemetry);
         let setup_items = setup::missing_items();
         let initial_mode = if setup::is_first_launch() && !setup_items.is_empty() {
             AppMode::Setup
@@ -228,6 +228,11 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Only handle key press events (crossterm 0.29 also sends Release/Repeat)
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
         // Ctrl+C quits from dashboard/editor, but is forwarded to the session in SessionView
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             match &self.mode {
@@ -241,16 +246,18 @@ impl App {
             }
         }
 
-        // Alt+M: toggle mouse capture (allows native text selection when off)
-        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
+        // Ctrl+Shift+M: toggle mouse capture (allows native text selection when off)
+        if key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && (key.code == KeyCode::Char('M') || key.code == KeyCode::Char('m'))
+        {
             self.toggle_mouse_capture = true;
             return;
         }
 
         // t: cycle color theme (available in dashboard modes)
-        if key.code == KeyCode::Char('t')
-            && matches!(self.mode, AppMode::Dashboard)
-        {
+        if key.code == KeyCode::Char('t') && matches!(self.mode, AppMode::Dashboard) {
             let next = self.theme.name.next();
             self.theme = Theme::new(next);
             self.status_message = Some(format!("Theme: {}", next.label()));
@@ -283,7 +290,9 @@ impl App {
                 AppMode::Dashboard => match self.focus {
                     PanelFocus::SessionList => {
                         if !self.sessions.is_empty() {
-                            self.selected = self.selected.saturating_sub(scroll_lines)
+                            self.selected = self
+                                .selected
+                                .saturating_sub(scroll_lines)
                                 .min(self.sessions.len().saturating_sub(1));
                             self.update_file_tree_for_selected();
                         }
@@ -337,7 +346,8 @@ impl App {
                     }
                 },
                 AppMode::SessionView(_) => {
-                    self.session_view_scroll = self.session_view_scroll.saturating_sub(scroll_lines);
+                    self.session_view_scroll =
+                        self.session_view_scroll.saturating_sub(scroll_lines);
                     self.user_scrolled = self.session_view_scroll > 0;
                 }
                 AppMode::Editor => {
@@ -481,8 +491,7 @@ impl App {
                     } else {
                         path.parent().unwrap_or(path).to_path_buf()
                     };
-                    self.new_session =
-                        Some(NewSessionState::with_dir(dir.display().to_string()));
+                    self.new_session = Some(NewSessionState::with_dir(dir.display().to_string()));
                     self.mode = AppMode::NewSessionModal;
                     self.focus = PanelFocus::SessionList;
                 }
@@ -517,8 +526,8 @@ impl App {
                     }
                 }
             }
-            // Alt+O: back to dashboard (same as session view)
-            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
+            // Alt+D: back to dashboard
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.editor = None;
                 self.mode = AppMode::Dashboard;
             }
@@ -661,13 +670,13 @@ impl App {
     }
 
     fn handle_session_view_key(&mut self, key: KeyEvent, session_id: usize) {
-        // Alt+O returns to dashboard (Ctrl+O is forwarded to session for Claude Code expand/collapse)
-        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('o') {
+        // Alt+D: back to dashboard
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d') {
             self.mode = AppMode::Dashboard;
             return;
         }
 
-        // Alt+S opens session quick-picker
+        // Alt+S: session quick-picker
         if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('s') {
             if self.sessions.len() > 1 {
                 // Pre-select the current session in the picker
@@ -924,7 +933,10 @@ impl App {
         let label = format!("claude-{id}");
 
         let cmd = launcher::claude_command();
-        let mut args: Vec<String> = launcher::claude_args().into_iter().map(String::from).collect();
+        let mut args: Vec<String> = launcher::claude_args()
+            .into_iter()
+            .map(String::from)
+            .collect();
         args.extend(extra_args);
         if let Some(ref prompt) = initial_prompt {
             args.push(prompt.clone());
@@ -1173,8 +1185,8 @@ impl App {
                 };
 
                 // Usage graph (bottom panel)
-                let usage_panel = UsageGraphPanel::new(th, tick)
-                    .with_rate_limit(self.rate_limit.as_ref());
+                let usage_panel =
+                    UsageGraphPanel::new(th, tick).with_rate_limit(self.rate_limit.as_ref());
                 frame.render_widget(usage_panel, usage_area);
 
                 // Command bar
@@ -1206,7 +1218,8 @@ impl App {
             AppMode::SessionView(id) | AppMode::SessionPicker(id) => {
                 let (main_area, cmd_area) = AppLayout::session_view(frame.area());
 
-                let context_pct = if let Some(session) = self.sessions.iter().find(|s| s.id == *id) {
+                let context_pct = if let Some(session) = self.sessions.iter().find(|s| s.id == *id)
+                {
                     let view = SessionViewPanel::new(session, th, tick)
                         .with_scroll(self.session_view_scroll);
                     frame.render_widget(view, main_area);
@@ -1217,11 +1230,7 @@ impl App {
 
                 if matches!(self.mode, AppMode::SessionPicker(_)) {
                     // Render picker overlay
-                    let picker = SessionPickerPanel::new(
-                        &self.sessions,
-                        self.picker_selected,
-                        th,
-                    );
+                    let picker = SessionPickerPanel::new(&self.sessions, self.picker_selected, th);
                     frame.render_widget(picker, main_area);
 
                     let command_bar = CommandBar::new(CommandBarMode::SessionPicker, th);
@@ -1232,8 +1241,8 @@ impl App {
                         session_pct: self.rate_limit.as_ref().and_then(|r| r.session_pct),
                         weekly_pct: self.rate_limit.as_ref().and_then(|r| r.weekly_pct),
                     };
-                    let command_bar = CommandBar::new(CommandBarMode::SessionView, th)
-                        .with_usage(usage);
+                    let command_bar =
+                        CommandBar::new(CommandBarMode::SessionView, th).with_usage(usage);
                     frame.render_widget(command_bar, cmd_area);
                 }
             }
@@ -1295,10 +1304,7 @@ impl App {
                 };
                 lines.push(Line::from(vec![
                     Span::styled(marker, Style::default().fg(Color::Cyan)),
-                    Span::styled(
-                        format!("[{icon}] "),
-                        Style::default().fg(color),
-                    ),
+                    Span::styled(format!("[{icon}] "), Style::default().fg(color)),
                     Span::styled(&item.name, Style::default().fg(Color::White)),
                     Span::styled(
                         format!(" — {}", item.description),
@@ -1538,7 +1544,7 @@ impl App {
                 "General",
                 &[
                     ("t", "Cycle color theme"),
-                    ("Alt+m", "Toggle mouse capture"),
+                    ("C-S-m", "Toggle mouse capture"),
                     ("?", "Toggle this help"),
                     ("q", "Quit"),
                     ("Ctrl+C", "Force quit"),
@@ -1588,10 +1594,7 @@ impl App {
             }
         }
         lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            " Press ? or Esc to close",
-            th.shortcut_desc(),
-        ));
+        lines.push(Line::styled(" Press ? or Esc to close", th.shortcut_desc()));
 
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, inner);

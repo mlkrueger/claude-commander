@@ -14,7 +14,11 @@ pub struct UsageGraphPanel<'a> {
 
 impl<'a> UsageGraphPanel<'a> {
     pub fn new(theme: &'a Theme, tick: u64) -> Self {
-        Self { rate_limit: None, theme, tick }
+        Self {
+            rate_limit: None,
+            theme,
+            tick,
+        }
     }
 
     pub fn with_rate_limit(mut self, rate_limit: Option<&'a RateLimitInfo>) -> Self {
@@ -49,7 +53,11 @@ impl Widget for UsageGraphPanel<'_> {
         if let Some(rl) = &self.rate_limit {
             // Current session (5-hour window)
             y = render_usage_section(
-                buf, x, y, w, inner.bottom(),
+                buf,
+                x,
+                y,
+                w,
+                inner.bottom(),
                 "Current session",
                 rl.session_resets.as_deref(),
                 rl.session_pct,
@@ -59,7 +67,11 @@ impl Widget for UsageGraphPanel<'_> {
             // Current week (7-day window)
             if y < inner.bottom() {
                 y = render_usage_section(
-                    buf, x, y, w, inner.bottom(),
+                    buf,
+                    x,
+                    y,
+                    w,
+                    inner.bottom(),
                     "Current week",
                     rl.weekly_resets.as_deref(),
                     rl.weekly_pct,
@@ -70,19 +82,37 @@ impl Widget for UsageGraphPanel<'_> {
             // Session cost
             if y < inner.bottom() {
                 if let Some(cost) = rl.cost_usd {
-                    render_text(buf, x, y, w, "Session cost",
-                        Style::default().fg(th.text).add_modifier(Modifier::BOLD));
+                    render_text(
+                        buf,
+                        x,
+                        y,
+                        w,
+                        "Session cost",
+                        Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+                    );
                     y += 1;
                     if y < inner.bottom() {
                         let cost_text = format!("${:.2}", cost);
-                        render_text(buf, x + 1, y, w.saturating_sub(1), &cost_text,
-                            Style::default().fg(th.dim));
+                        render_text(
+                            buf,
+                            x + 1,
+                            y,
+                            w.saturating_sub(1),
+                            &cost_text,
+                            Style::default().fg(th.dim),
+                        );
                     }
                 }
             }
         } else {
-            render_text(buf, x, y, w, "No usage data available",
-                Style::default().fg(th.dim));
+            render_text(
+                buf,
+                x,
+                y,
+                w,
+                "No usage data available",
+                Style::default().fg(th.dim),
+            );
         }
     }
 }
@@ -104,8 +134,14 @@ fn render_usage_section(
     }
 
     // Title line
-    render_text(buf, x, y, width, title,
-        Style::default().fg(th.text).add_modifier(Modifier::BOLD));
+    render_text(
+        buf,
+        x,
+        y,
+        width,
+        title,
+        Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+    );
     let mut cy = y + 1;
 
     // Reset info line
@@ -115,8 +151,14 @@ fn render_usage_section(
             None => String::new(),
         };
         if !reset_text.is_empty() {
-            render_text(buf, x + 1, cy, width.saturating_sub(1), &reset_text,
-                Style::default().fg(th.dim));
+            render_text(
+                buf,
+                x + 1,
+                cy,
+                width.saturating_sub(1),
+                &reset_text,
+                Style::default().fg(th.dim),
+            );
         }
         cy += 1;
     }
@@ -177,7 +219,9 @@ fn render_progress_bar(buf: &mut Buffer, x: u16, y: u16, width: u16, pct: Option
         } else {
             ('\u{2501}', empty_color) // ━
         };
-        buf[(cx, y)].set_char(ch).set_style(Style::default().fg(color));
+        buf[(cx, y)]
+            .set_char(ch)
+            .set_style(Style::default().fg(color));
         cx += 1;
     }
 
@@ -198,7 +242,9 @@ fn render_progress_bar(buf: &mut Buffer, x: u16, y: u16, width: u16, pct: Option
     };
     for ch in label.chars() {
         if cx < x + width {
-            buf[(cx, y)].set_char(ch).set_style(Style::default().fg(label_color));
+            buf[(cx, y)]
+                .set_char(ch)
+                .set_style(Style::default().fg(label_color));
             cx += 1;
         }
     }

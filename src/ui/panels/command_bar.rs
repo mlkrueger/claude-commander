@@ -30,7 +30,11 @@ pub struct CommandBar<'a> {
 
 impl<'a> CommandBar<'a> {
     pub fn new(mode: CommandBarMode, theme: &'a Theme) -> Self {
-        Self { mode, usage: None, theme }
+        Self {
+            mode,
+            usage: None,
+            theme,
+        }
     }
 
     pub fn with_usage(mut self, usage: UsageStats) -> Self {
@@ -67,7 +71,7 @@ impl Widget for CommandBar<'_> {
                 ("q", "quit"),
             ],
             CommandBarMode::SessionView => vec![
-                ("Alt+O", "back to dashboard"),
+                ("Alt+D", "dashboard"),
                 ("Alt+S", "switch session"),
                 ("All keys", "forwarded to session"),
             ],
@@ -79,7 +83,7 @@ impl Widget for CommandBar<'_> {
             CommandBarMode::Editor => vec![
                 ("Ctrl+S", "save"),
                 ("Ctrl+P", "send to claude"),
-                ("Alt+O", "close"),
+                ("Alt+D", "close"),
                 ("Arrows", "navigate"),
             ],
             CommandBarMode::Setup => vec![

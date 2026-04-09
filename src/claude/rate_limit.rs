@@ -9,6 +9,7 @@ pub struct RateLimitFile {
     pub seven_day: Option<RateLimitWindow>,
     pub cost: Option<CostInfo>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub updated_at: Option<String>,
 }
 
@@ -119,11 +120,11 @@ pub fn get_rate_limit_from_telemetry() -> Option<RateLimitInfo> {
                     latest_timestamp = ts;
                     if let Some(meta) = extract_json_string_val(&line, "additional_metadata") {
                         // Parse the nested JSON string
-                        if let Ok(meta_obj) =
-                            serde_json::from_str::<serde_json::Value>(&meta)
-                        {
-                            latest_status =
-                                meta_obj.get("status").and_then(|s| s.as_str()).map(String::from);
+                        if let Ok(meta_obj) = serde_json::from_str::<serde_json::Value>(&meta) {
+                            latest_status = meta_obj
+                                .get("status")
+                                .and_then(|s| s.as_str())
+                                .map(String::from);
                             latest_resets_at = meta_obj
                                 .get("hoursTillReset")
                                 .and_then(|h| h.as_u64())

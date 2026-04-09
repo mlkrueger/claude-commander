@@ -96,7 +96,9 @@ fn main() -> anyhow::Result<()> {
             if app.mouse_captured {
                 execute!(io::stdout(), DisableMouseCapture)?;
                 app.mouse_captured = false;
-                app.status_message = Some("Mouse capture OFF — select text freely, Alt+M to re-enable".to_string());
+                app.status_message = Some(
+                    "Mouse capture OFF — select text freely, Ctrl+Shift+M to re-enable".to_string(),
+                );
             } else {
                 execute!(io::stdout(), EnableMouseCapture)?;
                 app.mouse_captured = true;

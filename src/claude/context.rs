@@ -109,7 +109,9 @@ fn extract_number(text: &str, key: &str) -> Option<u64> {
     let idx = text.find(key)?;
     let start = idx + key.len();
     let rest = text[start..].trim_start();
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     if end == 0 {
         return None;
     }
@@ -147,10 +149,7 @@ mod tests {
             extract_json_string(json, "sessionId"),
             Some("abc-123".to_string())
         );
-        assert_eq!(
-            extract_json_string(json, "cwd"),
-            Some("/tmp".to_string())
-        );
+        assert_eq!(extract_json_string(json, "cwd"), Some("/tmp".to_string()));
         assert_eq!(extract_json_string(json, "missing"), None);
     }
 
@@ -174,6 +173,9 @@ mod tests {
         assert_eq!(context_window_for_model("claude-opus-4-6", false), 200_000);
         // Non-opus models always 200k
         assert_eq!(context_window_for_model("claude-sonnet-4-6", true), 200_000);
-        assert_eq!(context_window_for_model("claude-haiku-4-5-20251001", false), 200_000);
+        assert_eq!(
+            context_window_for_model("claude-haiku-4-5-20251001", false),
+            200_000
+        );
     }
 }

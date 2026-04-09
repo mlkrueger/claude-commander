@@ -16,7 +16,13 @@ pub struct SessionListPanel<'a> {
 }
 
 impl<'a> SessionListPanel<'a> {
-    pub fn new(sessions: &'a [Session], selected: usize, focused: bool, theme: &'a Theme, tick: u64) -> Self {
+    pub fn new(
+        sessions: &'a [Session],
+        selected: usize,
+        focused: bool,
+        theme: &'a Theme,
+        tick: u64,
+    ) -> Self {
         Self {
             sessions,
             selected,
