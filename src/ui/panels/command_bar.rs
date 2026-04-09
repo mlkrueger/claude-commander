@@ -16,6 +16,7 @@ pub enum CommandBarMode {
     Dashboard,
     FileTree,
     SessionView,
+    SessionPicker,
     Editor,
     SendFile(Vec<String>), // session labels
     Setup,
@@ -67,7 +68,13 @@ impl Widget for CommandBar<'_> {
             ],
             CommandBarMode::SessionView => vec![
                 ("Ctrl+O", "back to dashboard"),
+                ("Alt+S", "switch session"),
                 ("All keys", "forwarded to session"),
+            ],
+            CommandBarMode::SessionPicker => vec![
+                ("\u{2191}\u{2193}/jk", "navigate"),
+                ("Enter", "switch"),
+                ("Esc", "cancel"),
             ],
             CommandBarMode::Editor => vec![
                 ("Ctrl+S", "save"),

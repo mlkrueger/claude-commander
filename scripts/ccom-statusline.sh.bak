@@ -1,0 +1,40 @@
+#!/bin/bash
+# Claude Code statusline hook for ccom
+# Reads statusline JSON from stdin, extracts rate_limits, writes to ~/.claude/ccom-rate-limits.json
+#
+# Install: add to Claude Code settings.json:
+#   "statusLine": { "command": "/path/to/ccom-statusline.sh" }
+
+OUTFILE="$HOME/.claude/ccom-rate-limits.json"
+
+python3 -c "
+import sys, json, os
+from datetime import datetime, timezone
+try:
+    data = json.load(sys.stdin)
+    rl = data.get('rate_limits', {})
+    outfile = os.path.expanduser('~/.claude/ccom-rate-limits.json')
+    if rl:
+        out = {'updated_at': datetime.now(timezone.utc).isoformat()}
+        for key in ('five_hour', 'daily'):
+            w = rl.get(key)
+            if w:
+                out[key] = {
+                    'used_percentage': w.get('used_percentage'),
+                    'resets_at': w.get('resets_at'),
+                }
+        with open(outfile, 'w') as f:
+            json.dump(out, f)
+    # Output statusline text
+    parts = []
+    fh = rl.get('five_hour', {})
+    if fh and fh.get('used_percentage') is not None:
+        parts.append(f\"5h:{fh['used_percentage']:.0f}%\")
+    d = rl.get('daily', {})
+    if d and d.get('used_percentage') is not None:
+        parts.append(f\"7d:{d['used_percentage']:.0f}%\")
+    if parts:
+        print(' | '.join(parts))
+except Exception:
+    pass
+"
