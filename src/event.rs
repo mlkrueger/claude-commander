@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent};
+use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, MouseEvent};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -6,6 +6,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub enum Event {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     PtyOutput {
         session_id: usize,
         #[allow(dead_code)]
@@ -35,6 +36,11 @@ impl EventCollector {
                     match event::read() {
                         Ok(CrosstermEvent::Key(key)) => {
                             if key_tx.send(Event::Key(key)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(CrosstermEvent::Mouse(mouse)) => {
+                            if key_tx.send(Event::Mouse(mouse)).is_err() {
                                 break;
                             }
                         }

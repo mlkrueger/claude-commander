@@ -3,6 +3,7 @@ mod claude;
 mod event;
 mod fs;
 mod pty;
+mod setup;
 mod ui;
 
 use std::io;
@@ -11,6 +12,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -44,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -88,6 +90,20 @@ fn main() -> anyhow::Result<()> {
             app.handle_event(event);
         }
 
+        // Handle mouse capture toggle
+        if app.toggle_mouse_capture {
+            app.toggle_mouse_capture = false;
+            if app.mouse_captured {
+                execute!(io::stdout(), DisableMouseCapture)?;
+                app.mouse_captured = false;
+                app.status_message = Some("Mouse capture OFF — select text freely, Alt+M to re-enable".to_string());
+            } else {
+                execute!(io::stdout(), EnableMouseCapture)?;
+                app.mouse_captured = true;
+                app.status_message = Some("Mouse capture ON — scroll with mouse".to_string());
+            }
+        }
+
         if app.should_quit {
             break;
         }
@@ -100,7 +116,7 @@ fn main() -> anyhow::Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
     Ok(())
 }
