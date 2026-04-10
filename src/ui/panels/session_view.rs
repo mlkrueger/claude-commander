@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Block, Borders, Widget};
 
-use crate::pty::session::{Session, lock_parser};
+use crate::session::{Session, lock_parser};
 use crate::ui::theme::{self, Theme};
 use crate::ui::widgets::terminal::TerminalWidget;
 

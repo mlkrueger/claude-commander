@@ -4,7 +4,7 @@ use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, Widget};
 
-use crate::pty::session::{Session, SessionStatus};
+use crate::session::{Session, SessionStatus};
 use crate::ui::theme::{self, Theme};
 
 pub struct SessionListPanel<'a> {

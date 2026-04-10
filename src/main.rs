@@ -3,6 +3,7 @@ mod claude;
 mod event;
 mod fs;
 mod pty;
+mod session;
 mod setup;
 mod ui;
 
@@ -111,7 +112,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Cleanup: kill all sessions
-    for session in &mut app.sessions {
+    for session in app.sessions.iter_mut() {
         session.kill();
     }
 

@@ -10,7 +10,7 @@ use crate::claude::context;
 use crate::event::Event;
 use crate::pty::detector::PromptDetector;
 
-pub(crate) fn lock_parser(p: &Mutex<vt100::Parser>) -> MutexGuard<'_, vt100::Parser> {
+pub fn lock_parser(p: &Mutex<vt100::Parser>) -> MutexGuard<'_, vt100::Parser> {
     p.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -218,6 +218,7 @@ impl Session {
         }
     }
 
+    #[allow(dead_code)]
     pub fn elapsed_since_activity(&self) -> std::time::Duration {
         self.last_activity.elapsed()
     }
