@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Block, Borders, Widget};
 
-use crate::pty::session::Session;
+use crate::pty::session::{Session, lock_parser};
 use crate::ui::theme::{self, Theme};
 use crate::ui::widgets::terminal::TerminalWidget;
 
@@ -48,7 +48,7 @@ impl Widget for SessionViewPanel<'_> {
             theme::paint_rainbow_border(buf, area, self.tick);
         }
 
-        let mut parser = self.session.parser.lock().unwrap();
+        let mut parser = lock_parser(&self.session.parser);
         parser.screen_mut().set_scrollback(self.scroll_offset);
         let screen = parser.screen();
         let terminal = TerminalWidget::new(screen, 0);

@@ -2,13 +2,17 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Instant;
 
 use crate::claude::context;
 use crate::event::Event;
 use crate::pty::detector::PromptDetector;
+
+pub(crate) fn lock_parser(p: &Mutex<vt100::Parser>) -> MutexGuard<'_, vt100::Parser> {
+    p.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
@@ -33,6 +37,7 @@ pub struct Session {
     pub needs_attention: bool,
     pub pty_size: PtySize,
     pub context_percent: Option<f64>,
+    pub consecutive_write_failures: u32,
 }
 
 impl Session {
@@ -72,23 +77,46 @@ impl Session {
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match reader.read(&mut buf) {
+                            Ok(0) => {
+                                let _ = event_tx.send(Event::SessionExited {
+                                    session_id,
+                                    code: 0,
+                                });
+                                true
+                            }
+                            Ok(n) => {
+                                let data = buf[..n].to_vec();
+                                lock_parser(&parser_clone).process(&data);
+                                let _ = event_tx.send(Event::PtyOutput { session_id, data });
+                                false
+                            }
+                            Err(_) => {
+                                let _ = event_tx.send(Event::SessionExited {
+                                    session_id,
+                                    code: -1,
+                                });
+                                true
+                            }
+                        }
+                    }));
+                match result {
+                    Ok(true) => break,
+                    Ok(false) => continue,
+                    Err(payload) => {
+                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "<non-string panic payload>".to_string()
+                        };
+                        log::warn!("pty reader for session {session_id} panicked: {msg}");
                         let _ = event_tx.send(Event::SessionExited {
                             session_id,
-                            code: 0,
-                        });
-                        break;
-                    }
-                    Ok(n) => {
-                        let data = buf[..n].to_vec();
-                        parser_clone.lock().unwrap().process(&data);
-                        let _ = event_tx.send(Event::PtyOutput { session_id, data });
-                    }
-                    Err(_) => {
-                        let _ = event_tx.send(Event::SessionExited {
-                            session_id,
-                            code: -1,
+                            code: -2,
                         });
                         break;
                     }
@@ -110,6 +138,7 @@ impl Session {
             needs_attention: false,
             pty_size,
             context_percent: None,
+            consecutive_write_failures: 0,
         })
     }
 
@@ -117,6 +146,31 @@ impl Session {
         self.writer.write_all(data)?;
         self.writer.flush()?;
         Ok(())
+    }
+
+    pub fn try_write(&mut self, bytes: &[u8]) {
+        match self.write(bytes) {
+            Ok(()) => {
+                self.consecutive_write_failures = 0;
+            }
+            Err(e) => {
+                log::warn!("session {} write failed: {e}", self.id);
+                self.consecutive_write_failures += 1;
+                if self.consecutive_write_failures >= 3 {
+                    log::warn!(
+                        "session {} exited after 3 consecutive write failures",
+                        self.id
+                    );
+                    self.status = SessionStatus::Exited(-3);
+                }
+            }
+        }
+    }
+
+    pub fn try_resize(&mut self, cols: u16, rows: u16) {
+        if let Err(e) = self.resize(cols, rows) {
+            log::warn!("session {} resize failed: {e}", self.id);
+        }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
@@ -127,11 +181,7 @@ impl Session {
             pixel_height: 0,
         };
         self.master.resize(self.pty_size)?;
-        self.parser
-            .lock()
-            .unwrap()
-            .screen_mut()
-            .set_size(rows, cols);
+        lock_parser(&self.parser).screen_mut().set_size(rows, cols);
         Ok(())
     }
 
@@ -140,7 +190,7 @@ impl Session {
             return;
         }
 
-        let parser = self.parser.lock().unwrap();
+        let parser = lock_parser(&self.parser);
         let screen = parser.screen();
         if let Some(kind) = detector.check(screen) {
             self.needs_attention = true;
