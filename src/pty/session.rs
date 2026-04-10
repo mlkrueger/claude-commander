@@ -33,6 +33,7 @@ pub struct Session {
     pub needs_attention: bool,
     pub pty_size: PtySize,
     pub context_percent: Option<f64>,
+    pub consecutive_write_failures: u32,
 }
 
 impl Session {
@@ -110,6 +111,7 @@ impl Session {
             needs_attention: false,
             pty_size,
             context_percent: None,
+            consecutive_write_failures: 0,
         })
     }
 
@@ -117,6 +119,31 @@ impl Session {
         self.writer.write_all(data)?;
         self.writer.flush()?;
         Ok(())
+    }
+
+    pub fn try_write(&mut self, bytes: &[u8]) {
+        match self.write(bytes) {
+            Ok(()) => {
+                self.consecutive_write_failures = 0;
+            }
+            Err(e) => {
+                log::warn!("session {} write failed: {e}", self.id);
+                self.consecutive_write_failures += 1;
+                if self.consecutive_write_failures >= 3 {
+                    log::warn!(
+                        "session {} exited after 3 consecutive write failures",
+                        self.id
+                    );
+                    self.status = SessionStatus::Exited(-3);
+                }
+            }
+        }
+    }
+
+    pub fn try_resize(&mut self, cols: u16, rows: u16) {
+        if let Err(e) = self.resize(cols, rows) {
+            log::warn!("session {} resize failed: {e}", self.id);
+        }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {

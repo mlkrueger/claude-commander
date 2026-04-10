@@ -220,7 +220,7 @@ impl App {
                     if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                         let inner_rows = rows.saturating_sub(3);
                         let inner_cols = cols.saturating_sub(2);
-                        let _ = session.resize(inner_cols, inner_rows);
+                        session.try_resize(inner_cols, inner_rows);
                     }
                 }
             }
@@ -418,7 +418,7 @@ impl App {
                     if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                         let inner_rows = self.terminal_rows.saturating_sub(3);
                         let inner_cols = self.terminal_cols.saturating_sub(2);
-                        let _ = session.resize(inner_cols, inner_rows);
+                        session.try_resize(inner_cols, inner_rows);
                     }
                     self.session_view_scroll = 0;
                     self.user_scrolled = false;
@@ -655,7 +655,7 @@ impl App {
         if let Some(path) = file_path {
             if let Some(session) = self.sessions.get_mut(idx) {
                 let msg = format!("Read the file at {}\n", path.display());
-                let _ = session.write(msg.as_bytes());
+                session.try_write(msg.as_bytes());
                 if let Some(editor) = &mut self.editor {
                     editor.message = Some(format!("Sent to session {}", session.label));
                 }
@@ -689,7 +689,7 @@ impl App {
         let bytes = key_event_to_bytes(&key);
         if !bytes.is_empty() {
             if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                let _ = session.write(&bytes);
+                session.try_write(&bytes);
             }
         }
     }
@@ -719,7 +719,7 @@ impl App {
                     if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                         let inner_rows = self.terminal_rows.saturating_sub(3);
                         let inner_cols = self.terminal_cols.saturating_sub(2);
-                        let _ = session.resize(inner_cols, inner_rows);
+                        session.try_resize(inner_cols, inner_rows);
                     }
                     self.selected = self.picker_selected;
                     self.mode = AppMode::SessionView(id);
@@ -965,13 +965,13 @@ impl App {
 
     fn approve_selected(&mut self) {
         if let Some(session) = self.sessions.get_mut(self.selected) {
-            let _ = session.write(b"\r");
+            session.try_write(b"\r");
         }
     }
 
     fn deny_selected(&mut self) {
         if let Some(session) = self.sessions.get_mut(self.selected) {
-            let _ = session.write(b"\x1b[B\x1b[B\r");
+            session.try_write(b"\x1b[B\x1b[B\r");
         }
     }
 
@@ -983,7 +983,7 @@ impl App {
 
     fn send_commit_prompt(&mut self) {
         if let Some(session) = self.sessions.get_mut(self.selected) {
-            let _ = session.write(b"/commit\n");
+            session.try_write(b"/commit\n");
             self.status_message = Some(format!("Sent /commit to {}", session.label));
         }
     }
