@@ -222,4 +222,128 @@ impl Session {
     pub fn elapsed_since_activity(&self) -> std::time::Duration {
         self.last_activity.elapsed()
     }
+
+    /// Build a fake `Session` in the `Exited(0)` state for unit tests.
+    ///
+    /// No real PTY is opened and no process is spawned. The `master`,
+    /// `writer`, and `child` fields are stub objects that panic if anything
+    /// tries to drive them — tests that exercise lifecycle bookkeeping only
+    /// (id/label/status/selection) should never touch them.
+    #[cfg(test)]
+    pub(crate) fn dummy_exited(id: usize, label: &str) -> Self {
+        use portable_pty::PtySize;
+        use test_helpers::{DummyChild, DummyPty, DummyWriter};
+
+        let pty_size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        Self {
+            id,
+            label: label.to_string(),
+            claude_session_id: None,
+            working_dir: PathBuf::from("/tmp"),
+            status: SessionStatus::Exited(0),
+            master: Box::new(DummyPty),
+            writer: Box::new(DummyWriter),
+            child: Box::new(DummyChild),
+            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 1000))),
+            last_activity: Instant::now(),
+            needs_attention: false,
+            pty_size,
+            context_percent: None,
+            consecutive_write_failures: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
+    use std::io::{Result as IoResult, Write};
+
+    /// No-op stand-in for `MasterPty`. All methods panic — tests must not
+    /// drive the pty.
+    #[derive(Debug)]
+    pub struct DummyPty;
+
+    impl MasterPty for DummyPty {
+        fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
+            panic!("DummyPty::resize should not be called from tests");
+        }
+
+        fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+            panic!("DummyPty::get_size should not be called from tests");
+        }
+
+        fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
+            panic!("DummyPty::try_clone_reader should not be called from tests");
+        }
+
+        fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
+            panic!("DummyPty::take_writer should not be called from tests");
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<i32> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<portable_pty::unix::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    /// No-op stand-in for the session's `Box<dyn Write + Send>`.
+    #[derive(Debug)]
+    pub struct DummyWriter;
+
+    impl Write for DummyWriter {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    /// No-op stand-in for `Box<dyn Child + Send + Sync>`. `try_wait` returns
+    /// `Ok(None)` (still running) so `reap_exited` leaves the session alone
+    /// if a test happens to call it on a dummy in a non-Exited state.
+    #[derive(Debug)]
+    pub struct DummyChild;
+
+    impl ChildKiller for DummyChild {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(DummyChild)
+        }
+    }
+
+    impl Child for DummyChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
 }
