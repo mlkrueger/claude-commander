@@ -1,0 +1,14 @@
+{
+  "updated_at": "2026-04-10T12:00:00Z",
+  "five_hour": {
+    "used_percentage": 4,
+    "resets_at": 1775869200
+  },
+  "seven_day": {
+    "used_percentage": 22,
+    "resets_at": 1776088800
+  },
+  "cost": {
+    "total_cost_usd": 12.5
+  }
+}
