@@ -2,13 +2,17 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Instant;
 
 use crate::claude::context;
 use crate::event::Event;
 use crate::pty::detector::PromptDetector;
+
+pub(crate) fn lock_parser(p: &Mutex<vt100::Parser>) -> MutexGuard<'_, vt100::Parser> {
+    p.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
@@ -72,23 +76,46 @@ impl Session {
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match reader.read(&mut buf) {
+                            Ok(0) => {
+                                let _ = event_tx.send(Event::SessionExited {
+                                    session_id,
+                                    code: 0,
+                                });
+                                true
+                            }
+                            Ok(n) => {
+                                let data = buf[..n].to_vec();
+                                lock_parser(&parser_clone).process(&data);
+                                let _ = event_tx.send(Event::PtyOutput { session_id, data });
+                                false
+                            }
+                            Err(_) => {
+                                let _ = event_tx.send(Event::SessionExited {
+                                    session_id,
+                                    code: -1,
+                                });
+                                true
+                            }
+                        }
+                    }));
+                match result {
+                    Ok(true) => break,
+                    Ok(false) => continue,
+                    Err(payload) => {
+                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "<non-string panic payload>".to_string()
+                        };
+                        log::warn!("pty reader for session {session_id} panicked: {msg}");
                         let _ = event_tx.send(Event::SessionExited {
                             session_id,
-                            code: 0,
-                        });
-                        break;
-                    }
-                    Ok(n) => {
-                        let data = buf[..n].to_vec();
-                        parser_clone.lock().unwrap().process(&data);
-                        let _ = event_tx.send(Event::PtyOutput { session_id, data });
-                    }
-                    Err(_) => {
-                        let _ = event_tx.send(Event::SessionExited {
-                            session_id,
-                            code: -1,
+                            code: -2,
                         });
                         break;
                     }
@@ -127,11 +154,7 @@ impl Session {
             pixel_height: 0,
         };
         self.master.resize(self.pty_size)?;
-        self.parser
-            .lock()
-            .unwrap()
-            .screen_mut()
-            .set_size(rows, cols);
+        lock_parser(&self.parser).screen_mut().set_size(rows, cols);
         Ok(())
     }
 
@@ -140,7 +163,7 @@ impl Session {
             return;
         }
 
-        let parser = self.parser.lock().unwrap();
+        let parser = lock_parser(&self.parser);
         let screen = parser.screen();
         if let Some(kind) = detector.check(screen) {
             self.needs_attention = true;
