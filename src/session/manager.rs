@@ -252,6 +252,35 @@ impl SessionManager {
         }
     }
 
+    /// Test-only helper that appends an already-built `Session` directly,
+    /// bypassing real PTY creation. Bumps `next_id` past the pushed id so
+    /// the monotonic-id invariant survives subsequent test spawns.
+    #[cfg(test)]
+    pub(crate) fn push_for_test(&mut self, session: Session) -> usize {
+        let id = session.id;
+        self.sessions.push(session);
+        self.selected = self.sessions.len() - 1;
+        if id >= self.next_id {
+            self.next_id = id + 1;
+        }
+        self.assert_invariant();
+        id
+    }
+
+    /// Test-only helper: append a stub `Session` that does not fork a real
+    /// PTY. Used by the property test to exercise `SessionManager`
+    /// invariants without the cost of spawning real processes.
+    #[cfg(test)]
+    pub(crate) fn spawn_dummy(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        let session = test_support::make_dummy_session(id);
+        self.sessions.push(session);
+        self.selected = self.sessions.len() - 1;
+        self.assert_invariant();
+        id
+    }
+
     #[inline]
     fn assert_invariant(&self) {
         debug_assert!(
@@ -260,5 +289,367 @@ impl SessionManager {
             self.selected,
             self.sessions.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `SessionManager` invariants (REFACTOR_PLAN.md §3.1).
+    //!
+    //! These tests use `Session::dummy_exited` + `SessionManager::push_for_test`
+    //! so nothing here forks a real process or opens a PTY — the whole file
+    //! runs offline in CI.
+
+    use super::*;
+
+    /// Allocate a fresh dummy session through the manager, threading the
+    /// manager's monotonic id counter so ids match what `spawn` would have
+    /// produced.
+    fn push(manager: &mut SessionManager, label: &str) -> usize {
+        let id = manager.peek_next_id();
+        let session = Session::dummy_exited(id, label);
+        manager.push_for_test(session)
+    }
+
+    #[test]
+    fn new_manager_is_empty() {
+        let m = SessionManager::new();
+        assert_eq!(m.len(), 0);
+        assert!(m.is_empty());
+        assert!(m.selected().is_none());
+        assert!(m.selected_index().is_none());
+    }
+
+    #[test]
+    fn spawn_assigns_monotonic_ids_and_keeps_selected_valid() {
+        let mut m = SessionManager::new();
+        let id_a = push(&mut m, "a");
+        let id_b = push(&mut m, "b");
+        let id_c = push(&mut m, "c");
+
+        assert!(
+            id_a < id_b && id_b < id_c,
+            "ids must be strictly increasing"
+        );
+        assert_eq!(m.len(), 3);
+
+        // Selected should always land on the most recently pushed session.
+        assert_eq!(m.selected_index(), Some(2));
+        assert_eq!(m.selected().map(|s| s.id), Some(id_c));
+
+        // Killing and re-pushing must not reuse a freed id.
+        m.kill(id_b);
+        let id_d = push(&mut m, "d");
+        assert!(id_d > id_c, "freed ids must not be reused");
+    }
+
+    #[test]
+    fn get_mut_unknown_id_returns_none() {
+        let mut m = SessionManager::new();
+        let _ = push(&mut m, "a");
+        assert!(m.get_mut(9999).is_none());
+        assert!(m.get(9999).is_none());
+    }
+
+    #[test]
+    fn selected_mut_clamps_after_killing_selected_tail() {
+        let mut m = SessionManager::new();
+        let id_a = push(&mut m, "a");
+        let _id_b = push(&mut m, "b");
+        let id_c = push(&mut m, "c");
+
+        // selected points at tail (c) after the last push; kill it and the
+        // selection should clamp to the new last session (b).
+        assert_eq!(m.selected().map(|s| s.id), Some(id_c));
+        m.kill(id_c);
+        assert_eq!(m.len(), 2);
+        let sel = m.selected_mut().expect("selected should still be Some");
+        assert_eq!(
+            sel.id,
+            id_a + 1,
+            "selection should clamp to the new last index"
+        );
+    }
+
+    #[test]
+    fn selected_mut_returns_none_when_last_session_removed() {
+        let mut m = SessionManager::new();
+        let id = push(&mut m, "only");
+        m.kill(id);
+        assert!(m.is_empty());
+        assert!(m.selected_mut().is_none());
+        assert!(m.selected_index().is_none());
+    }
+
+    #[test]
+    fn select_next_and_prev_wrap_but_stay_in_bounds() {
+        let mut m = SessionManager::new();
+        push(&mut m, "a");
+        push(&mut m, "b");
+        push(&mut m, "c");
+        // After pushing, selected == 2 (the tail).
+        assert_eq!(m.selected_index(), Some(2));
+
+        // select_next wraps to 0.
+        m.select_next();
+        assert_eq!(m.selected_index(), Some(0));
+
+        // select_prev from 0 wraps to the tail — still a valid index.
+        m.select_prev();
+        assert_eq!(m.selected_index(), Some(2));
+
+        // Many nexts in a row never walk out of bounds.
+        for _ in 0..50 {
+            m.select_next();
+            assert!(m.selected_index().unwrap() < m.len());
+        }
+        for _ in 0..50 {
+            m.select_prev();
+            assert!(m.selected_index().unwrap() < m.len());
+        }
+
+        // select_up_by / select_down_by saturate at the ends.
+        m.set_selected(1);
+        m.select_up_by(100);
+        assert_eq!(m.selected_index(), Some(0));
+        m.select_down_by(100);
+        assert_eq!(m.selected_index(), Some(m.len() - 1));
+    }
+
+    #[test]
+    fn kill_before_selected_decrements_selected() {
+        let mut m = SessionManager::new();
+        let id_a = push(&mut m, "a");
+        let _id_b = push(&mut m, "b");
+        let id_c = push(&mut m, "c");
+
+        // Select the tail explicitly.
+        m.set_selected(2);
+        assert_eq!(m.selected().map(|s| s.id), Some(id_c));
+
+        // Killing the head (index 0, which is < selected) must decrement
+        // selected so it still points at c.
+        m.kill(id_a);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.selected_index(), Some(1));
+        assert_eq!(m.selected().map(|s| s.id), Some(id_c));
+    }
+
+    #[test]
+    fn kill_after_selected_leaves_selected_unchanged() {
+        let mut m = SessionManager::new();
+        let _id_a = push(&mut m, "a");
+        let id_b = push(&mut m, "b");
+        let id_c = push(&mut m, "c");
+
+        m.set_selected(1);
+        assert_eq!(m.selected().map(|s| s.id), Some(id_b));
+
+        // Killing c (index 2, > selected) must not move selected.
+        m.kill(id_c);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.selected_index(), Some(1));
+        assert_eq!(m.selected().map(|s| s.id), Some(id_b));
+    }
+
+    #[test]
+    fn kill_last_remaining_leaves_manager_empty() {
+        let mut m = SessionManager::new();
+        let id = push(&mut m, "only");
+        assert!(m.kill(id));
+        assert!(m.is_empty());
+        assert_eq!(m.len(), 0);
+        assert!(m.selected_mut().is_none());
+        assert!(m.selected().is_none());
+        assert!(m.selected_index().is_none());
+
+        // kill() of an unknown id on an empty manager returns false without
+        // panicking.
+        assert!(!m.kill(id));
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    //! Minimal stub PTY/Child impls so tests can construct a `Session`
+    //! without forking a real child process. Every trait method that could
+    //! actually talk to a live PTY panics — the property test only
+    //! exercises `SessionManager`'s collection logic (spawn / kill /
+    //! select), never `Session::write`, `Session::resize`, or child I/O,
+    //! so these stubs should never be touched at runtime.
+    use std::io::{Result as IoResult, Write};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
+
+    use super::super::types::{Session, SessionStatus};
+
+    #[derive(Debug)]
+    pub(super) struct DummyPty;
+
+    impl MasterPty for DummyPty {
+        fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+            Ok(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        }
+        fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
+            unreachable!("DummyPty::try_clone_reader should not be called in tests")
+        }
+        fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
+            unreachable!("DummyPty::take_writer should not be called in tests")
+        }
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<i32> {
+            None
+        }
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    pub(super) struct DummyWriter;
+
+    impl Write for DummyWriter {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct DummyChild;
+
+    impl ChildKiller for DummyChild {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(DummyChild)
+        }
+    }
+
+    impl Child for DummyChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    pub(super) fn make_dummy_session(id: usize) -> Session {
+        Session {
+            id,
+            label: format!("dummy-{id}"),
+            claude_session_id: None,
+            working_dir: PathBuf::from("/"),
+            status: SessionStatus::Running,
+            master: Box::new(DummyPty),
+            writer: Box::new(DummyWriter),
+            child: Box::new(DummyChild),
+            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            last_activity: Instant::now(),
+            needs_attention: false,
+            pty_size: PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            context_percent: None,
+            consecutive_write_failures: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Spawn,
+        /// Kill a session by vec index (generator space: 0..16, modulo len
+        /// at application time).
+        Kill(usize),
+        SelectNext,
+        SelectPrev,
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            Just(Op::Spawn),
+            (0usize..16).prop_map(Op::Kill),
+            Just(Op::SelectNext),
+            Just(Op::SelectPrev),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn manager_invariant_holds(
+            ops in prop::collection::vec(op_strategy(), 0..100),
+        ) {
+            let mut mgr = SessionManager::new();
+            let mut seen_ids: Vec<usize> = Vec::new();
+
+            for op in ops {
+                match op {
+                    Op::Spawn => {
+                        let id = mgr.spawn_dummy();
+                        // Ids must be globally unique for the lifetime of
+                        // the manager — killing must never free an id.
+                        prop_assert!(
+                            !seen_ids.contains(&id),
+                            "id {id} was reused"
+                        );
+                        seen_ids.push(id);
+                    }
+                    Op::Kill(idx) => {
+                        if !mgr.is_empty() {
+                            let real_idx = idx % mgr.len();
+                            let target_id =
+                                mgr.iter().nth(real_idx).unwrap().id;
+                            prop_assert!(mgr.kill(target_id));
+                        }
+                    }
+                    Op::SelectNext => mgr.select_next(),
+                    Op::SelectPrev => mgr.select_prev(),
+                }
+
+                // Core invariant: empty OR selected < len.
+                let ok = mgr.is_empty()
+                    || mgr
+                        .selected_index()
+                        .map(|i| i < mgr.len())
+                        .unwrap_or(false);
+                prop_assert!(
+                    ok,
+                    "invariant broken: len={}, selected={:?}",
+                    mgr.len(),
+                    mgr.selected_index()
+                );
+            }
+        }
     }
 }

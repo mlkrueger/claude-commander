@@ -161,3 +161,72 @@ fn extract_json_string_val(json: &str, key: &str) -> Option<String> {
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Sanitized fixture mirroring the on-disk format written by the statusline
+    // hook (~/.claude/ccom-rate-limits.json). Timestamps and cost are fixed.
+    const HAPPY_FIXTURE: &str = include_str!("../../tests/fixtures/rate_limit_happy.json");
+
+    #[test]
+    fn happy_path_parses_all_fields() {
+        let file: RateLimitFile =
+            serde_json::from_str(HAPPY_FIXTURE).expect("fixture should parse");
+
+        assert_eq!(file.updated_at.as_deref(), Some("2026-04-10T12:00:00Z"));
+
+        let five_hour = file.five_hour.expect("five_hour window present");
+        assert_eq!(five_hour.used_percentage, Some(4.0));
+        assert_eq!(five_hour.resets_at, Some(1_775_869_200));
+
+        let seven_day = file.seven_day.expect("seven_day window present");
+        assert_eq!(seven_day.used_percentage, Some(22.0));
+        assert_eq!(seven_day.resets_at, Some(1_776_088_800));
+
+        let cost = file.cost.expect("cost present");
+        assert_eq!(cost.total_cost_usd, Some(12.5));
+    }
+
+    #[test]
+    fn missing_resets_at_parses_as_none() {
+        // `resets_at` is `Option<i64>`, so omitting it should yield Ok(None),
+        // not an error. This pins that semantics.
+        let json = r#"{
+            "updated_at": "2026-04-10T12:00:00Z",
+            "five_hour": { "used_percentage": 10 },
+            "seven_day": { "used_percentage": 20 },
+            "cost": { "total_cost_usd": 1.0 }
+        }"#;
+
+        let file: RateLimitFile =
+            serde_json::from_str(json).expect("missing resets_at should still parse");
+
+        let five_hour = file.five_hour.expect("five_hour present");
+        assert_eq!(five_hour.used_percentage, Some(10.0));
+        assert!(five_hour.resets_at.is_none());
+
+        let seven_day = file.seven_day.expect("seven_day present");
+        assert!(seven_day.resets_at.is_none());
+    }
+
+    #[test]
+    fn malformed_json_returns_err_without_panicking() {
+        let bad = "{not valid json";
+        let result = std::panic::catch_unwind(|| serde_json::from_str::<RateLimitFile>(bad));
+        let parsed = result.expect("parser must not panic on malformed input");
+        assert!(parsed.is_err(), "malformed JSON should produce Err");
+    }
+
+    #[test]
+    fn format_reset_time_handles_invalid_timestamp() {
+        // i64::MAX is not a representable local datetime; the function should
+        // fall back to the "at <ts>" format rather than panicking.
+        let formatted = format_reset_time(i64::MAX);
+        assert!(
+            formatted.starts_with("at "),
+            "expected fallback format, got {formatted:?}"
+        );
+    }
+}
