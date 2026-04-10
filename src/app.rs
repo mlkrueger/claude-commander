@@ -890,10 +890,9 @@ impl App {
         if matches.len() == 1 {
             let completed = search_dir.join(&matches[0]);
             let home = dirs::home_dir().unwrap_or_default();
-            let display = if completed.starts_with(&home) {
-                format!("~{}/", completed.strip_prefix(&home).unwrap().display())
-            } else {
-                format!("{}/", completed.display())
+            let display = match completed.strip_prefix(&home).ok() {
+                Some(rel) => format!("~{}/", rel.display()),
+                None => format!("{}/", completed.display()),
             };
             state.dir_input = display;
             state.status_message = None;
@@ -902,10 +901,9 @@ impl App {
             if common.len() > prefix.len() {
                 let completed = search_dir.join(&common);
                 let home = dirs::home_dir().unwrap_or_default();
-                let display = if completed.starts_with(&home) {
-                    format!("~{}", completed.strip_prefix(&home).unwrap().display())
-                } else {
-                    format!("{}", completed.display())
+                let display = match completed.strip_prefix(&home).ok() {
+                    Some(rel) => format!("~{}", rel.display()),
+                    None => format!("{}", completed.display()),
                 };
                 state.dir_input = display;
             }
