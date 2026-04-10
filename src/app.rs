@@ -11,7 +11,7 @@ use crate::event::Event;
 use crate::fs::git::{self, GitStatusMap};
 use crate::fs::tree::FileTree;
 use crate::pty::detector::PromptDetector;
-use crate::pty::session::{Session, SessionStatus, lock_parser};
+use crate::session::{SessionManager, SessionStatus, SpawnConfig, lock_parser};
 use crate::setup::{self, SetupItem};
 use crate::ui::layout::AppLayout;
 use crate::ui::panels::command_bar::{self, CommandBar, CommandBarMode};
@@ -78,8 +78,7 @@ pub enum PanelFocus {
 }
 
 pub struct App {
-    pub sessions: Vec<Session>,
-    pub selected: usize,
+    pub(crate) sessions: SessionManager,
     pub mode: AppMode,
     pub focus: PanelFocus,
     pub file_tree: FileTree,
@@ -87,7 +86,6 @@ pub struct App {
     pub should_quit: bool,
     pub event_tx: mpsc::Sender<Event>,
     pub detector: PromptDetector,
-    pub next_session_id: usize,
     pub input_buffer: String,
     pub working_dir: PathBuf,
     pub last_attention_check: Instant,
@@ -126,8 +124,7 @@ impl App {
             AppMode::Dashboard
         };
         Self {
-            sessions: Vec::new(),
-            selected: 0,
+            sessions: SessionManager::new(),
             mode: initial_mode,
             focus: PanelFocus::SessionList,
             file_tree,
@@ -135,7 +132,6 @@ impl App {
             should_quit: false,
             event_tx,
             detector: PromptDetector::new(),
-            next_session_id: 1,
             input_buffer: String::new(),
             working_dir,
             last_attention_check: Instant::now(),
@@ -167,7 +163,7 @@ impl App {
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::PtyOutput { session_id, .. } => {
-                if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                if let Some(session) = self.sessions.get_mut(session_id) {
                     session.last_activity = Instant::now();
                 }
                 // Auto-scroll to bottom only when user hasn't manually scrolled up
@@ -187,9 +183,7 @@ impl App {
                 if self.last_git_refresh.elapsed() > Duration::from_secs(5) {
                     self.git_status = git::get_git_status(&self.file_tree.root.path);
                     self.last_git_refresh = Instant::now();
-                    for session in &mut self.sessions {
-                        session.refresh_context();
-                    }
+                    self.sessions.refresh_contexts();
                 }
                 // Refresh usage graph and rate limits every 30 seconds
                 if self.last_usage_refresh.elapsed() > Duration::from_secs(30) {
@@ -197,16 +191,10 @@ impl App {
                         .or_else(rate_limit::get_rate_limit_from_telemetry);
                     self.last_usage_refresh = Instant::now();
                 }
-                for session in &mut self.sessions {
-                    if !matches!(session.status, SessionStatus::Exited(_)) {
-                        if let Ok(Some(status)) = session.child.try_wait() {
-                            session.status = SessionStatus::Exited(status.exit_code() as i32);
-                        }
-                    }
-                }
+                self.sessions.reap_exited();
             }
             Event::SessionExited { session_id, code } => {
-                if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                if let Some(session) = self.sessions.get_mut(session_id) {
                     session.status = SessionStatus::Exited(code);
                 }
                 if self.mode == AppMode::SessionView(session_id) {
@@ -217,7 +205,7 @@ impl App {
                 self.terminal_cols = cols;
                 self.terminal_rows = rows;
                 if let AppMode::SessionView(id) = self.mode {
-                    if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    if let Some(session) = self.sessions.get_mut(id) {
                         let inner_rows = rows.saturating_sub(3);
                         let inner_cols = cols.saturating_sub(2);
                         session.try_resize(inner_cols, inner_rows);
@@ -286,10 +274,7 @@ impl App {
                 AppMode::Dashboard => match self.focus {
                     PanelFocus::SessionList => {
                         if !self.sessions.is_empty() {
-                            self.selected = self
-                                .selected
-                                .saturating_sub(scroll_lines)
-                                .min(self.sessions.len().saturating_sub(1));
+                            self.sessions.select_up_by(scroll_lines);
                             self.update_file_tree_for_selected();
                         }
                     }
@@ -302,7 +287,7 @@ impl App {
                 },
                 AppMode::SessionView(id) => {
                     let id = *id;
-                    if let Some(session) = self.sessions.iter().find(|s| s.id == id) {
+                    if let Some(session) = self.sessions.get(id) {
                         // Probe max scrollback by setting a large value and reading back
                         let mut parser = lock_parser(&session.parser);
                         parser.screen_mut().set_scrollback(usize::MAX);
@@ -329,8 +314,7 @@ impl App {
                 AppMode::Dashboard => match self.focus {
                     PanelFocus::SessionList => {
                         if !self.sessions.is_empty() {
-                            self.selected = (self.selected + scroll_lines)
-                                .min(self.sessions.len().saturating_sub(1));
+                            self.sessions.select_down_by(scroll_lines);
                             self.update_file_tree_for_selected();
                         }
                     }
@@ -378,7 +362,7 @@ impl App {
             };
             // Update file tree root to selected session's dir
             if self.focus == PanelFocus::FileTree {
-                if let Some(session) = self.sessions.get(self.selected) {
+                if let Some(session) = self.sessions.selected() {
                     let dir = session.working_dir.clone();
                     if dir != self.file_tree.root.path {
                         self.file_tree.set_root(dir);
@@ -399,27 +383,22 @@ impl App {
             KeyCode::Char('q') => self.mode = AppMode::QuitConfirm,
             KeyCode::Down => {
                 if !self.sessions.is_empty() {
-                    self.selected = (self.selected + 1) % self.sessions.len();
+                    self.sessions.select_next();
                     self.update_file_tree_for_selected();
                 }
             }
             KeyCode::Up => {
                 if !self.sessions.is_empty() {
-                    self.selected = self
-                        .selected
-                        .checked_sub(1)
-                        .unwrap_or(self.sessions.len() - 1);
+                    self.sessions.select_prev();
                     self.update_file_tree_for_selected();
                 }
             }
             KeyCode::Enter => {
-                if let Some(session) = self.sessions.get(self.selected) {
+                let inner_rows = self.terminal_rows.saturating_sub(3);
+                let inner_cols = self.terminal_cols.saturating_sub(2);
+                if let Some(session) = self.sessions.selected_mut() {
                     let id = session.id;
-                    if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
-                        let inner_rows = self.terminal_rows.saturating_sub(3);
-                        let inner_cols = self.terminal_cols.saturating_sub(2);
-                        session.try_resize(inner_cols, inner_rows);
-                    }
+                    session.try_resize(inner_cols, inner_rows);
                     self.session_view_scroll = 0;
                     self.user_scrolled = false;
                     self.mode = AppMode::SessionView(id);
@@ -432,8 +411,8 @@ impl App {
             KeyCode::Char('a') => self.approve_selected(),
             KeyCode::Char('d') => self.deny_selected(),
             KeyCode::Char('r') => {
-                if !self.sessions.is_empty() {
-                    self.input_buffer = self.sessions[self.selected].label.clone();
+                if let Some(session) = self.sessions.selected() {
+                    self.input_buffer = session.label.clone();
                     self.mode = AppMode::RenamePrompt;
                 }
             }
@@ -653,11 +632,16 @@ impl App {
     fn send_file_to_session(&mut self, idx: usize) {
         let file_path = self.editor.as_ref().map(|e| e.file_path.clone());
         if let Some(path) = file_path {
-            if let Some(session) = self.sessions.get_mut(idx) {
-                let msg = format!("Read the file at {}\n", path.display());
-                session.try_write(msg.as_bytes());
-                if let Some(editor) = &mut self.editor {
-                    editor.message = Some(format!("Sent to session {}", session.label));
+            // idx here is a positional index into the session list, not an id.
+            let session_id = self.sessions.iter().nth(idx).map(|s| s.id);
+            if let Some(id) = session_id {
+                if let Some(session) = self.sessions.get_mut(id) {
+                    let msg = format!("Read the file at {}\n", path.display());
+                    session.try_write(msg.as_bytes());
+                    let label = session.label.clone();
+                    if let Some(editor) = &mut self.editor {
+                        editor.message = Some(format!("Sent to session {label}"));
+                    }
                 }
             } else if let Some(editor) = &mut self.editor {
                 editor.message = Some(format!("No session at index {idx}"));
@@ -688,7 +672,7 @@ impl App {
 
         let bytes = key_event_to_bytes(&key);
         if !bytes.is_empty() {
-            if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            if let Some(session) = self.sessions.get_mut(session_id) {
                 session.try_write(&bytes);
             }
         }
@@ -713,15 +697,16 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(session) = self.sessions.get(self.picker_selected) {
-                    let id = session.id;
+                let picker_idx = self.picker_selected;
+                let id = self.sessions.iter().nth(picker_idx).map(|s| s.id);
+                if let Some(id) = id {
                     // Resize to fit the session view
-                    if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    if let Some(session) = self.sessions.get_mut(id) {
                         let inner_rows = self.terminal_rows.saturating_sub(3);
                         let inner_cols = self.terminal_cols.saturating_sub(2);
                         session.try_resize(inner_cols, inner_rows);
                     }
-                    self.selected = self.picker_selected;
+                    self.sessions.set_selected(picker_idx);
                     self.mode = AppMode::SessionView(id);
                 }
             }
@@ -732,8 +717,10 @@ impl App {
     fn handle_rename_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
-                if !self.input_buffer.is_empty() && !self.sessions.is_empty() {
-                    self.sessions[self.selected].label = self.input_buffer.clone();
+                if !self.input_buffer.is_empty() {
+                    if let Some(session) = self.sessions.selected_mut() {
+                        session.label = self.input_buffer.clone();
+                    }
                 }
                 self.input_buffer.clear();
                 self.mode = AppMode::Dashboard;
@@ -922,9 +909,7 @@ impl App {
         extra_args: Vec<String>,
         initial_prompt: Option<String>,
     ) {
-        let id = self.next_session_id;
-        self.next_session_id += 1;
-        let label = format!("claude-{id}");
+        let label = format!("claude-{}", self.sessions.peek_next_id());
 
         let cmd = launcher::claude_command();
         let mut args: Vec<String> = launcher::claude_args()
@@ -932,27 +917,25 @@ impl App {
             .map(String::from)
             .collect();
         args.extend(extra_args);
-        if let Some(ref prompt) = initial_prompt {
-            args.push(prompt.clone());
+        if let Some(prompt) = initial_prompt {
+            args.push(prompt);
         }
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let cols = self.terminal_cols.saturating_sub(34).max(40); // account for file tree
         let rows = self.terminal_rows.saturating_sub(3).max(10);
 
-        match Session::spawn(
-            id,
+        let config = SpawnConfig {
             label,
             working_dir,
-            cmd,
-            &arg_refs,
-            self.event_tx.clone(),
+            command: cmd,
+            args,
+            event_tx: self.event_tx.clone(),
             cols,
             rows,
-        ) {
-            Ok(session) => {
-                self.sessions.push(session);
-                self.selected = self.sessions.len() - 1;
+        };
+
+        match self.sessions.spawn(config) {
+            Ok(_id) => {
                 self.update_file_tree_for_selected();
             }
             Err(e) => {
@@ -962,36 +945,34 @@ impl App {
     }
 
     fn approve_selected(&mut self) {
-        if let Some(session) = self.sessions.get_mut(self.selected) {
+        if let Some(session) = self.sessions.selected_mut() {
             session.try_write(b"\r");
         }
     }
 
     fn deny_selected(&mut self) {
-        if let Some(session) = self.sessions.get_mut(self.selected) {
+        if let Some(session) = self.sessions.selected_mut() {
             session.try_write(b"\x1b[B\x1b[B\r");
         }
     }
 
     fn kill_selected(&mut self) {
-        if let Some(session) = self.sessions.get_mut(self.selected) {
-            session.kill();
+        let id = self.sessions.selected().map(|s| s.id);
+        if let Some(id) = id {
+            self.sessions.kill(id);
         }
     }
 
     fn send_commit_prompt(&mut self) {
-        if let Some(session) = self.sessions.get_mut(self.selected) {
+        if let Some(session) = self.sessions.selected_mut() {
             session.try_write(b"/commit\n");
-            self.status_message = Some(format!("Sent /commit to {}", session.label));
+            let label = session.label.clone();
+            self.status_message = Some(format!("Sent /commit to {label}"));
         }
     }
 
     fn clear_dead_sessions(&mut self) {
-        self.sessions
-            .retain(|s| !matches!(s.status, SessionStatus::Exited(_)));
-        if self.selected >= self.sessions.len() {
-            self.selected = self.sessions.len().saturating_sub(1);
-        }
+        self.sessions.retain_alive();
     }
 
     fn handle_setup_key(&mut self, key: KeyEvent) {
@@ -1040,7 +1021,7 @@ impl App {
         let home = dirs::home_dir().unwrap_or_else(|| self.working_dir.clone());
         self.spawn_session_with_prompt(home, vec![], Some(prompt));
 
-        let session_id = self.sessions.last().map(|s| s.id);
+        let session_id = self.sessions.selected().map(|s| s.id);
 
         if let Some(id) = session_id {
             setup::mark_initialized();
@@ -1052,15 +1033,11 @@ impl App {
     }
 
     fn check_all_attention(&mut self) {
-        for session in &mut self.sessions {
-            if !matches!(session.status, SessionStatus::Exited(_)) {
-                session.check_attention(&self.detector);
-            }
-        }
+        self.sessions.check_attention(&self.detector);
     }
 
     fn update_file_tree_for_selected(&mut self) {
-        if let Some(session) = self.sessions.get(self.selected) {
+        if let Some(session) = self.sessions.selected() {
             let dir = session.working_dir.clone();
             if dir != self.file_tree.root.path {
                 self.file_tree.set_root(dir.clone());
@@ -1086,6 +1063,10 @@ impl App {
             .filter(|s| !matches!(s.status, SessionStatus::Exited(_)))
             .map(|s| s.working_dir.clone())
             .collect()
+    }
+
+    fn sel_idx_or_zero(&self) -> usize {
+        self.sessions.selected_index().unwrap_or(0)
     }
 
     pub fn draw(&self, frame: &mut Frame) {
@@ -1138,8 +1119,8 @@ impl App {
 
                 // Session list (main panel)
                 let session_list = SessionListPanel::new(
-                    &self.sessions,
-                    self.selected,
+                    self.sessions.as_slice(),
+                    self.sel_idx_or_zero(),
                     self.focus == PanelFocus::SessionList,
                     th,
                     tick,
@@ -1212,8 +1193,7 @@ impl App {
             AppMode::SessionView(id) | AppMode::SessionPicker(id) => {
                 let (main_area, cmd_area) = AppLayout::session_view(frame.area());
 
-                let context_pct = if let Some(session) = self.sessions.iter().find(|s| s.id == *id)
-                {
+                let context_pct = if let Some(session) = self.sessions.get(*id) {
                     let view = SessionViewPanel::new(session, th, tick)
                         .with_scroll(self.session_view_scroll);
                     frame.render_widget(view, main_area);
@@ -1224,7 +1204,8 @@ impl App {
 
                 if matches!(self.mode, AppMode::SessionPicker(_)) {
                     // Render picker overlay
-                    let picker = SessionPickerPanel::new(&self.sessions, self.picker_selected, th);
+                    let picker =
+                        SessionPickerPanel::new(self.sessions.as_slice(), self.picker_selected, th);
                     frame.render_widget(picker, main_area);
 
                     let command_bar = CommandBar::new(CommandBarMode::SessionPicker, th);
