@@ -267,6 +267,20 @@ impl SessionManager {
         id
     }
 
+    /// Test-only helper: append a stub `Session` that does not fork a real
+    /// PTY. Used by the property test to exercise `SessionManager`
+    /// invariants without the cost of spawning real processes.
+    #[cfg(test)]
+    pub(crate) fn spawn_dummy(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        let session = test_support::make_dummy_session(id);
+        self.sessions.push(session);
+        self.selected = self.sessions.len() - 1;
+        self.assert_invariant();
+        id
+    }
+
     #[inline]
     fn assert_invariant(&self) {
         debug_assert!(
@@ -452,5 +466,190 @@ mod tests {
         // kill() of an unknown id on an empty manager returns false without
         // panicking.
         assert!(!m.kill(id));
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    //! Minimal stub PTY/Child impls so tests can construct a `Session`
+    //! without forking a real child process. Every trait method that could
+    //! actually talk to a live PTY panics — the property test only
+    //! exercises `SessionManager`'s collection logic (spawn / kill /
+    //! select), never `Session::write`, `Session::resize`, or child I/O,
+    //! so these stubs should never be touched at runtime.
+    use std::io::{Result as IoResult, Write};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
+
+    use super::super::types::{Session, SessionStatus};
+
+    #[derive(Debug)]
+    pub(super) struct DummyPty;
+
+    impl MasterPty for DummyPty {
+        fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+            Ok(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        }
+        fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
+            unreachable!("DummyPty::try_clone_reader should not be called in tests")
+        }
+        fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
+            unreachable!("DummyPty::take_writer should not be called in tests")
+        }
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<i32> {
+            None
+        }
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    pub(super) struct DummyWriter;
+
+    impl Write for DummyWriter {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct DummyChild;
+
+    impl ChildKiller for DummyChild {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(DummyChild)
+        }
+    }
+
+    impl Child for DummyChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    pub(super) fn make_dummy_session(id: usize) -> Session {
+        Session {
+            id,
+            label: format!("dummy-{id}"),
+            claude_session_id: None,
+            working_dir: PathBuf::from("/"),
+            status: SessionStatus::Running,
+            master: Box::new(DummyPty),
+            writer: Box::new(DummyWriter),
+            child: Box::new(DummyChild),
+            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            last_activity: Instant::now(),
+            needs_attention: false,
+            pty_size: PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            context_percent: None,
+            consecutive_write_failures: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Spawn,
+        /// Kill a session by vec index (generator space: 0..16, modulo len
+        /// at application time).
+        Kill(usize),
+        SelectNext,
+        SelectPrev,
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            Just(Op::Spawn),
+            (0usize..16).prop_map(Op::Kill),
+            Just(Op::SelectNext),
+            Just(Op::SelectPrev),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn manager_invariant_holds(
+            ops in prop::collection::vec(op_strategy(), 0..100),
+        ) {
+            let mut mgr = SessionManager::new();
+            let mut seen_ids: Vec<usize> = Vec::new();
+
+            for op in ops {
+                match op {
+                    Op::Spawn => {
+                        let id = mgr.spawn_dummy();
+                        // Ids must be globally unique for the lifetime of
+                        // the manager — killing must never free an id.
+                        prop_assert!(
+                            !seen_ids.contains(&id),
+                            "id {id} was reused"
+                        );
+                        seen_ids.push(id);
+                    }
+                    Op::Kill(idx) => {
+                        if !mgr.is_empty() {
+                            let real_idx = idx % mgr.len();
+                            let target_id =
+                                mgr.iter().nth(real_idx).unwrap().id;
+                            prop_assert!(mgr.kill(target_id));
+                        }
+                    }
+                    Op::SelectNext => mgr.select_next(),
+                    Op::SelectPrev => mgr.select_prev(),
+                }
+
+                // Core invariant: empty OR selected < len.
+                let ok = mgr.is_empty()
+                    || mgr
+                        .selected_index()
+                        .map(|i| i < mgr.len())
+                        .unwrap_or(false);
+                prop_assert!(
+                    ok,
+                    "invariant broken: len={}, selected={:?}",
+                    mgr.len(),
+                    mgr.selected_index()
+                );
+            }
+        }
     }
 }
