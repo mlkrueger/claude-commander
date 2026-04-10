@@ -176,4 +176,86 @@ mod tests {
         assert_eq!(extract_usage_number(line, "\"output_tokens\":"), Some(5000));
         assert_eq!(extract_usage_number(line, "\"input_tokens\":"), Some(100));
     }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn test_parse_jsonl_mixed_conversation() {
+        // conversation_mixed.jsonl contains:
+        //  - 1 plain user message (no "usage" field) -> skipped
+        //  - assistant 2026-04-08 output_tokens=150
+        //  - assistant 2026-04-08 output_tokens=300 (tool_use)
+        //  - 1 tool_result user message (no "usage") -> skipped
+        //  - assistant 2026-04-09 output_tokens=500
+        //  - 1 malformed line (bad timestamp) -> skipped, not fatal
+        //  - assistant 2026-04-09 output_tokens=75
+        //  - 1 assistant line dated 2025-01-01 -> filtered by cutoff
+        //
+        // With cutoff "2026-01-01", expected:
+        //   2026-04-08: 450 tokens / 2 messages
+        //   2026-04-09: 575 tokens / 2 messages
+        //   total:     1025 tokens / 4 messages
+        let path = fixture_path("conversation_mixed.jsonl");
+        let mut daily: BTreeMap<String, DailyUsage> = BTreeMap::new();
+        parse_jsonl_usage(&path, "2026-01-01", &mut daily);
+
+        assert_eq!(daily.len(), 2, "expected two dated buckets");
+
+        let d08 = daily.get("2026-04-08").expect("missing 2026-04-08 bucket");
+        assert_eq!(d08.output_tokens, 450);
+        assert_eq!(d08.messages, 2);
+
+        let d09 = daily.get("2026-04-09").expect("missing 2026-04-09 bucket");
+        assert_eq!(d09.output_tokens, 575);
+        assert_eq!(d09.messages, 2);
+
+        let total_tokens: u64 = daily.values().map(|d| d.output_tokens).sum();
+        let total_messages: u64 = daily.values().map(|d| d.messages).sum();
+        assert_eq!(total_tokens, 1025);
+        assert_eq!(total_messages, 4);
+    }
+
+    #[test]
+    fn test_parse_jsonl_empty_file_is_not_an_error() {
+        // An empty conversation.jsonl must yield zero totals, not a panic
+        // or error. parse_jsonl_usage returns unit, so we assert the map
+        // stays empty.
+        let path = fixture_path("conversation_empty.jsonl");
+        let mut daily: BTreeMap<String, DailyUsage> = BTreeMap::new();
+        parse_jsonl_usage(&path, "2026-01-01", &mut daily);
+        assert!(daily.is_empty(), "empty file should produce no entries");
+    }
+
+    #[test]
+    fn test_parse_jsonl_skips_malformed_lines() {
+        // Write a file with one malformed line sandwiched between two good
+        // ones. The parser must surface both good lines and simply skip
+        // the bad one (not abort, not zero-out).
+        let mut path = std::env::temp_dir();
+        path.push(format!("ccom_usage_malformed_{}.jsonl", std::process::id()));
+        let contents = concat!(
+            r#"{"type":"assistant","timestamp":"2026-04-09T08:00:00Z","message":{"usage":{"input_tokens":1,"output_tokens":42}}}"#,
+            "\n",
+            "this line is not json at all and has no usage field\n",
+            r#"{"type":"assistant","timestamp":"2026-04-09T09:00:00Z","message":{"usage":{"input_tokens":2,"output_tokens":58}}}"#,
+            "\n",
+        );
+        fs::write(&path, contents).expect("write temp fixture");
+
+        let mut daily: BTreeMap<String, DailyUsage> = BTreeMap::new();
+        parse_jsonl_usage(&path, "2026-01-01", &mut daily);
+
+        // Clean up temp file before assertions in case they fail
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(daily.len(), 1);
+        let bucket = daily.get("2026-04-09").expect("missing bucket");
+        assert_eq!(bucket.output_tokens, 100, "42 + 58 from the two good lines");
+        assert_eq!(bucket.messages, 2);
+    }
 }

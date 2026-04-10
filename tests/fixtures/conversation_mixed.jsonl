@@ -1,0 +1,8 @@
+{"type":"user","timestamp":"2026-04-08T10:00:00Z","message":{"role":"user","content":"hello claude"}}
+{"type":"assistant","timestamp":"2026-04-08T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"hi there"}],"usage":{"input_tokens":10,"output_tokens":150}}}
+{"type":"assistant","timestamp":"2026-04-08T10:05:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tool_1","name":"Read","input":{}}],"usage":{"input_tokens":20,"output_tokens":300}}}
+{"type":"user","timestamp":"2026-04-08T10:05:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":"file contents here"}]}}
+{"type":"assistant","timestamp":"2026-04-09T09:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"another day"}],"usage":{"input_tokens":50,"output_tokens":500}}}
+not-json-but-contains-usage-and-bad-timestamp "usage":"garbage" "timestamp":"notadate" "output_tokens":999
+{"type":"assistant","timestamp":"2026-04-09T09:10:00Z","message":{"role":"assistant","content":[{"type":"text","text":"follow up"}],"usage":{"input_tokens":15,"output_tokens":75}}}
+{"type":"assistant","timestamp":"2025-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"way too old"}],"usage":{"input_tokens":5,"output_tokens":9999}}}
