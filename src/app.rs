@@ -11,7 +11,7 @@ use crate::event::Event;
 use crate::fs::git::{self, GitStatusMap};
 use crate::fs::tree::FileTree;
 use crate::pty::detector::PromptDetector;
-use crate::pty::session::{Session, SessionStatus};
+use crate::pty::session::{Session, SessionStatus, lock_parser};
 use crate::setup::{self, SetupItem};
 use crate::ui::layout::AppLayout;
 use crate::ui::panels::command_bar::{self, CommandBar, CommandBarMode};
@@ -304,7 +304,7 @@ impl App {
                     let id = *id;
                     if let Some(session) = self.sessions.iter().find(|s| s.id == id) {
                         // Probe max scrollback by setting a large value and reading back
-                        let mut parser = session.parser.lock().unwrap();
+                        let mut parser = lock_parser(&session.parser);
                         parser.screen_mut().set_scrollback(usize::MAX);
                         let max_scroll = parser.screen().scrollback();
                         let desired = self.session_view_scroll + scroll_lines;
