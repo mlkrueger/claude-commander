@@ -76,23 +76,46 @@ impl Session {
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match reader.read(&mut buf) {
+                            Ok(0) => {
+                                let _ = event_tx.send(Event::SessionExited {
+                                    session_id,
+                                    code: 0,
+                                });
+                                true
+                            }
+                            Ok(n) => {
+                                let data = buf[..n].to_vec();
+                                lock_parser(&parser_clone).process(&data);
+                                let _ = event_tx.send(Event::PtyOutput { session_id, data });
+                                false
+                            }
+                            Err(_) => {
+                                let _ = event_tx.send(Event::SessionExited {
+                                    session_id,
+                                    code: -1,
+                                });
+                                true
+                            }
+                        }
+                    }));
+                match result {
+                    Ok(true) => break,
+                    Ok(false) => continue,
+                    Err(payload) => {
+                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "<non-string panic payload>".to_string()
+                        };
+                        log::warn!("pty reader for session {session_id} panicked: {msg}");
                         let _ = event_tx.send(Event::SessionExited {
                             session_id,
-                            code: 0,
-                        });
-                        break;
-                    }
-                    Ok(n) => {
-                        let data = buf[..n].to_vec();
-                        lock_parser(&parser_clone).process(&data);
-                        let _ = event_tx.send(Event::PtyOutput { session_id, data });
-                    }
-                    Err(_) => {
-                        let _ = event_tx.send(Event::SessionExited {
-                            session_id,
-                            code: -1,
+                            code: -2,
                         });
                         break;
                     }
