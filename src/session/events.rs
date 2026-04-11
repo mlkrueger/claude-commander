@@ -51,8 +51,7 @@ pub enum SessionEvent {
     /// corresponding body is not carried — fetch via
     /// `SessionManager::get_prompt` (future Phase).
     ///
-    /// Constructed by `SessionManager::send_prompt` in Phase 2.
-    #[allow(dead_code)]
+    /// Emitted by `SessionManager::send_prompt`.
     PromptSubmitted { session_id: usize, turn_id: TurnId },
     /// The response boundary detector observed the target turn complete.
     /// Fetch the body via `SessionManager::get_response` (Phase 3).

@@ -27,7 +27,7 @@ use std::sync::mpsc;
 use crate::event::Event;
 use crate::pty::detector::PromptDetector;
 
-use super::events::{EventBus, SessionEvent};
+use super::events::{EventBus, SessionEvent, TurnId};
 use super::types::{Session, SessionStatus};
 
 /// Byte sequence appended after a prompt's payload to submit it to the
@@ -183,6 +183,31 @@ impl SessionManager {
     /// Mutable lookup by id.
     pub fn get_mut(&mut self, id: usize) -> Option<&mut Session> {
         self.sessions.iter_mut().find(|s| s.id == id)
+    }
+
+    /// Submit `text` to the session identified by `id`, allocating a
+    /// fresh `TurnId` and publishing `SessionEvent::PromptSubmitted` on
+    /// the bus. Writes the prompt text followed by `SUBMIT_SEQUENCE` to
+    /// the session's PTY.
+    ///
+    /// Returns `Err` if the id does not match any live session; in that
+    /// case no turn id is allocated and no event is published.
+    #[allow(dead_code)] // first production caller lands later in Phase 2
+    pub fn send_prompt(&mut self, id: usize, text: &str) -> anyhow::Result<TurnId> {
+        let turn_id = {
+            let session = self
+                .get_mut(id)
+                .ok_or_else(|| anyhow::anyhow!("session {id} not found"))?;
+            let turn_id = session.allocate_turn_id();
+            session.try_write(text.as_bytes());
+            session.try_write(SUBMIT_SEQUENCE);
+            turn_id
+        };
+        self.bus.publish(SessionEvent::PromptSubmitted {
+            session_id: id,
+            turn_id,
+        });
+        Ok(turn_id)
     }
 
     /// Current selected index, or `None` when empty.
@@ -934,6 +959,113 @@ mod tests {
         assert!(
             prompt_pending,
             "expected PromptPending fired by detector hit, saw {events:?}"
+        );
+    }
+
+    // ---------------- send_prompt (Phase 2 Task 2) ----------------
+
+    #[test]
+    fn send_prompt_returns_first_turn_id_as_zero() {
+        let (mut m, _bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let turn = m.send_prompt(id, "hi").expect("send_prompt should succeed");
+        assert_eq!(turn, TurnId::new(0));
+    }
+
+    #[test]
+    fn send_prompt_returns_monotonic_turn_ids() {
+        let (mut m, _bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let first = m.send_prompt(id, "one").expect("first send_prompt");
+        let second = m.send_prompt(id, "two").expect("second send_prompt");
+        assert_eq!(first, TurnId::new(0));
+        assert_eq!(second, TurnId::new(1));
+    }
+
+    #[test]
+    fn send_prompt_publishes_prompt_submitted_with_matching_turn_id() {
+        let (mut m, bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let rx = bus.subscribe();
+        let turn = m.send_prompt(id, "hi").expect("send_prompt should succeed");
+
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let submitted: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                SessionEvent::PromptSubmitted {
+                    session_id,
+                    turn_id,
+                } => Some((*session_id, *turn_id)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            submitted,
+            vec![(id, turn)],
+            "expected exactly one PromptSubmitted matching the returned turn, saw {events:?}"
+        );
+    }
+
+    #[test]
+    fn send_prompt_writes_text_then_submit_sequence() {
+        let (mut m, _bus) = manager_with_bus();
+        let next_id = m.peek_next_id();
+        let (session, recording) = super::test_support::make_recording_session(next_id);
+        let id = m.push_for_test(session);
+        m.send_prompt(id, "hello")
+            .expect("send_prompt should succeed");
+        assert_eq!(recording.captured(), b"hello\r");
+    }
+
+    #[test]
+    fn send_prompt_writes_unicode_text_correctly() {
+        let (mut m, _bus) = manager_with_bus();
+        let next_id = m.peek_next_id();
+        let (session, recording) = super::test_support::make_recording_session(next_id);
+        let id = m.push_for_test(session);
+        m.send_prompt(id, "héllo")
+            .expect("send_prompt should succeed");
+        assert_eq!(recording.captured(), "héllo\r".as_bytes());
+    }
+
+    #[test]
+    fn send_prompt_unknown_id_returns_err() {
+        let (mut m, _bus) = manager_with_bus();
+        let err = m
+            .send_prompt(999, "x")
+            .expect_err("send_prompt on unknown id must fail");
+        assert!(
+            err.to_string().contains("999"),
+            "error message should mention the missing id, got {err}"
+        );
+    }
+
+    #[test]
+    fn send_prompt_unknown_id_publishes_nothing() {
+        let (mut m, bus) = manager_with_bus();
+        let rx = bus.subscribe();
+        let _ = m.send_prompt(999, "x");
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events.is_empty(),
+            "failed send_prompt must publish nothing, saw {events:?}"
+        );
+    }
+
+    #[test]
+    fn send_prompt_unknown_id_does_not_allocate_turn_id() {
+        let (mut m, _bus) = manager_with_bus();
+        let real_id = push_running(&mut m, "a");
+        let _ = m.send_prompt(999, "x");
+        let turn = m
+            .send_prompt(real_id, "y")
+            .expect("send_prompt on real id should succeed");
+        assert_eq!(
+            turn,
+            TurnId::new(0),
+            "a failed send_prompt must not bump any counter"
         );
     }
 }
