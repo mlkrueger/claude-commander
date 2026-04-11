@@ -27,8 +27,26 @@ use std::sync::mpsc;
 use crate::event::Event;
 use crate::pty::detector::PromptDetector;
 
-use super::events::{EventBus, SessionEvent};
+use super::events::{EventBus, SessionEvent, TurnId};
 use super::types::{Session, SessionStatus};
+
+/// Byte sequence appended after a prompt's payload to submit it to the
+/// underlying interactive runner. Currently `\r` (carriage return),
+/// matching what `crate::app::key_event_to_bytes` emits for
+/// `KeyCode::Enter` and what the existing `App::approve_selected`
+/// already writes directly. Centralized here so
+/// `SessionManager::send_prompt` and any future caller share one
+/// definition; if Claude Code's submit chord ever changes, this is
+/// the only line to update — and the `// MUST match SUBMIT_SEQUENCE`
+/// comment in `crate::app::key_event_to_bytes` is the cross-reference.
+//
+// `#[allow(dead_code)]` because the binary's reachability analysis
+// (`cargo build`) starts from `main` and doesn't reach `send_prompt`
+// yet — its first production caller arrives in Council Phase 2. Tests
+// reference this constant via the test target, which doesn't satisfy
+// the binary lint. Pinned by `submit_sequence_is_carriage_return`.
+#[allow(dead_code)]
+pub(crate) const SUBMIT_SEQUENCE: &[u8] = b"\r";
 
 /// Arguments for spawning a new `Session` through [`SessionManager::spawn`].
 pub struct SpawnConfig<'a> {
@@ -39,6 +57,22 @@ pub struct SpawnConfig<'a> {
     pub event_tx: mpsc::Sender<Event>,
     pub cols: u16,
     pub rows: u16,
+}
+
+/// Outcome of a [`SessionManager::broadcast`] call. Reports which
+/// session ids the broadcast attempted to write to and which ids were
+/// not found in the manager. Order within each Vec matches input
+/// order. Note that `sent` reports *attempts*, not delivery — see
+/// the doc on [`SessionManager::broadcast`] for the `try_write`
+/// failure caveat.
+//
+// `#[allow(dead_code)]` until the first production caller (Council
+// Phase 2). The binary's lint pass doesn't see test references.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastResult {
+    pub sent: Vec<usize>,
+    pub not_found: Vec<usize>,
 }
 
 pub struct SessionManager {
@@ -172,6 +206,90 @@ impl SessionManager {
     /// Mutable lookup by id.
     pub fn get_mut(&mut self, id: usize) -> Option<&mut Session> {
         self.sessions.iter_mut().find(|s| s.id == id)
+    }
+
+    /// Submit `text` to the session identified by `id`, allocating a
+    /// fresh `TurnId` and publishing `SessionEvent::PromptSubmitted` on
+    /// the bus. Writes the prompt text followed by `SUBMIT_SEQUENCE` to
+    /// the session's PTY.
+    ///
+    /// Returns `Err` if the id does not match any live session; in that
+    /// case no turn id is allocated and no event is published.
+    ///
+    /// **PTY write failures are not detected.** [`Session::try_write`]
+    /// is fire-and-forget — it logs failures and bumps
+    /// `consecutive_write_failures`, but never returns an error to its
+    /// caller. So if either the prompt-text write or the submit-byte
+    /// write fails (broken pipe, dead child, etc.), `send_prompt`
+    /// will still:
+    ///   - allocate the `TurnId`
+    ///   - publish `PromptSubmitted` on the bus
+    ///   - return `Ok(turn_id)`
+    /// even though no bytes reached the underlying process. Callers
+    /// that need write-failure visibility should consult
+    /// `Session::consecutive_write_failures` directly; the existing
+    /// logic transitions a session to `Exited(-3)` after three
+    /// consecutive failures, so a persistently broken session will
+    /// surface via `SessionEvent::Exited` on the next `reap_exited`
+    /// pass.
+    ///
+    /// PR #8 review item D1 made this limitation explicit. A future
+    /// refactor may switch `try_write` to return a `Result` and
+    /// propagate failures through `send_prompt` / `broadcast`; until
+    /// then, treat the bus's `PromptSubmitted` event as "we attempted
+    /// to submit," not "the runner has the bytes."
+    //
+    // `#[allow(dead_code)]` until the first production caller (Council
+    // Phase 3 synthesizer). The binary's lint pass doesn't see test
+    // references.
+    #[allow(dead_code)]
+    pub fn send_prompt(&mut self, id: usize, text: &str) -> anyhow::Result<TurnId> {
+        let turn_id = {
+            let session = self
+                .get_mut(id)
+                .ok_or_else(|| anyhow::anyhow!("session {id} not found"))?;
+            let turn_id = session.allocate_turn_id();
+            session.try_write(text.as_bytes());
+            session.try_write(SUBMIT_SEQUENCE);
+            turn_id
+        };
+        self.bus.publish(SessionEvent::PromptSubmitted {
+            session_id: id,
+            turn_id,
+        });
+        Ok(turn_id)
+    }
+
+    /// Write raw bytes to every session in `ids`, in order. Does not
+    /// allocate a `TurnId`, does not publish `SessionEvent`s, does not
+    /// dedupe `ids`. See `BroadcastResult` for the return shape and the
+    /// Phase 2 design doc §3 for the rationale.
+    ///
+    /// **`sent` reports attempts, not delivery.** Same caveat as
+    /// [`SessionManager::send_prompt`]: [`Session::try_write`] is
+    /// fire-and-forget, so a session id appears in `result.sent` as
+    /// long as `try_write` was called — even if the underlying PTY
+    /// write actually failed. Callers needing per-session delivery
+    /// visibility should consult `Session::consecutive_write_failures`
+    /// after the broadcast. See PR #8 review item D1.
+    //
+    // `#[allow(dead_code)]` until the first production caller (Council
+    // Phase 2 broadcast dispatch). The binary's lint pass doesn't see
+    // test references.
+    #[allow(dead_code)]
+    pub fn broadcast(&mut self, ids: &[usize], bytes: &[u8]) -> BroadcastResult {
+        let mut sent = Vec::new();
+        let mut not_found = Vec::new();
+        for &id in ids {
+            match self.get_mut(id) {
+                Some(session) => {
+                    session.try_write(bytes);
+                    sent.push(id);
+                }
+                None => not_found.push(id),
+            }
+        }
+        BroadcastResult { sent, not_found }
     }
 
     /// Current selected index, or `None` when empty.
@@ -844,6 +962,17 @@ mod tests {
     }
 
     #[test]
+    fn submit_sequence_is_carriage_return() {
+        // Pin the submit byte sequence so an unintended change to
+        // `SUBMIT_SEQUENCE` (e.g. switching to `\n` or a multi-byte
+        // chord) is caught immediately. The value must match what the
+        // production keyboard handler writes for `KeyCode::Enter` —
+        // see `crate::app::key_event_to_bytes` and the existing
+        // `App::approve_selected` call site (`b"\r"`).
+        assert_eq!(super::SUBMIT_SEQUENCE, b"\r");
+    }
+
+    #[test]
     fn check_attention_publishes_via_real_detector() {
         // PR #7 review item D2: closes the one wiring gap that
         // `publish_status_diffs` direct tests can't see — verifies
@@ -914,6 +1043,226 @@ mod tests {
             "expected PromptPending fired by detector hit, saw {events:?}"
         );
     }
+
+    // ---------------- send_prompt (Phase 2 Task 2) ----------------
+
+    #[test]
+    fn send_prompt_returns_first_turn_id_as_zero() {
+        let (mut m, _bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let turn = m.send_prompt(id, "hi").expect("send_prompt should succeed");
+        assert_eq!(turn, TurnId::new(0));
+    }
+
+    #[test]
+    fn send_prompt_returns_monotonic_turn_ids() {
+        let (mut m, _bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let first = m.send_prompt(id, "one").expect("first send_prompt");
+        let second = m.send_prompt(id, "two").expect("second send_prompt");
+        assert_eq!(first, TurnId::new(0));
+        assert_eq!(second, TurnId::new(1));
+    }
+
+    #[test]
+    fn send_prompt_publishes_prompt_submitted_with_matching_turn_id() {
+        let (mut m, bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let rx = bus.subscribe();
+        let turn = m.send_prompt(id, "hi").expect("send_prompt should succeed");
+
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let submitted: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                SessionEvent::PromptSubmitted {
+                    session_id,
+                    turn_id,
+                } => Some((*session_id, *turn_id)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            submitted,
+            vec![(id, turn)],
+            "expected exactly one PromptSubmitted matching the returned turn, saw {events:?}"
+        );
+    }
+
+    #[test]
+    fn send_prompt_writes_text_then_submit_sequence() {
+        let (mut m, _bus) = manager_with_bus();
+        let next_id = m.peek_next_id();
+        let (session, recording) = super::test_support::make_recording_session(next_id);
+        let id = m.push_for_test(session);
+        m.send_prompt(id, "hello")
+            .expect("send_prompt should succeed");
+        assert_eq!(recording.captured(), b"hello\r");
+    }
+
+    #[test]
+    fn send_prompt_writes_unicode_text_correctly() {
+        let (mut m, _bus) = manager_with_bus();
+        let next_id = m.peek_next_id();
+        let (session, recording) = super::test_support::make_recording_session(next_id);
+        let id = m.push_for_test(session);
+        m.send_prompt(id, "héllo")
+            .expect("send_prompt should succeed");
+        assert_eq!(recording.captured(), "héllo\r".as_bytes());
+    }
+
+    #[test]
+    fn send_prompt_unknown_id_returns_err() {
+        let (mut m, _bus) = manager_with_bus();
+        let err = m
+            .send_prompt(999, "x")
+            .expect_err("send_prompt on unknown id must fail");
+        assert!(
+            err.to_string().contains("999"),
+            "error message should mention the missing id, got {err}"
+        );
+    }
+
+    #[test]
+    fn send_prompt_unknown_id_publishes_nothing() {
+        let (mut m, bus) = manager_with_bus();
+        let rx = bus.subscribe();
+        let _ = m.send_prompt(999, "x");
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events.is_empty(),
+            "failed send_prompt must publish nothing, saw {events:?}"
+        );
+    }
+
+    #[test]
+    fn send_prompt_unknown_id_does_not_allocate_turn_id() {
+        let (mut m, _bus) = manager_with_bus();
+        let real_id = push_running(&mut m, "a");
+        let _ = m.send_prompt(999, "x");
+        let turn = m
+            .send_prompt(real_id, "y")
+            .expect("send_prompt on real id should succeed");
+        assert_eq!(
+            turn,
+            TurnId::new(0),
+            "a failed send_prompt must not bump any counter"
+        );
+    }
+
+    // ---------------- broadcast (Phase 2 Task 3) ----------------
+    //
+    // These tests exercise the `SessionManager::broadcast` contract:
+    // raw multi-session writes that do NOT allocate a TurnId and do
+    // NOT publish any `SessionEvent`. See docs/designs/session-management.md §3.
+    //
+    // `TurnId` is already in scope via the `use super::*;` at the top
+    // of `mod tests` (file-level `use super::events::{..., TurnId}`),
+    // so no extra import is needed here.
+
+    #[test]
+    fn broadcast_to_empty_ids_returns_empty_result() {
+        let mut m = SessionManager::new();
+        let result = m.broadcast(&[], b"hi");
+        assert!(result.sent.is_empty());
+        assert!(result.not_found.is_empty());
+    }
+
+    #[test]
+    fn broadcast_to_single_session_records_in_sent() {
+        let (mut m, _bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let result = m.broadcast(&[id], b"x");
+        assert_eq!(result.sent, vec![id]);
+        assert!(result.not_found.is_empty());
+    }
+
+    #[test]
+    fn broadcast_to_multiple_sessions_preserves_input_order() {
+        let (mut m, _bus) = manager_with_bus();
+        let id_a = push_running(&mut m, "a");
+        let id_b = push_running(&mut m, "b");
+        let id_c = push_running(&mut m, "c");
+
+        // Deliberately not in storage order: c, a, b.
+        let result = m.broadcast(&[id_c, id_a, id_b], b"x");
+        assert_eq!(result.sent, vec![id_c, id_a, id_b]);
+        assert!(result.not_found.is_empty());
+    }
+
+    #[test]
+    fn broadcast_to_unknown_id_records_in_not_found() {
+        let (mut m, _bus) = manager_with_bus();
+        let real_id = push_running(&mut m, "a");
+        let result = m.broadcast(&[real_id, 9999], b"x");
+        assert_eq!(result.sent, vec![real_id]);
+        assert_eq!(result.not_found, vec![9999]);
+    }
+
+    #[test]
+    fn broadcast_writes_bytes_to_each_target() {
+        let (mut m, _bus) = manager_with_bus();
+        let id_a = m.peek_next_id();
+        let (sess_a, rec_a) = super::test_support::make_recording_session(id_a);
+        m.push_for_test(sess_a);
+        let id_b = m.peek_next_id();
+        let (sess_b, rec_b) = super::test_support::make_recording_session(id_b);
+        m.push_for_test(sess_b);
+
+        let result = m.broadcast(&[id_a, id_b], b"hi");
+        assert_eq!(result.sent, vec![id_a, id_b]);
+        assert!(result.not_found.is_empty());
+
+        // No submit sequence or other framing — broadcast sends raw bytes.
+        assert_eq!(rec_a.captured(), b"hi");
+        assert_eq!(rec_b.captured(), b"hi");
+    }
+
+    #[test]
+    fn broadcast_does_not_publish_any_session_event() {
+        let (mut m, bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+
+        // Subscribe AFTER push so the Spawned event isn't on this rx.
+        let rx = bus.subscribe();
+
+        let _ = m.broadcast(&[id], b"payload");
+
+        // Drain — must be empty.
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events.is_empty(),
+            "broadcast must not publish any SessionEvent, saw {events:?}"
+        );
+    }
+
+    #[test]
+    fn broadcast_does_not_allocate_turn_id() {
+        let (mut m, _bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+
+        let _ = m.broadcast(&[id], b"x");
+
+        // If broadcast had allocated a TurnId, the per-session counter
+        // would now be at 1 and this next allocation would return
+        // TurnId::new(1). Assert it's still at 0.
+        let session = m.get_mut(id).expect("session must exist");
+        assert_eq!(session.allocate_turn_id(), TurnId::new(0));
+    }
+
+    #[test]
+    fn broadcast_with_duplicate_ids_writes_each_time() {
+        let (mut m, _bus) = manager_with_bus();
+        let id = m.peek_next_id();
+        let (sess, rec) = super::test_support::make_recording_session(id);
+        m.push_for_test(sess);
+
+        let result = m.broadcast(&[id, id, id], b"x");
+        assert_eq!(result.sent, vec![id, id, id]);
+        assert!(result.not_found.is_empty());
+        assert_eq!(rec.captured(), b"xxx");
+    }
 }
 
 #[cfg(test)]
@@ -979,6 +1328,53 @@ mod test_support {
         }
     }
 
+    /// `Write` impl that captures every byte written to it. Used by
+    /// `send_prompt` / `broadcast` tests to assert exactly what bytes
+    /// `Session::try_write` produced. The buffer is shared via
+    /// `Arc<Mutex<>>` so the test can hold one handle and the
+    /// `Session` (via its `Box<dyn Write + Send>`) holds another.
+    #[derive(Debug, Clone)]
+    pub(super) struct RecordingWriter(pub(super) Arc<Mutex<Vec<u8>>>);
+
+    impl RecordingWriter {
+        pub(super) fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        /// Snapshot the captured bytes. Cloning the inner Vec is fine
+        /// for tests; production code never sees this type.
+        pub(super) fn captured(&self) -> Vec<u8> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a dummy `Session` whose `writer` is a `RecordingWriter`,
+    /// returning both the session and a handle on the recording so the
+    /// test can assert on captured bytes after the session is moved
+    /// into the manager via `push_for_test`.
+    pub(super) fn make_recording_session(id: usize) -> (Session, RecordingWriter) {
+        let writer = RecordingWriter::new();
+        let mut session = make_dummy_session(id);
+        session.writer = Box::new(writer.clone());
+        (session, writer)
+    }
+
     #[derive(Debug)]
     pub(super) struct DummyChild;
 
@@ -1024,6 +1420,7 @@ mod test_support {
             },
             context_percent: None,
             consecutive_write_failures: 0,
+            next_turn_id: 0,
         }
     }
 

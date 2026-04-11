@@ -9,6 +9,7 @@ use std::time::Instant;
 use crate::claude::context;
 use crate::event::Event;
 use crate::pty::detector::PromptDetector;
+use crate::session::events::TurnId;
 
 pub fn lock_parser(p: &Mutex<vt100::Parser>) -> MutexGuard<'_, vt100::Parser> {
     p.lock().unwrap_or_else(|e| e.into_inner())
@@ -38,6 +39,18 @@ pub struct Session {
     pub pty_size: PtySize,
     pub context_percent: Option<f64>,
     pub consecutive_write_failures: u32,
+    /// Per-session monotonic counter for `TurnId` allocation. Bumped
+    /// by [`Session::allocate_turn_id`]; never reused. Phase 2 added
+    /// this so `SessionManager::send_prompt` can correlate prompts
+    /// with `ResponseComplete` events emitted by Phase 3's response
+    /// boundary detector.
+    ///
+    /// `pub(super)` so the `session::manager::test_support` helpers
+    /// that construct stub `Session` values directly can initialize
+    /// the field. Outside the `session` module, treat as private —
+    /// production code must allocate ids only via
+    /// [`Session::allocate_turn_id`].
+    pub(super) next_turn_id: u64,
 }
 
 impl Session {
@@ -139,7 +152,25 @@ impl Session {
             pty_size,
             context_percent: None,
             consecutive_write_failures: 0,
+            next_turn_id: 0,
         })
+    }
+
+    /// Allocate the next `TurnId` for this session. Returns the
+    /// current value of `next_turn_id` wrapped in a `TurnId`, then
+    /// increments the counter so the next call yields a fresh id.
+    /// Monotonic for the lifetime of the `Session`; never reused.
+    ///
+    /// Called by `SessionManager::send_prompt` (Phase 2) before
+    /// publishing `SessionEvent::PromptSubmitted`. The returned
+    /// `TurnId` is the correlation key the response boundary
+    /// detector (Phase 3) will pair with the matching
+    /// `ResponseComplete`.
+    #[allow(dead_code)] // first production caller is Phase 2 send_prompt
+    pub(crate) fn allocate_turn_id(&mut self) -> TurnId {
+        let id = TurnId::new(self.next_turn_id);
+        self.next_turn_id += 1;
+        id
     }
 
     pub fn write(&mut self, data: &[u8]) -> anyhow::Result<()> {
@@ -256,6 +287,7 @@ impl Session {
             pty_size,
             context_percent: None,
             consecutive_write_failures: 0,
+            next_turn_id: 0,
         }
     }
 }
@@ -345,5 +377,67 @@ pub(crate) mod test_helpers {
         fn process_id(&self) -> Option<u32> {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for `Session` state that doesn't require a real PTY.
+    //! Phase 2 added the `next_turn_id` counter and `allocate_turn_id`
+    //! method; the tests below pin its monotonic + per-session-isolated
+    //! contract.
+
+    use super::*;
+
+    #[test]
+    fn allocate_turn_id_starts_at_zero() {
+        let mut s = Session::dummy_exited(1, "a");
+        assert_eq!(s.allocate_turn_id(), TurnId::new(0));
+    }
+
+    #[test]
+    fn allocate_turn_id_is_monotonic() {
+        let mut s = Session::dummy_exited(1, "a");
+        let ids: Vec<TurnId> = (0..5).map(|_| s.allocate_turn_id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                TurnId::new(0),
+                TurnId::new(1),
+                TurnId::new(2),
+                TurnId::new(3),
+                TurnId::new(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn allocate_turn_id_never_reuses_a_value() {
+        // Stronger version of monotonic: across many allocations, no
+        // id repeats. Catches a future "reset on overflow" or
+        // "reuse after reap" regression.
+        let mut s = Session::dummy_exited(1, "a");
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = s.allocate_turn_id();
+            assert!(seen.insert(id), "TurnId {id:?} was reused");
+        }
+    }
+
+    #[test]
+    fn allocate_turn_id_is_independent_per_session() {
+        // Two sessions on the same manager (or in this test, just two
+        // independent `Session`s) must have independent counters —
+        // a turn id allocated by session A says nothing about session
+        // B's next turn id.
+        let mut a = Session::dummy_exited(1, "a");
+        let mut b = Session::dummy_exited(2, "b");
+
+        let _ = a.allocate_turn_id(); // a is now at 1
+        let _ = a.allocate_turn_id(); // a is now at 2
+
+        assert_eq!(b.allocate_turn_id(), TurnId::new(0));
+        assert_eq!(a.allocate_turn_id(), TurnId::new(2));
+        assert_eq!(b.allocate_turn_id(), TurnId::new(1));
     }
 }

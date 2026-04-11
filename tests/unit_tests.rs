@@ -388,6 +388,201 @@ mod session_bus_integration {
             assert_eq!(code, 0);
         }
     }
+
+    // ---------------- Phase 2 (send_prompt + broadcast) ----------------
+    //
+    // These exercise the production path against a real PTY backed by
+    // `/bin/cat`, which echoes its stdin to stdout. The PTY's line
+    // discipline ALSO echoes input back, so a successful write produces
+    // observable bytes on the PtyOutput event channel that the test
+    // reader thread feeds. We use that to confirm the bytes
+    // `send_prompt` and `broadcast` write actually reached the PTY.
+
+    use ccom::session::TurnId;
+    use std::collections::HashMap;
+
+    /// Per-session PTY output buffer that survives across multiple
+    /// `wait_for_bytes` calls. Built once per test and threaded through
+    /// each substring check so events for *other* sessions get
+    /// accumulated for their own future checks instead of being
+    /// silently dropped.
+    ///
+    /// This replaces an earlier helper (`read_pty_until_contains`) that
+    /// drained the channel into a single per-call buffer and discarded
+    /// any non-matching events. PR #8 review item C3 caught the bug:
+    /// `broadcast_through_real_pty_writes_to_each_session` checks
+    /// session a then session b in sequence, and the original helper
+    /// would discard a's events while waiting for b (or vice versa)
+    /// depending on arrival order. The test passed by ordering luck.
+    struct PtyOutputAccumulator<'a> {
+        rx: &'a mpsc::Receiver<ccom::event::Event>,
+        buffers: HashMap<usize, Vec<u8>>,
+    }
+
+    impl<'a> PtyOutputAccumulator<'a> {
+        fn new(rx: &'a mpsc::Receiver<ccom::event::Event>) -> Self {
+            Self {
+                rx,
+                buffers: HashMap::new(),
+            }
+        }
+
+        /// Drain whatever is currently sitting on the channel into the
+        /// per-session buffers. Non-blocking.
+        fn drain(&mut self) {
+            while let Ok(ev) = self.rx.try_recv() {
+                if let ccom::event::Event::PtyOutput { session_id, data } = ev {
+                    self.buffers
+                        .entry(session_id)
+                        .or_default()
+                        .extend_from_slice(&data);
+                }
+            }
+        }
+
+        /// Block (with polling) until `needle` appears anywhere in the
+        /// accumulated buffer for `target_session`, or `timeout`
+        /// elapses. Drain happens on every poll, so events for other
+        /// sessions are buffered for their own future checks.
+        fn wait_for_bytes(
+            &mut self,
+            target_session: usize,
+            needle: &[u8],
+            timeout: Duration,
+        ) -> bool {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                self.drain();
+                if let Some(buf) = self.buffers.get(&target_session)
+                    && buf.windows(needle.len()).any(|w| w == needle)
+                {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn send_prompt_through_real_pty_writes_bytes_and_publishes_event() {
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+        let (event_tx, event_rx) = mpsc::channel();
+
+        // `cat` reads its stdin and echoes back. The PTY line
+        // discipline also echoes input, so we'll see the bytes via
+        // the PtyOutput channel either way.
+        let id = manager
+            .spawn(SpawnConfig {
+                label: "smoke-send".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx,
+                cols: 80,
+                rows: 24,
+            })
+            .expect("real spawn should succeed");
+
+        let bus_rx = bus.subscribe();
+        let returned_turn = manager
+            .send_prompt(id, "phase2-marker")
+            .expect("send_prompt should succeed against a real PTY");
+
+        // First allocation on this fresh session — TurnId::new(0).
+        assert_eq!(returned_turn, TurnId::new(0));
+
+        // The bus must publish PromptSubmitted with the same turn id.
+        let bus_event = wait_for(&bus_rx, Duration::from_secs(2), |ev| {
+            matches!(
+                ev,
+                ccom::session::SessionEvent::PromptSubmitted { session_id, .. }
+                    if *session_id == id
+            )
+        })
+        .expect("PromptSubmitted should arrive on bus");
+        if let ccom::session::SessionEvent::PromptSubmitted { turn_id, .. } = bus_event {
+            assert_eq!(turn_id, returned_turn);
+        }
+
+        // The bytes we wrote must actually reach the PTY — verified
+        // via the PtyOutput echo through cat.
+        let mut pty = PtyOutputAccumulator::new(&event_rx);
+        assert!(
+            pty.wait_for_bytes(id, b"phase2-marker", Duration::from_secs(3)),
+            "expected 'phase2-marker' to appear in PtyOutput from cat",
+        );
+
+        manager.kill(id);
+    }
+
+    #[test]
+    fn broadcast_through_real_pty_writes_to_each_session() {
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+        let (event_tx, event_rx) = mpsc::channel();
+
+        let id_a = manager
+            .spawn(SpawnConfig {
+                label: "smoke-bcast-a".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx: event_tx.clone(),
+                cols: 80,
+                rows: 24,
+            })
+            .expect("spawn a");
+
+        let id_b = manager
+            .spawn(SpawnConfig {
+                label: "smoke-bcast-b".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx,
+                cols: 80,
+                rows: 24,
+            })
+            .expect("spawn b");
+
+        // Subscribe AFTER spawn so we don't have to filter Spawned events.
+        let bus_rx = bus.subscribe();
+
+        let result = manager.broadcast(&[id_a, id_b], b"bcast-marker\r");
+        assert_eq!(result.sent, vec![id_a, id_b]);
+        assert!(result.not_found.is_empty());
+
+        // Bytes must reach BOTH sessions — verified via per-session
+        // PtyOutput echoes through their respective cat processes.
+        // Single accumulator threads through both checks so events
+        // arriving for one session while we wait on the other are
+        // buffered, not dropped (PR #8 review item C3).
+        let mut pty = PtyOutputAccumulator::new(&event_rx);
+        assert!(
+            pty.wait_for_bytes(id_a, b"bcast-marker", Duration::from_secs(3)),
+            "session a should have echoed 'bcast-marker'",
+        );
+        assert!(
+            pty.wait_for_bytes(id_b, b"bcast-marker", Duration::from_secs(3)),
+            "session b should have echoed 'bcast-marker'",
+        );
+
+        // Broadcast must NOT have published any SessionEvent on the bus.
+        let bus_events: Vec<_> = std::iter::from_fn(|| bus_rx.try_recv().ok()).collect();
+        assert!(
+            !bus_events
+                .iter()
+                .any(|ev| matches!(ev, ccom::session::SessionEvent::PromptSubmitted { .. })),
+            "broadcast must not publish PromptSubmitted, saw {bus_events:?}",
+        );
+
+        manager.kill(id_a);
+        manager.kill(id_b);
+    }
 }
 
 // Test key_event_to_bytes (need to make it pub or test via integration)
