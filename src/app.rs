@@ -2,6 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ use crate::event::Event;
 use crate::fs::git::{self, GitStatusMap};
 use crate::fs::tree::FileTree;
 use crate::pty::detector::PromptDetector;
-use crate::session::{SessionManager, SessionStatus, SpawnConfig, lock_parser};
+use crate::session::{EventBus, SessionManager, SessionStatus, SpawnConfig, lock_parser};
 use crate::setup::{self, SetupItem};
 use crate::ui::layout::AppLayout;
 use crate::ui::panels::command_bar::{self, CommandBar, CommandBarMode};
@@ -96,6 +97,13 @@ pub enum PanelFocus {
 
 pub struct App {
     pub(crate) sessions: SessionManager,
+    /// Top-level event bus for high-level `SessionEvent`s. Owned at the
+    /// `App` level so future consumers (Council controller, MCP server,
+    /// stats panel) can subscribe without reaching through
+    /// `SessionManager`. Holds the same `Arc` that `SessionManager`
+    /// publishes to. Read by Phase 2+ consumers.
+    #[allow(dead_code)]
+    pub(crate) event_bus: Arc<EventBus>,
     pub mode: AppMode,
     pub focus: PanelFocus,
     pub file_tree: FileTree,
@@ -140,8 +148,10 @@ impl App {
         } else {
             AppMode::Dashboard
         };
+        let event_bus = Arc::new(EventBus::new());
         Self {
-            sessions: SessionManager::new(),
+            sessions: SessionManager::with_bus(Arc::clone(&event_bus)),
+            event_bus,
             mode: initial_mode,
             focus: PanelFocus::SessionList,
             file_tree,

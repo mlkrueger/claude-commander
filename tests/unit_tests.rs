@@ -223,6 +223,173 @@ mod editor_tests {
     }
 }
 
+// Integration smoke tests that exercise SessionManager's *real* spawn path
+// (PTY + fork) end-to-end with the EventBus. The unit tests inside
+// `src/session/manager.rs` use `push_for_test` and dummy children to keep
+// the inner test loop fast and offline; these tests catch any wiring
+// regressions in the production `Session::spawn` -> bus publish chain that
+// the dummy path can't see.
+mod session_bus_integration {
+    use ccom::session::{EventBus, SessionManager, SpawnConfig};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Drain bus events until we either find one matching `pred` or
+    /// exceed `timeout`. The bus is sync (`std::sync::mpsc`), so this
+    /// just spins on `try_recv` with a small sleep — keeps the test
+    /// resilient to ordering and to incidental events that arrive
+    /// alongside the one we care about.
+    fn wait_for<F>(
+        rx: &mpsc::Receiver<ccom::session::SessionEvent>,
+        timeout: Duration,
+        mut pred: F,
+    ) -> Option<ccom::session::SessionEvent>
+    where
+        F: FnMut(&ccom::session::SessionEvent) -> bool,
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            while let Ok(ev) = rx.try_recv() {
+                if pred(&ev) {
+                    return Some(ev);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn spawn_publishes_spawned_event_through_real_pty() {
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+        let rx = bus.subscribe();
+
+        // We need an event_tx for the PTY reader thread. We don't read
+        // from it here — the test only cares about the bus.
+        let (event_tx, _event_rx) = mpsc::channel();
+
+        let id = manager
+            .spawn(SpawnConfig {
+                label: "smoke-spawn".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/sh",
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+                event_tx,
+                cols: 80,
+                rows: 24,
+            })
+            .expect("real spawn should succeed");
+
+        let event = wait_for(&rx, Duration::from_secs(2), |ev| {
+            matches!(
+                ev,
+                ccom::session::SessionEvent::Spawned { session_id, .. }
+                    if *session_id == id
+            )
+        })
+        .expect("Spawned event should arrive within 2s");
+
+        match event {
+            ccom::session::SessionEvent::Spawned { session_id, label } => {
+                assert_eq!(session_id, id);
+                assert_eq!(label, "smoke-spawn");
+            }
+            _ => unreachable!(),
+        }
+
+        // Cleanup: child has likely already exited, but kill is
+        // idempotent on dead processes.
+        manager.kill(id);
+    }
+
+    #[test]
+    fn kill_publishes_exited_event_through_real_pty() {
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+
+        let (event_tx, _event_rx) = mpsc::channel();
+        // Use `sleep 30` so the child is reliably alive when we kill it.
+        let id = manager
+            .spawn(SpawnConfig {
+                label: "smoke-kill".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/sh",
+                args: vec!["-c".to_string(), "sleep 30".to_string()],
+                event_tx,
+                cols: 80,
+                rows: 24,
+            })
+            .expect("real spawn should succeed");
+
+        // Subscribe AFTER spawn so we don't have to filter the Spawned
+        // event we don't care about for this test.
+        let rx = bus.subscribe();
+
+        assert!(manager.kill(id));
+
+        let event = wait_for(&rx, Duration::from_secs(2), |ev| {
+            matches!(
+                ev,
+                ccom::session::SessionEvent::Exited { session_id, .. }
+                    if *session_id == id
+            )
+        })
+        .expect("Exited event should arrive within 2s");
+
+        if let ccom::session::SessionEvent::Exited { code, .. } = event {
+            // `Session::kill` sets status to Exited(-1) regardless of
+            // the actual signal-driven exit code, so the bus event
+            // mirrors that.
+            assert_eq!(code, -1);
+        }
+    }
+
+    #[test]
+    fn reap_exited_publishes_for_naturally_exiting_child() {
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+
+        let (event_tx, _event_rx) = mpsc::channel();
+        let id = manager
+            .spawn(SpawnConfig {
+                label: "smoke-reap".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/sh",
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+                event_tx,
+                cols: 80,
+                rows: 24,
+            })
+            .expect("real spawn should succeed");
+
+        // Wait long enough for the child to actually exit on its own.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let rx = bus.subscribe();
+        manager.reap_exited();
+
+        let event = wait_for(&rx, Duration::from_secs(2), |ev| {
+            matches!(
+                ev,
+                ccom::session::SessionEvent::Exited { session_id, .. }
+                    if *session_id == id
+            )
+        })
+        .expect("reap_exited should publish Exited within 2s");
+
+        if let ccom::session::SessionEvent::Exited { code, .. } = event {
+            // `exit 0` exits with code 0 — reap_exited reads the real
+            // child status, so the published code matches.
+            assert_eq!(code, 0);
+        }
+    }
+}
+
 // Test key_event_to_bytes (need to make it pub or test via integration)
 mod key_encoding_tests {
     #[test]
