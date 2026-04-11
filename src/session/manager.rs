@@ -52,6 +52,16 @@ pub struct SpawnConfig<'a> {
     pub rows: u16,
 }
 
+/// Outcome of a [`SessionManager::broadcast`] call. Reports which
+/// session ids successfully received the bytes and which were not
+/// found in the manager. Order within each Vec matches input order.
+#[allow(dead_code)] // first production caller lands in Council Phase 2
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastResult {
+    pub sent: Vec<usize>,
+    pub not_found: Vec<usize>,
+}
+
 pub struct SessionManager {
     sessions: Vec<Session>,
     selected: usize,
@@ -208,6 +218,26 @@ impl SessionManager {
             turn_id,
         });
         Ok(turn_id)
+    }
+
+    /// Write raw bytes to every session in `ids`, in order. Does not
+    /// allocate a `TurnId`, does not publish `SessionEvent`s, does not
+    /// dedupe `ids`. See `BroadcastResult` for the return shape and the
+    /// Phase 2 design doc §3 for the rationale.
+    #[allow(dead_code)] // first production caller lands in Council Phase 2
+    pub fn broadcast(&mut self, ids: &[usize], bytes: &[u8]) -> BroadcastResult {
+        let mut sent = Vec::new();
+        let mut not_found = Vec::new();
+        for &id in ids {
+            match self.get_mut(id) {
+                Some(session) => {
+                    session.try_write(bytes);
+                    sent.push(id);
+                }
+                None => not_found.push(id),
+            }
+        }
+        BroadcastResult { sent, not_found }
     }
 
     /// Current selected index, or `None` when empty.
@@ -1067,6 +1097,119 @@ mod tests {
             TurnId::new(0),
             "a failed send_prompt must not bump any counter"
         );
+    }
+
+    // ---------------- broadcast (Phase 2 Task 3) ----------------
+    //
+    // These tests exercise the `SessionManager::broadcast` contract:
+    // raw multi-session writes that do NOT allocate a TurnId and do
+    // NOT publish any `SessionEvent`. See docs/designs/session-management.md §3.
+    //
+    // `TurnId` is already in scope via the `use super::*;` at the top
+    // of `mod tests` (file-level `use super::events::{..., TurnId}`),
+    // so no extra import is needed here.
+
+    #[test]
+    fn broadcast_to_empty_ids_returns_empty_result() {
+        let mut m = SessionManager::new();
+        let result = m.broadcast(&[], b"hi");
+        assert!(result.sent.is_empty());
+        assert!(result.not_found.is_empty());
+    }
+
+    #[test]
+    fn broadcast_to_single_session_records_in_sent() {
+        let (mut m, _bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let result = m.broadcast(&[id], b"x");
+        assert_eq!(result.sent, vec![id]);
+        assert!(result.not_found.is_empty());
+    }
+
+    #[test]
+    fn broadcast_to_multiple_sessions_preserves_input_order() {
+        let (mut m, _bus) = manager_with_bus();
+        let id_a = push_running(&mut m, "a");
+        let id_b = push_running(&mut m, "b");
+        let id_c = push_running(&mut m, "c");
+
+        // Deliberately not in storage order: c, a, b.
+        let result = m.broadcast(&[id_c, id_a, id_b], b"x");
+        assert_eq!(result.sent, vec![id_c, id_a, id_b]);
+        assert!(result.not_found.is_empty());
+    }
+
+    #[test]
+    fn broadcast_to_unknown_id_records_in_not_found() {
+        let (mut m, _bus) = manager_with_bus();
+        let real_id = push_running(&mut m, "a");
+        let result = m.broadcast(&[real_id, 9999], b"x");
+        assert_eq!(result.sent, vec![real_id]);
+        assert_eq!(result.not_found, vec![9999]);
+    }
+
+    #[test]
+    fn broadcast_writes_bytes_to_each_target() {
+        let (mut m, _bus) = manager_with_bus();
+        let id_a = m.peek_next_id();
+        let (sess_a, rec_a) = super::test_support::make_recording_session(id_a);
+        m.push_for_test(sess_a);
+        let id_b = m.peek_next_id();
+        let (sess_b, rec_b) = super::test_support::make_recording_session(id_b);
+        m.push_for_test(sess_b);
+
+        let result = m.broadcast(&[id_a, id_b], b"hi");
+        assert_eq!(result.sent, vec![id_a, id_b]);
+        assert!(result.not_found.is_empty());
+
+        // No submit sequence or other framing — broadcast sends raw bytes.
+        assert_eq!(rec_a.captured(), b"hi");
+        assert_eq!(rec_b.captured(), b"hi");
+    }
+
+    #[test]
+    fn broadcast_does_not_publish_any_session_event() {
+        let (mut m, bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+
+        // Subscribe AFTER push so the Spawned event isn't on this rx.
+        let rx = bus.subscribe();
+
+        let _ = m.broadcast(&[id], b"payload");
+
+        // Drain — must be empty.
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events.is_empty(),
+            "broadcast must not publish any SessionEvent, saw {events:?}"
+        );
+    }
+
+    #[test]
+    fn broadcast_does_not_allocate_turn_id() {
+        let (mut m, _bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+
+        let _ = m.broadcast(&[id], b"x");
+
+        // If broadcast had allocated a TurnId, the per-session counter
+        // would now be at 1 and this next allocation would return
+        // TurnId::new(1). Assert it's still at 0.
+        let session = m.get_mut(id).expect("session must exist");
+        assert_eq!(session.allocate_turn_id(), TurnId::new(0));
+    }
+
+    #[test]
+    fn broadcast_with_duplicate_ids_writes_each_time() {
+        let (mut m, _bus) = manager_with_bus();
+        let id = m.peek_next_id();
+        let (sess, rec) = super::test_support::make_recording_session(id);
+        m.push_for_test(sess);
+
+        let result = m.broadcast(&[id, id, id], b"x");
+        assert_eq!(result.sent, vec![id, id, id]);
+        assert!(result.not_found.is_empty());
+        assert_eq!(rec.captured(), b"xxx");
     }
 }
 
