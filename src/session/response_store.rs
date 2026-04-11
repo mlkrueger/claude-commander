@@ -18,15 +18,8 @@
 //! history. Default budget: 256 KB. Default min retention: 3 turns.
 //!
 //! See `docs/designs/session-management.md` §4 for the full rationale.
-//!
-//! ## Phase 3 Task 0 (this skeleton)
-//!
-//! `StoredTurn`, `TurnSink`, and the `ResponseStore` skeleton with
-//! `todo!()` bodies are pre-staged on the phase branch so the
-//! parallel Tasks 1 (real `ResponseStore` impl) and 3 (detector) can
-//! be developed in separate worktrees without stepping on each other.
-//! Task 1 replaces all `todo!()` calls in this file.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::session::events::TurnId;
@@ -74,25 +67,22 @@ pub trait TurnSink {
     fn push_turn(&mut self, turn: StoredTurn);
 }
 
-/// Bounded per-session store of [`StoredTurn`]s. Phase 3 Task 1
-/// (parallel subagent) will replace this skeleton with the real
-/// implementation.
-#[allow(dead_code)] // first production caller is Phase 3 Task 5 (get_response accessor)
+/// Bounded per-session store of [`StoredTurn`]s.
+///
+/// Eviction policy: oldest-first while `total_bytes > budget_bytes`
+/// **and** `len > min_retain`. The floor takes precedence so a single
+/// oversized turn can never push the store below `min_retain`.
 pub struct ResponseStore {
-    // Skeleton placeholder. Phase 3 Task 1 replaces this with real
-    // fields (a `VecDeque<StoredTurn>`, total_bytes counter, budget
-    // params, etc.). Marked `pub(super)` so the same-module
-    // implementation can mutate, but no caller outside the module
-    // touches it directly — all access goes through the methods
-    // below.
-    pub(super) _phase_3_task_1_placeholder: (),
+    turns: VecDeque<StoredTurn>,
+    total_bytes: usize,
+    budget_bytes: usize,
+    min_retain: usize,
 }
 
 impl ResponseStore {
     /// Construct a `ResponseStore` with the default budget
     /// ([`DEFAULT_BUDGET_BYTES`]) and default minimum retention floor
     /// ([`DEFAULT_MIN_RETAIN`]).
-    #[allow(dead_code)] // first production caller is Phase 3 Task 4 (PTY reader hook)
     pub fn new() -> Self {
         Self::with_budget(DEFAULT_BUDGET_BYTES, DEFAULT_MIN_RETAIN)
     }
@@ -102,18 +92,20 @@ impl ResponseStore {
     /// `total_bytes > budget_bytes` AND `len > min_retain` — the
     /// `min_retain` floor takes precedence so an oversized turn never
     /// causes the store to drop below the floor.
-    #[allow(dead_code)] // first production caller is Phase 3 Task 4 (PTY reader hook)
     pub fn with_budget(budget_bytes: usize, min_retain: usize) -> Self {
-        let _ = (budget_bytes, min_retain);
-        todo!("Phase 3 Task 1 — ResponseStore::with_budget")
+        Self {
+            turns: VecDeque::new(),
+            total_bytes: 0,
+            budget_bytes,
+            min_retain,
+        }
     }
 
     /// Look up a completed turn by id. Returns `None` if the turn
     /// has been evicted, never existed, or is still in progress.
     #[allow(dead_code)] // first production caller is Phase 3 Task 5 (get_response accessor)
     pub fn get(&self, turn_id: TurnId) -> Option<&StoredTurn> {
-        let _ = turn_id;
-        todo!("Phase 3 Task 1 — ResponseStore::get")
+        self.turns.iter().find(|t| t.turn_id == turn_id)
     }
 
     /// Return the most recently completed turn, if any. Useful for
@@ -121,14 +113,14 @@ impl ResponseStore {
     /// recovery path described in the design spec §2.
     #[allow(dead_code)] // first production caller is Phase 3 Task 5 (get_latest_response accessor)
     pub fn latest(&self) -> Option<&StoredTurn> {
-        todo!("Phase 3 Task 1 — ResponseStore::latest")
+        self.turns.back()
     }
 
     /// Number of stored turns. Useful for tests asserting eviction
     /// behavior.
     #[allow(dead_code)] // exposed for Phase 3 Task 2 store tests
     pub fn len(&self) -> usize {
-        todo!("Phase 3 Task 1 — ResponseStore::len")
+        self.turns.len()
     }
 
     /// Total bytes currently held in the store (sum of every
@@ -136,7 +128,7 @@ impl ResponseStore {
     /// enforcement.
     #[allow(dead_code)] // exposed for Phase 3 Task 2 store tests
     pub fn total_bytes(&self) -> usize {
-        todo!("Phase 3 Task 1 — ResponseStore::total_bytes")
+        self.total_bytes
     }
 }
 
@@ -148,7 +140,201 @@ impl Default for ResponseStore {
 
 impl TurnSink for ResponseStore {
     fn push_turn(&mut self, turn: StoredTurn) {
-        let _ = turn;
-        todo!("Phase 3 Task 1 — TurnSink for ResponseStore")
+        self.total_bytes += turn.body.len();
+        self.turns.push_back(turn);
+
+        while self.total_bytes > self.budget_bytes && self.turns.len() > self.min_retain {
+            if let Some(evicted) = self.turns.pop_front() {
+                self.total_bytes -= evicted.body.len();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn_of_size(id: u64, body_bytes: usize) -> StoredTurn {
+        StoredTurn {
+            turn_id: TurnId::new(id),
+            started_at: Instant::now(),
+            completed_at: Some(Instant::now()),
+            body: "x".repeat(body_bytes),
+        }
+    }
+
+    #[test]
+    fn new_store_is_empty() {
+        let store = ResponseStore::new();
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.total_bytes(), 0);
+        assert!(store.latest().is_none());
+    }
+
+    #[test]
+    fn with_budget_zero_min_retain_is_allowed() {
+        let store = ResponseStore::with_budget(100, 0);
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.total_bytes(), 0);
+    }
+
+    #[test]
+    fn push_turn_appends_and_increases_total_bytes() {
+        let mut store = ResponseStore::new();
+        let turn = turn_of_size(1, 50);
+        store.push_turn(turn.clone());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), 50);
+        assert_eq!(store.latest(), Some(&turn));
+        assert_eq!(store.get(TurnId::new(1)), Some(&turn));
+    }
+
+    #[test]
+    fn get_unknown_turn_id_returns_none() {
+        let mut store = ResponseStore::new();
+        store.push_turn(turn_of_size(1, 10));
+        assert!(store.get(TurnId::new(42)).is_none());
+    }
+
+    #[test]
+    fn latest_returns_most_recently_pushed() {
+        let mut store = ResponseStore::new();
+        store.push_turn(turn_of_size(0, 10));
+        store.push_turn(turn_of_size(1, 10));
+        store.push_turn(turn_of_size(2, 10));
+        assert_eq!(store.latest().unwrap().turn_id, TurnId::new(2));
+    }
+
+    #[test]
+    fn push_below_budget_does_not_evict() {
+        let mut store = ResponseStore::with_budget(1000, 0);
+        for id in 0..3 {
+            store.push_turn(turn_of_size(id, 100));
+        }
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.total_bytes(), 300);
+        for id in 0..3 {
+            assert!(store.get(TurnId::new(id)).is_some());
+        }
+    }
+
+    #[test]
+    fn push_over_budget_evicts_oldest_first() {
+        let mut store = ResponseStore::with_budget(200, 0);
+        for id in 0..4 {
+            store.push_turn(turn_of_size(id, 100));
+        }
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.total_bytes(), 200);
+        assert!(store.get(TurnId::new(0)).is_none());
+        assert!(store.get(TurnId::new(1)).is_none());
+        assert!(store.get(TurnId::new(2)).is_some());
+        assert!(store.get(TurnId::new(3)).is_some());
+    }
+
+    #[test]
+    fn min_retain_floor_protects_against_budget() {
+        let mut store = ResponseStore::with_budget(100, 3);
+        for id in 0..4 {
+            store.push_turn(turn_of_size(id, 100));
+        }
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.total_bytes(), 300);
+        assert!(store.get(TurnId::new(0)).is_none());
+        assert!(store.get(TurnId::new(1)).is_some());
+        assert!(store.get(TurnId::new(2)).is_some());
+        assert!(store.get(TurnId::new(3)).is_some());
+    }
+
+    #[test]
+    fn single_oversized_turn_is_retained_when_below_min_retain() {
+        let mut store = ResponseStore::with_budget(100, 3);
+        store.push_turn(turn_of_size(7, 500));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), 500);
+        assert!(store.get(TurnId::new(7)).is_some());
+    }
+
+    #[test]
+    fn min_retain_three_with_one_huge_turn_keeps_huge_plus_two_more() {
+        let mut store = ResponseStore::with_budget(100, 3);
+        store.push_turn(turn_of_size(0, 10));
+        store.push_turn(turn_of_size(1, 10));
+        store.push_turn(turn_of_size(2, 1000));
+        store.push_turn(turn_of_size(3, 10));
+        store.push_turn(turn_of_size(4, 10));
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.total_bytes(), 1020);
+        assert!(store.get(TurnId::new(0)).is_none());
+        assert!(store.get(TurnId::new(1)).is_none());
+        assert!(store.get(TurnId::new(2)).is_some());
+        assert!(store.get(TurnId::new(3)).is_some());
+        assert!(store.get(TurnId::new(4)).is_some());
+    }
+
+    #[test]
+    fn zero_min_retain_evicts_below_budget_aggressively() {
+        let mut store = ResponseStore::with_budget(50, 0);
+        for id in 0..3 {
+            store.push_turn(turn_of_size(id, 100));
+        }
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.total_bytes(), 0);
+    }
+
+    #[test]
+    fn total_bytes_matches_sum_of_bodies_after_evictions() {
+        let mut store = ResponseStore::with_budget(500, 0);
+        let sizes = [30, 70, 50, 120, 40, 80, 60, 90, 110, 25];
+        for (id, size) in sizes.iter().enumerate() {
+            store.push_turn(turn_of_size(id as u64, *size));
+        }
+
+        let reported = store.total_bytes();
+        let mut summed = 0usize;
+        for id in 0..sizes.len() as u64 {
+            if let Some(t) = store.get(TurnId::new(id)) {
+                summed += t.body.len();
+            }
+        }
+        assert_eq!(reported, summed);
+        assert!(reported <= 500);
+
+        let before = store.total_bytes();
+        let before_len = store.len();
+        store.push_turn(turn_of_size(100, 40));
+        // After pushing a new 40-byte turn, total_bytes must equal
+        // (before + 40) minus any evicted bytes. Recompute from scratch:
+        let mut fresh = 0usize;
+        for id in 0..=100u64 {
+            if let Some(t) = store.get(TurnId::new(id)) {
+                fresh += t.body.len();
+            }
+        }
+        assert_eq!(store.total_bytes(), fresh);
+        assert!(store.total_bytes() <= 500);
+        // Sanity: either we grew by 40 (no eviction) or we stayed flat /
+        // shrank (eviction triggered).
+        let _ = (before, before_len);
+    }
+
+    #[test]
+    fn turn_sink_impl_delegates_to_push_turn() {
+        let mut store = ResponseStore::new();
+        {
+            let sink: &mut dyn TurnSink = &mut store;
+            sink.push_turn(turn_of_size(9, 20));
+        }
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.latest().unwrap().turn_id, TurnId::new(9));
+    }
+
+    #[test]
+    fn default_matches_new() {
+        let store = ResponseStore::default();
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.total_bytes(), 0);
+        assert!(store.latest().is_none());
     }
 }
