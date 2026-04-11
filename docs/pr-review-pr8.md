@@ -102,11 +102,14 @@ the action items).
   in production code paths.
 - **`text` parameter to `send_prompt` is not sanitized.** ANSI escapes
   flow through to the PTY. Currently fine because callers are trusted
-  (TUI code), but Phase 6's MCP `send_prompt` tool will accept
-  arbitrary `text` from driver sessions and needs sanitization at the
-  tool boundary. **Tracked in `docs/plans/session-management-phase-4-6.md`
-  Phase 6 task 1** alongside the existing label sanitization note.
-  Required policy: strip control chars (allowlist `\n`, `\t`),
+  (TUI code), but **Phase 5**'s MCP `send_prompt` tool handler (Task 1)
+  will accept arbitrary `text` from MCP callers and needs sanitization
+  at the tool boundary. **Tracked in
+  `docs/plans/session-management-phase-4-6.md` Phase 5 Task 1.** The
+  parallel label-sanitization task lives in Phase 6 Task 3 (the
+  `spawn_session` MCP tool, which accepts arbitrary `label` from
+  driver sessions); both share the same threat model. Required policy
+  for `send_prompt` text: strip control chars (allowlist `\n`, `\t`),
   normalize newlines, strip ANSI CSI/OSC, cap length, reject empty
   post-sanitization text.
 
@@ -142,3 +145,47 @@ the action items).
   *before* recommending the removal would have caught this. Lesson:
   always run the relevant cargo command before flagging dead-code
   annotations as "removable."
+
+---
+
+## Second review pass — delta commit `1b64282`
+
+After applying A1–A4 + D1 + D2 and pushing the follow-up commit, ran
+the review flow again on just the delta. This appendix is the second
+pass's record.
+
+### Action item verification
+
+| ID | Verified |
+|---|---|
+| **A1** | `PtyOutputAccumulator` correctly per-session-buffers events. Both real-PTY tests rebuilt; broadcast test threads ONE accumulator through both checks. C3 fix is complete. |
+| **A2** | Removed from `RecordingWriter`/impls/`make_recording_session` (cfg(test) items). Restored on `SUBMIT_SEQUENCE`, `BroadcastResult`, `send_prompt`, `broadcast`, `PromptSubmitted` with comments naming the future caller. `cargo build` is now warning-free. |
+| **A3** | `// MUST match` cross-reference comment in place at `app.rs::key_event_to_bytes`. (Initially had a wrong path; fixed in this same pass — see DOC2 below.) |
+| **A4** | Phase 5 Task 1 has the `send_prompt` text-sanitization note with concrete policy. (Initially mis-described as "Phase 6 task 1"; fixed in this same pass — see DOC1 below.) |
+| **D1** | Multi-paragraph `try_write` failure caveat on `send_prompt`; shorter cross-reference caveat on `broadcast`. Both reference review item D1. |
+| **D2** | `TurnId::new` is `const fn`. |
+
+### Doc accuracy issues found in the second pass
+
+| # | Item | Disposition |
+|---|---|---|
+| **DOC1** | Original `pr-review-pr8.md` security section said "Phase 6 task 1" for the `send_prompt` sanitization note. Actual placement is **Phase 5 Task 1**, because Phase 5 is where `send_prompt` becomes a user-facing MCP tool. Phase 6 holds the parallel *label* sanitization for `spawn_session` (Phase 6 Task 3). Two separate sanitization tasks in two different phases. | **Applied in second pass.** Updated `pr-review-pr8.md` security section to name Phase 5 Task 1 explicitly and cross-reference Phase 6 Task 3 for the parallel label-sanitization task. |
+| **DOC2** | `app.rs` cross-reference comment said `crate::session::SUBMIT_SEQUENCE` but the constant is `pub(crate)` in `session::manager` and not re-exported from `mod.rs`. The actual reachable path is `crate::session::manager::SUBMIT_SEQUENCE`. Future grep-by-path would miss it. | **Applied in second pass.** Updated the comment to use the correct path and added a sentence explaining why it's the longer path. |
+
+### New issues found by the second pass
+
+**None substantive in production code.** Only the two doc-path
+inaccuracies above. All six action items are correctly implemented.
+
+### Stylistic nits — considered, not actionable
+
+| # | Nit | Why not fixing |
+|---|---|---|
+| **N1** | `wait_for_bytes` re-scans the entire accumulated buffer with `windows().any()` on every poll. For our test volumes (~hundreds of bytes, 3-second timeouts) this is fine. | A future test working with megabytes of buffered output would need an incremental matcher (e.g. Knuth-Morris-Pratt with stored state), but that's premature optimization for nothing currently in the tree. |
+| **N2** | The annotation rationale comments mix `///` (above) and `//` (below) for the same item. Slightly unusual but a common Rust pattern for "rationale that doesn't belong in rendered docs." | The doc-comment is the API doc; the `//` comment is the implementation note. Keeping them visually separated is the right call. |
+
+### Final disposition
+
+**Approved on second pass after applying DOC1 + DOC2 fixes.** Delta
+commit is tight, every action item is verifiably applied, no new
+correctness issues introduced. Ready to merge.

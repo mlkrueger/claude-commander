@@ -1701,7 +1701,9 @@ fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
             let s = c.encode_utf8(&mut buf);
             s.as_bytes().to_vec()
         }
-        // MUST match `crate::session::SUBMIT_SEQUENCE` (currently `b"\r"`).
+        // MUST match `crate::session::manager::SUBMIT_SEQUENCE` (currently
+        // `b"\r"`). The constant is `pub(crate)` and not re-exported from
+        // `session::mod`, so the full path goes through `manager`.
         // If you change the byte sequence Enter produces, also update
         // `SUBMIT_SEQUENCE` in `src/session/manager.rs` — the
         // `submit_sequence_is_carriage_return` test will catch divergence
