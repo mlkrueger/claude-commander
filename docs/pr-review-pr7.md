@@ -126,3 +126,44 @@ red→green throughout, pre-commit hook passes.
 | T2 | Concurrent subscribe + publish test | This file (no plan-level note) |
 | T3 | `#[cfg(unix)]` on real-PTY tests if Windows support ever lands | This file (no plan-level note) |
 | Phase 6 label sanitization | MCP `spawn_session` must sanitize labels supplied by drivers | `docs/plans/session-management-phase-4-6.md` Phase 6 |
+
+---
+
+## Second review pass — delta commit `4ec4e6b`
+
+After applying A1–A4 + D2 and pushing the follow-up commit, I ran the
+review flow again on just the delta (commit `4ec4e6b`, +282 / −12, 5
+files). This appendix is the second pass's record.
+
+### Action item verification
+
+| ID | Verified |
+|---|---|
+| **A1** | `new()` is `#[cfg(test)] pub(crate)`; `impl Default` is gone. `cargo build` succeeds, proving no non-test code path depended on either. |
+| **A2** | `publish_status_diffs` is private `fn`. `check_attention` (same `impl` block) and `mod tests` (child of `mod manager`) both still reach it via parent-private access. |
+| **A3** | Held-lock invariant comment on `EventBus::publish` is in place, names the alternatives (release-then-resend, RwLock + try_send), links design open question #4. |
+| **A4** | `ExitedChild::new` constructor with `debug_assert!(code >= 0)` is in place. Field is now private. Both call sites updated (`clone_killer`, `make_exiting_session`). |
+| **D2** | `check_attention_publishes_via_real_detector` exists. Cursor-position math verified: `ESC[20;1H` → row 19 (0-indexed), within the detector's 9..24 scan window for the dummy session's 24x80 screen. Subscribe-after-mutate avoids `Spawned` clutter. Drain loop is race-free because `EventBus::publish` is synchronous. Asserts on presence not order so future `publish_status_diffs` refactors aren't bound to a specific emission sequence. |
+
+### New issues found by the second pass
+
+**None substantive.** All five changes are restrictions or additions,
+not relaxations. No new risks introduced.
+
+### Stylistic nits — considered, not actionable
+
+These were noticed during the second pass but explicitly judged
+**not worth a follow-up commit.** Recording here so a future
+reader doesn't re-raise them as fresh issues.
+
+| # | Nit | Why not fixing |
+|---|---|---|
+| N1 | The 5-line comment block standing in where `impl Default for SessionManager` used to live is unusual. Most codebases just delete the impl and let `git blame` carry the rationale. | Defensible because "why not Default?" is a question reviewers will reasonably ask. The comment answers it inline. Cost: ~5 lines. Benefit: any future reviewer immediately understands the constraint without spelunking through git history or this review file. Net positive. |
+| N2 | `ExitedChild::clone_killer` calls `ExitedChild::new(self.code)`, which re-runs the `debug_assert` on every clone. If `self.code` was valid at original construction, it's still valid at clone time. The redundant assert is harmless but slightly wasteful. | The cost is **zero** in release builds (`debug_assert!` compiles out) and trivial in debug. The alternative (`Self { code: self.code }`) bypasses the constructor and would diverge if a future invariant is added to `new`. Keep the assert; consistency wins. |
+| N3 | The new test imports `PromptDetector` and `lock_parser` inline (`use` inside the test function) rather than at the test module top. | Stylistic. Inline `use` keeps the test self-documenting about its dependencies. Acceptable Rust idiom. |
+
+### Final disposition
+
+**Approved on second pass.** Delta commit is tight, every action item
+is verifiably applied, the new test is well-constructed, and no new
+issues were introduced. Ready to merge.
