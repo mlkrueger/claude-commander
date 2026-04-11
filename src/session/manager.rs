@@ -48,16 +48,27 @@ pub struct SessionManager {
     bus: Arc<EventBus>,
 }
 
-impl Default for SessionManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// `impl Default for SessionManager` was removed in the PR #7
+// post-review pass: `Default::default` is unconditionally `pub` via the
+// trait, which would have provided an external escape hatch around the
+// `pub(crate) fn new()` restriction below. Use `SessionManager::with_bus`
+// from production and `SessionManager::new()` from tests.
 
 impl SessionManager {
-    /// Construct a `SessionManager` with a fresh internal `EventBus`. The
-    /// bus can still be subscribed to via [`SessionManager::bus`].
-    pub fn new() -> Self {
+    /// Construct a `SessionManager` with a fresh internal `EventBus`.
+    /// **Test-only.** Production code (`App::new`) must use
+    /// [`SessionManager::with_bus`] so the top-level `App` owns the
+    /// shared bus and can hand subscriptions to future Phase 2+
+    /// consumers (Council, MCP server, stats panel).
+    ///
+    /// Gated to `#[cfg(test)]` and `pub(crate)` in the PR #7
+    /// post-review pass: previously `pub`, which let external code
+    /// (and `Default::default`) construct a `SessionManager` whose
+    /// bus no one outside could ever subscribe to. The cfg gate makes
+    /// the production constraint structural — `with_bus` is now the
+    /// *only* externally-reachable constructor.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self::with_bus(Arc::new(EventBus::new()))
     }
 
@@ -91,7 +102,13 @@ impl SessionManager {
     ///
     /// Sessions present in `before` but no longer in the manager (e.g.
     /// killed mid-tick) are ignored.
-    pub(crate) fn publish_status_diffs(&self, before: &[(usize, SessionStatus)]) {
+    ///
+    /// Private (`fn`, no `pub(crate)`): the only legitimate caller is
+    /// `check_attention`. The child `mod tests` can still call this
+    /// directly because Rust lets child modules reach private items of
+    /// their parent. Tightened from `pub(crate)` in the PR #7
+    /// post-review pass.
+    fn publish_status_diffs(&self, before: &[(usize, SessionStatus)]) {
         for (id, old_status) in before {
             let Some(session) = self.sessions.iter().find(|s| s.id == *id) else {
                 continue;
@@ -825,6 +842,78 @@ mod tests {
             SessionEvent::Exited { session_id: 42, .. }
         ));
     }
+
+    #[test]
+    fn check_attention_publishes_via_real_detector() {
+        // PR #7 review item D2: closes the one wiring gap that
+        // `publish_status_diffs` direct tests can't see — verifies
+        // that `check_attention` actually flows from a real
+        // `PromptDetector` match through `Session::check_attention`
+        // and out to the bus as `StatusChanged` + `PromptPending`.
+        //
+        // Uses a dummy session (no real PTY) but a real
+        // `vt100::Parser`, into which we inject bytes that match the
+        // detector's `YesNo` pattern. No fork, no /bin/sh, runs
+        // offline.
+        use crate::pty::detector::PromptDetector;
+        use crate::session::lock_parser;
+
+        let (mut m, bus) = manager_with_bus();
+        let id = push_running(&mut m, "real-detector");
+
+        // Inject a Y/n prompt into the session's parser. This is the
+        // same shape `Session::check_attention` reads via its own
+        // `lock_parser(&self.parser).screen()` call.
+        //
+        // `PromptDetector::check` only scans the last 15 rows of the
+        // screen, so we use the vt100 cursor-position escape
+        // (`ESC[20;1H`) to land the bytes on row 20 — well within the
+        // detector's scan window for the dummy session's 24x80 screen.
+        {
+            let session = m.get(id).expect("session must exist");
+            let mut parser = lock_parser(&session.parser);
+            parser.process(b"\x1b[20;1HDo you want to proceed? Y/n");
+        }
+
+        // Subscribe AFTER mutating the parser so the only events on
+        // the channel are the ones produced by the detector run.
+        let rx = bus.subscribe();
+        let detector = PromptDetector::new();
+        m.check_attention(&detector);
+
+        // Drain everything the call published. Order is
+        // implementation-defined: `publish_status_diffs` fires
+        // `StatusChanged` first then `PromptPending`, but the test
+        // asserts on presence rather than ordering so future
+        // refactors don't bind us to a specific sequence.
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+
+        let status_changed_to_waiting = events.iter().any(|ev| {
+            matches!(
+                ev,
+                SessionEvent::StatusChanged {
+                    session_id,
+                    status: SessionStatus::WaitingForApproval(_),
+                } if *session_id == id
+            )
+        });
+        assert!(
+            status_changed_to_waiting,
+            "expected StatusChanged → WaitingForApproval, saw {events:?}"
+        );
+
+        let prompt_pending = events.iter().any(|ev| {
+            matches!(
+                ev,
+                SessionEvent::PromptPending { session_id, .. }
+                    if *session_id == id
+            )
+        });
+        assert!(
+            prompt_pending,
+            "expected PromptPending fired by detector hit, saw {events:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -943,7 +1032,25 @@ mod test_support {
     /// session's status transitions from `Running` to `Exited(code)`.
     #[derive(Debug)]
     pub(super) struct ExitedChild {
-        pub code: i32,
+        code: i32,
+    }
+
+    impl ExitedChild {
+        /// Construct an `ExitedChild` with the given exit code.
+        ///
+        /// `code` must be non-negative because `try_wait` round-trips
+        /// it through `ExitStatus::with_exit_code(u32)`. PR #7
+        /// post-review pass added this `debug_assert` so a test
+        /// passing a negative code (which would silently wrap to a
+        /// large positive number) trips in debug builds instead of
+        /// producing surprising assertion failures downstream.
+        pub(super) fn new(code: i32) -> Self {
+            debug_assert!(
+                code >= 0,
+                "ExitedChild only supports non-negative exit codes; got {code}"
+            );
+            Self { code }
+        }
     }
 
     impl ChildKiller for ExitedChild {
@@ -951,7 +1058,7 @@ mod test_support {
             Ok(())
         }
         fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-            Box::new(ExitedChild { code: self.code })
+            Box::new(ExitedChild::new(self.code))
         }
     }
 
@@ -976,7 +1083,7 @@ mod test_support {
     /// `Running -> Exited(code)` transition and fire the bus event.
     pub(super) fn make_exiting_session(id: usize, code: i32) -> Session {
         let mut session = make_dummy_session(id);
-        session.child = Box::new(ExitedChild { code });
+        session.child = Box::new(ExitedChild::new(code));
         session
     }
 }

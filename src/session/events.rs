@@ -98,6 +98,20 @@ impl EventBus {
     /// `Receiver` has been dropped are pruned. Safe to call
     /// concurrently from multiple threads; safe to call on an empty
     /// bus (no-op).
+    ///
+    /// **Held-lock invariant.** This implementation holds the
+    /// `senders` mutex while iterating and calling `tx.send` on every
+    /// subscriber. That's only safe because `std::sync::mpsc::channel`
+    /// is **unbounded** — `send` returns immediately on success and
+    /// only fails (without blocking) when the receiver has been
+    /// dropped. If we ever switch the backing store to a bounded
+    /// channel (`crossbeam::channel::bounded`, `tokio::sync::mpsc`
+    /// with capacity, etc.), a slow subscriber's full queue would
+    /// freeze every other subscriber under this lock, turning the
+    /// bus into a head-of-line blocker. Either revisit the lock
+    /// strategy (release-then-resend, RwLock + try_send) or accept
+    /// drops on backpressure (open question #4 in
+    /// `docs/designs/session-management.md` §7).
     pub fn publish(&self, event: SessionEvent) {
         let mut senders = self
             .senders

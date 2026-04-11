@@ -388,6 +388,17 @@ genuinely a fleet-management tool.
        `Ask` for this one spawn.
      - `Trust` → silent.
    - On allow: spawns a new session with `spawned_by = Some(driver_id)`.
+   - **Sanitize the `label` argument** before passing to
+     `SessionManager::spawn`. A driver-supplied label flows through
+     `SessionEvent::Spawned` and into the session list UI, log
+     consumers, and any future MCP `subscribe` stream — untrusted
+     content can include ANSI escape sequences, control characters,
+     or terminal injection attacks against any subscriber that
+     renders or logs labels. Required policy: strip ASCII control
+     characters (`< 0x20` except none, plus `0x7f`), strip or escape
+     ANSI CSI sequences, cap length to a reasonable bound (e.g. 64
+     characters), reject empty labels. **Tracked from PR #7 review
+     security item, see `docs/pr-review-pr7.md`.**
 
 4. **Scope-restricted tool views.** For a driver caller, the
    existing read-only tools (`list_sessions`, `read_response`,
