@@ -30,6 +30,17 @@ use crate::pty::detector::PromptDetector;
 use super::events::{EventBus, SessionEvent};
 use super::types::{Session, SessionStatus};
 
+/// Byte sequence appended after a prompt's payload to submit it to the
+/// underlying interactive runner. Currently `\r` (carriage return),
+/// matching what `crate::app::key_event_to_bytes` emits for
+/// `KeyCode::Enter` and what the existing `App::approve_selected`
+/// already writes directly. Centralized here so Phase 2's
+/// `SessionManager::send_prompt` and any future caller share one
+/// definition; if Claude Code's submit chord ever changes, this is
+/// the only line to update.
+#[allow(dead_code)] // first production caller is Phase 2 send_prompt (next slice)
+pub(crate) const SUBMIT_SEQUENCE: &[u8] = b"\r";
+
 /// Arguments for spawning a new `Session` through [`SessionManager::spawn`].
 pub struct SpawnConfig<'a> {
     pub label: String,
@@ -844,6 +855,17 @@ mod tests {
     }
 
     #[test]
+    fn submit_sequence_is_carriage_return() {
+        // Pin the submit byte sequence so an unintended change to
+        // `SUBMIT_SEQUENCE` (e.g. switching to `\n` or a multi-byte
+        // chord) is caught immediately. The value must match what the
+        // production keyboard handler writes for `KeyCode::Enter` —
+        // see `crate::app::key_event_to_bytes` and the existing
+        // `App::approve_selected` call site (`b"\r"`).
+        assert_eq!(super::SUBMIT_SEQUENCE, b"\r");
+    }
+
+    #[test]
     fn check_attention_publishes_via_real_detector() {
         // PR #7 review item D2: closes the one wiring gap that
         // `publish_status_diffs` direct tests can't see — verifies
@@ -979,6 +1001,56 @@ mod test_support {
         }
     }
 
+    /// `Write` impl that captures every byte written to it. Used by
+    /// `send_prompt` / `broadcast` tests to assert exactly what bytes
+    /// `Session::try_write` produced. The buffer is shared via
+    /// `Arc<Mutex<>>` so the test can hold one handle and the
+    /// `Session` (via its `Box<dyn Write + Send>`) holds another.
+    #[allow(dead_code)] // first callers land in Phase 2 Tasks 2 and 3
+    #[derive(Debug, Clone)]
+    pub(super) struct RecordingWriter(pub(super) Arc<Mutex<Vec<u8>>>);
+
+    #[allow(dead_code)] // first callers land in Phase 2 Tasks 2 and 3
+    impl RecordingWriter {
+        pub(super) fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        /// Snapshot the captured bytes. Cloning the inner Vec is fine
+        /// for tests; production code never sees this type.
+        pub(super) fn captured(&self) -> Vec<u8> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a dummy `Session` whose `writer` is a `RecordingWriter`,
+    /// returning both the session and a handle on the recording so the
+    /// test can assert on captured bytes after the session is moved
+    /// into the manager via `push_for_test`.
+    #[allow(dead_code)] // first callers land in Phase 2 Tasks 2 and 3
+    pub(super) fn make_recording_session(id: usize) -> (Session, RecordingWriter) {
+        let writer = RecordingWriter::new();
+        let mut session = make_dummy_session(id);
+        session.writer = Box::new(writer.clone());
+        (session, writer)
+    }
+
     #[derive(Debug)]
     pub(super) struct DummyChild;
 
@@ -1024,6 +1096,7 @@ mod test_support {
             },
             context_percent: None,
             consecutive_write_failures: 0,
+            next_turn_id: 0,
         }
     }
 

@@ -16,11 +16,28 @@ use std::sync::{Arc, Mutex, mpsc};
 
 /// Per-session monotonic counter identifying one prompt/response round-trip.
 ///
-/// A new `TurnId` is allocated by `SessionManager::send_prompt` (Phase 2)
-/// and paired with a matching `ResponseComplete` from the response
-/// boundary detector (Phase 3). Phase 1 only defines the type.
+/// A new `TurnId` is allocated by [`crate::session::Session::allocate_turn_id`]
+/// (the canonical mint site, added in Phase 2) and paired with a matching
+/// `ResponseComplete` from the response boundary detector (Phase 3).
+///
+/// External callers construct via [`TurnId::new`]; the inner field is
+/// `pub(crate)` so only in-crate code can read it directly. The K2
+/// follow-up from PR #7 review tightened this from `pub u64`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TurnId(pub u64);
+pub struct TurnId(pub(crate) u64);
+
+impl TurnId {
+    /// Construct a `TurnId` from a raw counter value. Production code
+    /// should not be calling this directly — use
+    /// [`crate::session::Session::allocate_turn_id`] which manages the
+    /// per-session monotonic counter. `new` exists for tests, for
+    /// deserialization, and for any future code that needs to
+    /// reconstruct a `TurnId` from an external source (e.g. an MCP
+    /// tool argument in Phase 4+).
+    pub fn new(value: u64) -> Self {
+        TurnId(value)
+    }
+}
 
 /// High-level state transition events published on the `EventBus`.
 ///
@@ -137,25 +154,31 @@ mod tests {
     // -------- TurnId --------
 
     #[test]
-    fn turn_id_constructs_from_u64() {
-        let t = TurnId(42);
+    fn turn_id_new_wraps_value() {
+        // `TurnId::new` is the public construction path (the `.0`
+        // field is `pub(crate)`, so external crates can only mint
+        // ids through this constructor or by reading them off
+        // already-published events).
+        let t = TurnId::new(42);
+        assert_eq!(t, TurnId::new(42));
+        // In-crate access can still read the inner value directly.
         assert_eq!(t.0, 42);
     }
 
     #[test]
     fn turn_id_is_copy_and_eq() {
-        let a = TurnId(7);
+        let a = TurnId::new(7);
         let b = a; // Copy
         assert_eq!(a, b);
-        assert_eq!(a, TurnId(7));
-        assert_ne!(a, TurnId(8));
+        assert_eq!(a, TurnId::new(7));
+        assert_ne!(a, TurnId::new(8));
     }
 
     #[test]
     fn turn_id_is_ordered() {
-        assert!(TurnId(1) < TurnId(2));
-        assert!(TurnId(5) > TurnId(4));
-        assert!(TurnId(3) <= TurnId(3));
+        assert!(TurnId::new(1) < TurnId::new(2));
+        assert!(TurnId::new(5) > TurnId::new(4));
+        assert!(TurnId::new(3) <= TurnId::new(3));
     }
 
     // -------- SessionEvent --------
