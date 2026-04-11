@@ -279,6 +279,29 @@ operate on sessions the main TUI already knows about.
    turn_id)`. No confirmation modal (per session-management §6 —
    "gating prompts is theater").
 
+   **Sanitize the `text` argument** before passing to
+   `SessionManager::send_prompt`. Driver-supplied text flows
+   verbatim into the target session's PTY, where ANSI escape
+   sequences and control characters are interpreted by the
+   underlying runner (Claude Code, Gemini CLI, etc.) and by any
+   subscriber that displays input echoes. Untrusted MCP callers can
+   inject terminal escapes, hijack the runner's input parsing, or
+   smuggle prompt-injection payloads. Required policy at the MCP
+   tool boundary:
+   - Strip raw control characters `< 0x20` except a small allowlist
+     (newline `\n`, tab `\t`) — and even allowed ones get normalized
+     (`\r`, `\r\n`, `\n` all collapse so the submit chord stays
+     under `SUBMIT_SEQUENCE`'s control).
+   - Strip ANSI CSI sequences (`ESC[…`) and OSC sequences
+     (`ESC]…BEL` / `ESC]…ESC\`).
+   - Cap total length at a reasonable bound (e.g. 16 KB) so a
+     misbehaving driver can't send a multi-megabyte payload.
+   - Reject empty post-sanitization text with a clear error.
+
+   Same threat model as the label-sanitization task in Phase 6.
+   **Tracked from PR #8 review security item, see
+   `docs/pr-review-pr8.md`.**
+
 2. **`kill_session` tool handler.** Always triggers a TUI
    confirmation modal in Phase 5 (no driver ownership yet — the
    silent-kill-for-your-own-children policy arrives in Phase 6).

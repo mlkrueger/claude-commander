@@ -34,11 +34,18 @@ use super::types::{Session, SessionStatus};
 /// underlying interactive runner. Currently `\r` (carriage return),
 /// matching what `crate::app::key_event_to_bytes` emits for
 /// `KeyCode::Enter` and what the existing `App::approve_selected`
-/// already writes directly. Centralized here so Phase 2's
+/// already writes directly. Centralized here so
 /// `SessionManager::send_prompt` and any future caller share one
 /// definition; if Claude Code's submit chord ever changes, this is
-/// the only line to update.
-#[allow(dead_code)] // first production caller is Phase 2 send_prompt (next slice)
+/// the only line to update — and the `// MUST match SUBMIT_SEQUENCE`
+/// comment in `crate::app::key_event_to_bytes` is the cross-reference.
+//
+// `#[allow(dead_code)]` because the binary's reachability analysis
+// (`cargo build`) starts from `main` and doesn't reach `send_prompt`
+// yet — its first production caller arrives in Council Phase 2. Tests
+// reference this constant via the test target, which doesn't satisfy
+// the binary lint. Pinned by `submit_sequence_is_carriage_return`.
+#[allow(dead_code)]
 pub(crate) const SUBMIT_SEQUENCE: &[u8] = b"\r";
 
 /// Arguments for spawning a new `Session` through [`SessionManager::spawn`].
@@ -53,9 +60,15 @@ pub struct SpawnConfig<'a> {
 }
 
 /// Outcome of a [`SessionManager::broadcast`] call. Reports which
-/// session ids successfully received the bytes and which were not
-/// found in the manager. Order within each Vec matches input order.
-#[allow(dead_code)] // first production caller lands in Council Phase 2
+/// session ids the broadcast attempted to write to and which ids were
+/// not found in the manager. Order within each Vec matches input
+/// order. Note that `sent` reports *attempts*, not delivery — see
+/// the doc on [`SessionManager::broadcast`] for the `try_write`
+/// failure caveat.
+//
+// `#[allow(dead_code)]` until the first production caller (Council
+// Phase 2). The binary's lint pass doesn't see test references.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BroadcastResult {
     pub sent: Vec<usize>,
@@ -202,7 +215,34 @@ impl SessionManager {
     ///
     /// Returns `Err` if the id does not match any live session; in that
     /// case no turn id is allocated and no event is published.
-    #[allow(dead_code)] // first production caller lands later in Phase 2
+    ///
+    /// **PTY write failures are not detected.** [`Session::try_write`]
+    /// is fire-and-forget — it logs failures and bumps
+    /// `consecutive_write_failures`, but never returns an error to its
+    /// caller. So if either the prompt-text write or the submit-byte
+    /// write fails (broken pipe, dead child, etc.), `send_prompt`
+    /// will still:
+    ///   - allocate the `TurnId`
+    ///   - publish `PromptSubmitted` on the bus
+    ///   - return `Ok(turn_id)`
+    /// even though no bytes reached the underlying process. Callers
+    /// that need write-failure visibility should consult
+    /// `Session::consecutive_write_failures` directly; the existing
+    /// logic transitions a session to `Exited(-3)` after three
+    /// consecutive failures, so a persistently broken session will
+    /// surface via `SessionEvent::Exited` on the next `reap_exited`
+    /// pass.
+    ///
+    /// PR #8 review item D1 made this limitation explicit. A future
+    /// refactor may switch `try_write` to return a `Result` and
+    /// propagate failures through `send_prompt` / `broadcast`; until
+    /// then, treat the bus's `PromptSubmitted` event as "we attempted
+    /// to submit," not "the runner has the bytes."
+    //
+    // `#[allow(dead_code)]` until the first production caller (Council
+    // Phase 3 synthesizer). The binary's lint pass doesn't see test
+    // references.
+    #[allow(dead_code)]
     pub fn send_prompt(&mut self, id: usize, text: &str) -> anyhow::Result<TurnId> {
         let turn_id = {
             let session = self
@@ -224,7 +264,19 @@ impl SessionManager {
     /// allocate a `TurnId`, does not publish `SessionEvent`s, does not
     /// dedupe `ids`. See `BroadcastResult` for the return shape and the
     /// Phase 2 design doc §3 for the rationale.
-    #[allow(dead_code)] // first production caller lands in Council Phase 2
+    ///
+    /// **`sent` reports attempts, not delivery.** Same caveat as
+    /// [`SessionManager::send_prompt`]: [`Session::try_write`] is
+    /// fire-and-forget, so a session id appears in `result.sent` as
+    /// long as `try_write` was called — even if the underlying PTY
+    /// write actually failed. Callers needing per-session delivery
+    /// visibility should consult `Session::consecutive_write_failures`
+    /// after the broadcast. See PR #8 review item D1.
+    //
+    // `#[allow(dead_code)]` until the first production caller (Council
+    // Phase 2 broadcast dispatch). The binary's lint pass doesn't see
+    // test references.
+    #[allow(dead_code)]
     pub fn broadcast(&mut self, ids: &[usize], bytes: &[u8]) -> BroadcastResult {
         let mut sent = Vec::new();
         let mut not_found = Vec::new();
@@ -1281,11 +1333,9 @@ mod test_support {
     /// `Session::try_write` produced. The buffer is shared via
     /// `Arc<Mutex<>>` so the test can hold one handle and the
     /// `Session` (via its `Box<dyn Write + Send>`) holds another.
-    #[allow(dead_code)] // first callers land in Phase 2 Tasks 2 and 3
     #[derive(Debug, Clone)]
     pub(super) struct RecordingWriter(pub(super) Arc<Mutex<Vec<u8>>>);
 
-    #[allow(dead_code)] // first callers land in Phase 2 Tasks 2 and 3
     impl RecordingWriter {
         pub(super) fn new() -> Self {
             Self(Arc::new(Mutex::new(Vec::new())))
@@ -1318,7 +1368,6 @@ mod test_support {
     /// returning both the session and a handle on the recording so the
     /// test can assert on captured bytes after the session is moved
     /// into the manager via `push_for_test`.
-    #[allow(dead_code)] // first callers land in Phase 2 Tasks 2 and 3
     pub(super) fn make_recording_session(id: usize) -> (Session, RecordingWriter) {
         let writer = RecordingWriter::new();
         let mut session = make_dummy_session(id);

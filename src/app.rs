@@ -1701,6 +1701,11 @@ fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
             let s = c.encode_utf8(&mut buf);
             s.as_bytes().to_vec()
         }
+        // MUST match `crate::session::SUBMIT_SEQUENCE` (currently `b"\r"`).
+        // If you change the byte sequence Enter produces, also update
+        // `SUBMIT_SEQUENCE` in `src/session/manager.rs` — the
+        // `submit_sequence_is_carriage_return` test will catch divergence
+        // on the manager side, but the source of truth lives here.
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab => vec![b'\t'],

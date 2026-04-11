@@ -34,7 +34,10 @@ impl TurnId {
     /// deserialization, and for any future code that needs to
     /// reconstruct a `TurnId` from an external source (e.g. an MCP
     /// tool argument in Phase 4+).
-    pub fn new(value: u64) -> Self {
+    ///
+    /// `const fn` so it can be used in const contexts like
+    /// `const FIRST: TurnId = TurnId::new(0);` — no runtime cost.
+    pub const fn new(value: u64) -> Self {
         TurnId(value)
     }
 }
@@ -51,7 +54,11 @@ pub enum SessionEvent {
     /// corresponding body is not carried — fetch via
     /// `SessionManager::get_prompt` (future Phase).
     ///
-    /// Emitted by `SessionManager::send_prompt`.
+    /// Emitted by `SessionManager::send_prompt`. `#[allow(dead_code)]`
+    /// because `send_prompt` itself has no production caller yet
+    /// (Council Phase 3 is the first), so the binary's reachability
+    /// analysis can't reach this variant.
+    #[allow(dead_code)]
     PromptSubmitted { session_id: usize, turn_id: TurnId },
     /// The response boundary detector observed the target turn complete.
     /// Fetch the body via `SessionManager::get_response` (Phase 3).

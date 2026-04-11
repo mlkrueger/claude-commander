@@ -399,33 +399,70 @@ mod session_bus_integration {
     // `send_prompt` and `broadcast` write actually reached the PTY.
 
     use ccom::session::TurnId;
+    use std::collections::HashMap;
 
-    /// Drain PtyOutput events for the given session id, accumulate
-    /// bytes, return true as soon as `needle` appears anywhere in the
-    /// accumulated buffer or `timeout` elapses.
-    fn read_pty_until_contains(
-        rx: &mpsc::Receiver<ccom::event::Event>,
-        target_session: usize,
-        needle: &[u8],
-        timeout: Duration,
-    ) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            while let Ok(ev) = rx.try_recv() {
-                if let ccom::event::Event::PtyOutput { session_id, data } = ev
-                    && session_id == target_session
-                {
-                    buf.extend_from_slice(&data);
-                    if buf.windows(needle.len()).any(|w| w == needle) {
-                        return true;
-                    }
+    /// Per-session PTY output buffer that survives across multiple
+    /// `wait_for_bytes` calls. Built once per test and threaded through
+    /// each substring check so events for *other* sessions get
+    /// accumulated for their own future checks instead of being
+    /// silently dropped.
+    ///
+    /// This replaces an earlier helper (`read_pty_until_contains`) that
+    /// drained the channel into a single per-call buffer and discarded
+    /// any non-matching events. PR #8 review item C3 caught the bug:
+    /// `broadcast_through_real_pty_writes_to_each_session` checks
+    /// session a then session b in sequence, and the original helper
+    /// would discard a's events while waiting for b (or vice versa)
+    /// depending on arrival order. The test passed by ordering luck.
+    struct PtyOutputAccumulator<'a> {
+        rx: &'a mpsc::Receiver<ccom::event::Event>,
+        buffers: HashMap<usize, Vec<u8>>,
+    }
+
+    impl<'a> PtyOutputAccumulator<'a> {
+        fn new(rx: &'a mpsc::Receiver<ccom::event::Event>) -> Self {
+            Self {
+                rx,
+                buffers: HashMap::new(),
+            }
+        }
+
+        /// Drain whatever is currently sitting on the channel into the
+        /// per-session buffers. Non-blocking.
+        fn drain(&mut self) {
+            while let Ok(ev) = self.rx.try_recv() {
+                if let ccom::event::Event::PtyOutput { session_id, data } = ev {
+                    self.buffers
+                        .entry(session_id)
+                        .or_default()
+                        .extend_from_slice(&data);
                 }
             }
-            if std::time::Instant::now() >= deadline {
-                return false;
+        }
+
+        /// Block (with polling) until `needle` appears anywhere in the
+        /// accumulated buffer for `target_session`, or `timeout`
+        /// elapses. Drain happens on every poll, so events for other
+        /// sessions are buffered for their own future checks.
+        fn wait_for_bytes(
+            &mut self,
+            target_session: usize,
+            needle: &[u8],
+            timeout: Duration,
+        ) -> bool {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                self.drain();
+                if let Some(buf) = self.buffers.get(&target_session)
+                    && buf.windows(needle.len()).any(|w| w == needle)
+                {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -473,8 +510,9 @@ mod session_bus_integration {
 
         // The bytes we wrote must actually reach the PTY — verified
         // via the PtyOutput echo through cat.
+        let mut pty = PtyOutputAccumulator::new(&event_rx);
         assert!(
-            read_pty_until_contains(&event_rx, id, b"phase2-marker", Duration::from_secs(3),),
+            pty.wait_for_bytes(id, b"phase2-marker", Duration::from_secs(3)),
             "expected 'phase2-marker' to appear in PtyOutput from cat",
         );
 
@@ -520,12 +558,16 @@ mod session_bus_integration {
 
         // Bytes must reach BOTH sessions — verified via per-session
         // PtyOutput echoes through their respective cat processes.
+        // Single accumulator threads through both checks so events
+        // arriving for one session while we wait on the other are
+        // buffered, not dropped (PR #8 review item C3).
+        let mut pty = PtyOutputAccumulator::new(&event_rx);
         assert!(
-            read_pty_until_contains(&event_rx, id_a, b"bcast-marker", Duration::from_secs(3),),
+            pty.wait_for_bytes(id_a, b"bcast-marker", Duration::from_secs(3)),
             "session a should have echoed 'bcast-marker'",
         );
         assert!(
-            read_pty_until_contains(&event_rx, id_b, b"bcast-marker", Duration::from_secs(3),),
+            pty.wait_for_bytes(id_b, b"bcast-marker", Duration::from_secs(3)),
             "session b should have echoed 'bcast-marker'",
         );
 
