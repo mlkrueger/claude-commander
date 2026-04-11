@@ -21,11 +21,13 @@
 //! uniqueness across the lifetime of an `App`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc;
 
 use crate::event::Event;
 use crate::pty::detector::PromptDetector;
 
+use super::events::{EventBus, SessionEvent};
 use super::types::{Session, SessionStatus};
 
 /// Arguments for spawning a new `Session` through [`SessionManager::spawn`].
@@ -43,20 +45,96 @@ pub struct SessionManager {
     sessions: Vec<Session>,
     selected: usize,
     next_id: usize,
+    bus: Arc<EventBus>,
 }
 
-impl Default for SessionManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// `impl Default for SessionManager` was removed in the PR #7
+// post-review pass: `Default::default` is unconditionally `pub` via the
+// trait, which would have provided an external escape hatch around the
+// `pub(crate) fn new()` restriction below. Use `SessionManager::with_bus`
+// from production and `SessionManager::new()` from tests.
 
 impl SessionManager {
-    pub fn new() -> Self {
+    /// Construct a `SessionManager` with a fresh internal `EventBus`.
+    /// **Test-only.** Production code (`App::new`) must use
+    /// [`SessionManager::with_bus`] so the top-level `App` owns the
+    /// shared bus and can hand subscriptions to future Phase 2+
+    /// consumers (Council, MCP server, stats panel).
+    ///
+    /// Gated to `#[cfg(test)]` and `pub(crate)` in the PR #7
+    /// post-review pass: previously `pub`, which let external code
+    /// (and `Default::default`) construct a `SessionManager` whose
+    /// bus no one outside could ever subscribe to. The cfg gate makes
+    /// the production constraint structural — `with_bus` is now the
+    /// *only* externally-reachable constructor.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::with_bus(Arc::new(EventBus::new()))
+    }
+
+    /// Construct a `SessionManager` that publishes `SessionEvent`s onto
+    /// the provided shared bus. Use this from production where the
+    /// `App` owns the top-level bus and wants a single shared instance.
+    pub fn with_bus(bus: Arc<EventBus>) -> Self {
         Self {
             sessions: Vec::new(),
             selected: 0,
             next_id: 1,
+            bus,
+        }
+    }
+
+    /// Return a shared reference to the event bus so callers (e.g. the
+    /// main event loop, the MCP server in later phases, tests) can
+    /// subscribe to `SessionEvent`s without holding a reference to the
+    /// manager itself. Phase 1 only consumes this from tests; Phase 2+
+    /// uses it from production code.
+    #[allow(dead_code)]
+    pub fn bus(&self) -> Arc<EventBus> {
+        Arc::clone(&self.bus)
+    }
+
+    /// Compare each `(id, prior_status)` entry in `before` against the
+    /// current session status and publish a `StatusChanged` event for
+    /// any session whose status has actually changed. Additionally,
+    /// when a session newly enters `WaitingForApproval`, publishes
+    /// `PromptPending` once for that transition.
+    ///
+    /// Sessions present in `before` but no longer in the manager (e.g.
+    /// killed mid-tick) are ignored.
+    ///
+    /// Private (`fn`, no `pub(crate)`): the only legitimate caller is
+    /// `check_attention`. The child `mod tests` can still call this
+    /// directly because Rust lets child modules reach private items of
+    /// their parent. Tightened from `pub(crate)` in the PR #7
+    /// post-review pass.
+    fn publish_status_diffs(&self, before: &[(usize, SessionStatus)]) {
+        for (id, old_status) in before {
+            let Some(session) = self.sessions.iter().find(|s| s.id == *id) else {
+                continue;
+            };
+            if session.status == *old_status {
+                continue;
+            }
+
+            self.bus.publish(SessionEvent::StatusChanged {
+                session_id: *id,
+                status: session.status.clone(),
+            });
+
+            // PromptPending fires only on the *transition into*
+            // WaitingForApproval — going WaitingForApproval(A) ->
+            // WaitingForApproval(B) is still a status change, but we
+            // already attention-flagged the session and don't want a
+            // second nudge.
+            if !matches!(old_status, SessionStatus::WaitingForApproval(_))
+                && let SessionStatus::WaitingForApproval(kind) = &session.status
+            {
+                self.bus.publish(SessionEvent::PromptPending {
+                    session_id: *id,
+                    kind: kind.clone(),
+                });
+            }
         }
     }
 
@@ -168,6 +246,7 @@ impl SessionManager {
         self.next_id += 1;
 
         let arg_refs: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
+        let label_for_event = config.label.clone();
 
         let session = Session::spawn(
             id,
@@ -182,6 +261,10 @@ impl SessionManager {
 
         self.sessions.push(session);
         self.selected = self.sessions.len() - 1;
+        self.bus.publish(SessionEvent::Spawned {
+            session_id: id,
+            label: label_for_event,
+        });
         self.assert_invariant();
         Ok(id)
     }
@@ -198,6 +281,13 @@ impl SessionManager {
             return false;
         };
         self.sessions[idx].kill();
+        // After `Session::kill`, status is `Exited(<code>)`. Capture
+        // the code before removing the session so the published event
+        // reflects what the killer set.
+        let exit_code = match self.sessions[idx].status {
+            SessionStatus::Exited(code) => code,
+            _ => -1,
+        };
         self.sessions.remove(idx);
 
         if self.sessions.is_empty() {
@@ -208,6 +298,10 @@ impl SessionManager {
             self.selected = self.sessions.len() - 1;
         }
 
+        self.bus.publish(SessionEvent::Exited {
+            session_id: id,
+            code: exit_code,
+        });
         self.assert_invariant();
         true
     }
@@ -231,54 +325,80 @@ impl SessionManager {
         }
     }
 
-    /// Run the attention detector against every live session.
+    /// Run the attention detector against every live session and
+    /// publish `StatusChanged` / `PromptPending` for any session whose
+    /// status changes as a result.
     pub fn check_attention(&mut self, detector: &PromptDetector) {
+        // Snapshot statuses before mutating so we can diff afterwards.
+        let before: Vec<(usize, SessionStatus)> = self
+            .sessions
+            .iter()
+            .map(|s| (s.id, s.status.clone()))
+            .collect();
+
         for session in &mut self.sessions {
             if !matches!(session.status, SessionStatus::Exited(_)) {
                 session.check_attention(detector);
             }
         }
+
+        self.publish_status_diffs(&before);
     }
 
     /// Poll all live sessions for child exit status and mark any that have
-    /// exited on their own since the last tick.
+    /// exited on their own since the last tick. Publishes
+    /// `SessionEvent::Exited` for each session that transitioned in
+    /// this call.
     pub fn reap_exited(&mut self) {
+        // Collect transitions inside the mutable loop, then publish
+        // afterwards. This sidesteps the borrow conflict between
+        // `&mut self.sessions` and `&self.bus`.
+        let mut transitioned = Vec::new();
         for session in &mut self.sessions {
             if !matches!(session.status, SessionStatus::Exited(_))
                 && let Ok(Some(status)) = session.child.try_wait()
             {
-                session.status = SessionStatus::Exited(status.exit_code() as i32);
+                let code = status.exit_code() as i32;
+                session.status = SessionStatus::Exited(code);
+                transitioned.push((session.id, code));
             }
+        }
+        for (session_id, code) in transitioned {
+            self.bus.publish(SessionEvent::Exited { session_id, code });
         }
     }
 
     /// Test-only helper that appends an already-built `Session` directly,
     /// bypassing real PTY creation. Bumps `next_id` past the pushed id so
     /// the monotonic-id invariant survives subsequent test spawns.
+    /// Publishes `Spawned` on the bus for parity with the production
+    /// `spawn` path.
     #[cfg(test)]
     pub(crate) fn push_for_test(&mut self, session: Session) -> usize {
         let id = session.id;
+        let label = session.label.clone();
         self.sessions.push(session);
         self.selected = self.sessions.len() - 1;
         if id >= self.next_id {
             self.next_id = id + 1;
         }
+        self.bus.publish(SessionEvent::Spawned {
+            session_id: id,
+            label,
+        });
         self.assert_invariant();
         id
     }
 
     /// Test-only helper: append a stub `Session` that does not fork a real
     /// PTY. Used by the property test to exercise `SessionManager`
-    /// invariants without the cost of spawning real processes.
+    /// invariants without the cost of spawning real processes. Publishes
+    /// `Spawned` via `push_for_test`.
     #[cfg(test)]
     pub(crate) fn spawn_dummy(&mut self) -> usize {
         let id = self.next_id;
-        self.next_id += 1;
         let session = test_support::make_dummy_session(id);
-        self.sessions.push(session);
-        self.selected = self.sessions.len() - 1;
-        self.assert_invariant();
-        id
+        self.push_for_test(session)
     }
 
     #[inline]
@@ -467,6 +587,333 @@ mod tests {
         // panicking.
         assert!(!m.kill(id));
     }
+
+    // ---------------- Bus publishing (Phase 1 Task 4) ----------------
+    //
+    // These tests exercise the SessionManager → EventBus contract. Each
+    // test constructs a fresh `EventBus`, passes it into
+    // `SessionManager::with_bus`, subscribes *before* the action under
+    // test, and asserts on the events that arrive.
+
+    use crate::session::events::{EventBus, SessionEvent};
+
+    fn manager_with_bus() -> (SessionManager, Arc<EventBus>) {
+        let bus = Arc::new(EventBus::new());
+        let manager = SessionManager::with_bus(Arc::clone(&bus));
+        (manager, bus)
+    }
+
+    /// Push a dummy session into the manager that starts in
+    /// `SessionStatus::Running` so status-transition tests have a
+    /// starting point that can change.
+    fn push_running(m: &mut SessionManager, label: &str) -> usize {
+        let id = m.peek_next_id();
+        let mut session = Session::dummy_exited(id, label);
+        session.status = SessionStatus::Running;
+        m.push_for_test(session)
+    }
+
+    #[test]
+    fn spawn_dummy_publishes_spawned_event() {
+        let (mut m, bus) = manager_with_bus();
+        let rx = bus.subscribe();
+        let id = m.spawn_dummy();
+        match rx.try_recv().expect("Spawned should have been published") {
+            SessionEvent::Spawned { session_id, label } => {
+                assert_eq!(session_id, id);
+                assert_eq!(label, format!("dummy-{id}"));
+            }
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_for_test_publishes_spawned_event() {
+        // Test parity: the test-only push helper publishes Spawned too,
+        // so tests that use `push_for_test` directly can still exercise
+        // downstream consumers that react to Spawned.
+        let (mut m, bus) = manager_with_bus();
+        let rx = bus.subscribe();
+        let id = m.peek_next_id();
+        m.push_for_test(Session::dummy_exited(id, "abc"));
+        match rx.try_recv().unwrap() {
+            SessionEvent::Spawned { session_id, label } => {
+                assert_eq!(session_id, id);
+                assert_eq!(label, "abc");
+            }
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kill_publishes_exited_event() {
+        let (mut m, bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let rx = bus.subscribe(); // subscribe AFTER push so we don't see Spawned
+        assert!(m.kill(id));
+        // `Session::kill` sets status to `Exited(-1)`, so the published
+        // exit code is -1.
+        match rx.try_recv().expect("Exited should have been published") {
+            SessionEvent::Exited { session_id, code } => {
+                assert_eq!(session_id, id);
+                assert_eq!(code, -1);
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kill_unknown_id_publishes_nothing() {
+        let (mut m, bus) = manager_with_bus();
+        let rx = bus.subscribe();
+        assert!(!m.kill(9999));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn reap_exited_publishes_exited_on_transition() {
+        let (mut m, bus) = manager_with_bus();
+        // A session whose child reports Ok(Some(7)) from try_wait.
+        let id = m.peek_next_id();
+        m.push_for_test(test_support::make_exiting_session(id, 7));
+        let rx = bus.subscribe();
+
+        m.reap_exited();
+
+        match rx.try_recv().expect("reap_exited should have published") {
+            SessionEvent::Exited { session_id, code } => {
+                assert_eq!(session_id, id);
+                assert_eq!(code, 7);
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reap_exited_does_not_refire_for_already_exited_sessions() {
+        let (mut m, bus) = manager_with_bus();
+        // `Session::dummy_exited` starts in Exited(0) — reap_exited must
+        // leave it alone and publish nothing.
+        let id = m.peek_next_id();
+        m.push_for_test(Session::dummy_exited(id, "z"));
+        let rx = bus.subscribe();
+
+        m.reap_exited();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn reap_exited_is_idempotent_after_first_transition() {
+        let (mut m, bus) = manager_with_bus();
+        let id = m.peek_next_id();
+        m.push_for_test(test_support::make_exiting_session(id, 0));
+        let rx = bus.subscribe();
+
+        m.reap_exited(); // should publish
+        m.reap_exited(); // session is now Exited — should NOT publish again
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SessionEvent::Exited { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn status_diff_fires_status_changed_when_status_changes() {
+        let (mut m, bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        // Snapshot current status BEFORE we mutate.
+        let before = vec![(id, SessionStatus::Running)];
+        // Mutate session status directly (simulating what
+        // `Session::check_attention` would do).
+        m.get_mut(id).unwrap().status = SessionStatus::Idle;
+        let rx = bus.subscribe();
+
+        m.publish_status_diffs(&before);
+
+        match rx.try_recv().expect("StatusChanged should have fired") {
+            SessionEvent::StatusChanged { session_id, status } => {
+                assert_eq!(session_id, id);
+                assert_eq!(status, SessionStatus::Idle);
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_diff_fires_prompt_pending_on_transition_to_waiting() {
+        let (mut m, bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let before = vec![(id, SessionStatus::Running)];
+        m.get_mut(id).unwrap().status = SessionStatus::WaitingForApproval("AllowOnce".into());
+        let rx = bus.subscribe();
+
+        m.publish_status_diffs(&before);
+
+        // Expect both StatusChanged and PromptPending (order: StatusChanged
+        // first, then PromptPending, per the implementation).
+        let first = rx.try_recv().unwrap();
+        let second = rx.try_recv().unwrap();
+        assert!(matches!(
+            first,
+            SessionEvent::StatusChanged {
+                session_id,
+                status: SessionStatus::WaitingForApproval(_),
+            } if session_id == id
+        ));
+        match second {
+            SessionEvent::PromptPending { session_id, kind } => {
+                assert_eq!(session_id, id);
+                assert_eq!(kind, "AllowOnce");
+            }
+            other => panic!("expected PromptPending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_diff_does_not_refire_prompt_pending_within_waiting() {
+        // Transitioning from WaitingForApproval(A) -> WaitingForApproval(B)
+        // should NOT re-fire PromptPending — the session is already
+        // waiting, and the kind change alone doesn't warrant a new
+        // attention signal. It should still fire StatusChanged because
+        // the status value did change.
+        let (mut m, bus) = manager_with_bus();
+        let id = m.peek_next_id();
+        let mut session = Session::dummy_exited(id, "a");
+        session.status = SessionStatus::WaitingForApproval("AllowOnce".into());
+        m.push_for_test(session);
+        let before = vec![(id, SessionStatus::WaitingForApproval("AllowOnce".into()))];
+        m.get_mut(id).unwrap().status = SessionStatus::WaitingForApproval("YesNo".into());
+        let rx = bus.subscribe();
+
+        m.publish_status_diffs(&before);
+
+        // Exactly one StatusChanged, no PromptPending.
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SessionEvent::StatusChanged { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn status_diff_publishes_nothing_when_unchanged() {
+        let (mut m, bus) = manager_with_bus();
+        let id = push_running(&mut m, "a");
+        let before = vec![(id, SessionStatus::Running)];
+        // Do NOT mutate the session.
+        let rx = bus.subscribe();
+
+        m.publish_status_diffs(&before);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn bus_accessor_returns_a_shared_handle() {
+        // `manager.bus()` gives out an Arc that's observably the same
+        // bus: subscribing via the accessor sees events the manager
+        // publishes.
+        let m = SessionManager::new();
+        let rx = m.bus().subscribe();
+        m.bus().publish(SessionEvent::Exited {
+            session_id: 42,
+            code: 0,
+        });
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SessionEvent::Exited { session_id: 42, .. }
+        ));
+    }
+
+    #[test]
+    fn check_attention_publishes_via_real_detector() {
+        // PR #7 review item D2: closes the one wiring gap that
+        // `publish_status_diffs` direct tests can't see — verifies
+        // that `check_attention` actually flows from a real
+        // `PromptDetector` match through `Session::check_attention`
+        // and out to the bus as `StatusChanged` + `PromptPending`.
+        //
+        // Uses a dummy session (no real PTY) but a real
+        // `vt100::Parser`, into which we inject bytes that match the
+        // detector's `YesNo` pattern. No fork, no /bin/sh, runs
+        // offline.
+        use crate::pty::detector::PromptDetector;
+        use crate::session::lock_parser;
+
+        let (mut m, bus) = manager_with_bus();
+        let id = push_running(&mut m, "real-detector");
+
+        // Inject a Y/n prompt into the session's parser. This is the
+        // same shape `Session::check_attention` reads via its own
+        // `lock_parser(&self.parser).screen()` call.
+        //
+        // `PromptDetector::check` only scans the last 15 rows of the
+        // screen, so we use the vt100 cursor-position escape
+        // (`ESC[20;1H`) to land the bytes on row 20 — well within the
+        // detector's scan window for the dummy session's 24x80 screen.
+        {
+            let session = m.get(id).expect("session must exist");
+            let mut parser = lock_parser(&session.parser);
+            parser.process(b"\x1b[20;1HDo you want to proceed? Y/n");
+        }
+
+        // Subscribe AFTER mutating the parser so the only events on
+        // the channel are the ones produced by the detector run.
+        let rx = bus.subscribe();
+        let detector = PromptDetector::new();
+        m.check_attention(&detector);
+
+        // Drain everything the call published. Order is
+        // implementation-defined: `publish_status_diffs` fires
+        // `StatusChanged` first then `PromptPending`, but the test
+        // asserts on presence rather than ordering so future
+        // refactors don't bind us to a specific sequence.
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+
+        let status_changed_to_waiting = events.iter().any(|ev| {
+            matches!(
+                ev,
+                SessionEvent::StatusChanged {
+                    session_id,
+                    status: SessionStatus::WaitingForApproval(_),
+                } if *session_id == id
+            )
+        });
+        assert!(
+            status_changed_to_waiting,
+            "expected StatusChanged → WaitingForApproval, saw {events:?}"
+        );
+
+        let prompt_pending = events.iter().any(|ev| {
+            matches!(
+                ev,
+                SessionEvent::PromptPending { session_id, .. }
+                    if *session_id == id
+            )
+        });
+        assert!(
+            prompt_pending,
+            "expected PromptPending fired by detector hit, saw {events:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -578,6 +1025,66 @@ mod test_support {
             context_percent: None,
             consecutive_write_failures: 0,
         }
+    }
+
+    /// Child stub whose `try_wait` reports a completed exit with the
+    /// given code on every call. Used by `reap_exited` tests so the
+    /// session's status transitions from `Running` to `Exited(code)`.
+    #[derive(Debug)]
+    pub(super) struct ExitedChild {
+        code: i32,
+    }
+
+    impl ExitedChild {
+        /// Construct an `ExitedChild` with the given exit code.
+        ///
+        /// `code` must be non-negative because `try_wait` round-trips
+        /// it through `ExitStatus::with_exit_code(u32)`. PR #7
+        /// post-review pass added this `debug_assert` so a test
+        /// passing a negative code (which would silently wrap to a
+        /// large positive number) trips in debug builds instead of
+        /// producing surprising assertion failures downstream.
+        pub(super) fn new(code: i32) -> Self {
+            debug_assert!(
+                code >= 0,
+                "ExitedChild only supports non-negative exit codes; got {code}"
+            );
+            Self { code }
+        }
+    }
+
+    impl ChildKiller for ExitedChild {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(ExitedChild::new(self.code))
+        }
+    }
+
+    impl Child for ExitedChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            // portable_pty's `with_exit_code` takes a u32, so negative
+            // codes round-trip via `as u32` / `as i32` — we only need
+            // non-negative codes in tests.
+            Ok(Some(ExitStatus::with_exit_code(self.code as u32)))
+        }
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(self.code as u32))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    /// Build a dummy `Session` whose `child.try_wait()` immediately
+    /// reports the given exit code. The session itself still starts in
+    /// `SessionStatus::Running` so `reap_exited` will observe the
+    /// `Running -> Exited(code)` transition and fire the bus event.
+    pub(super) fn make_exiting_session(id: usize, code: i32) -> Session {
+        let mut session = make_dummy_session(id);
+        session.child = Box::new(ExitedChild::new(code));
+        session
     }
 }
 

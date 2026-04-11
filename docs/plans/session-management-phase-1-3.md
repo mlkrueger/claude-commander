@@ -197,6 +197,16 @@ Council Phase 2.
 Two new `SessionManager` methods that let callers (main loop now, MCP
 handlers later) submit prompts and broadcast bytes to sessions without
 going through the keystroke handler. `send_prompt` is the first
+
+### Carry-forward from Phase 1 PR review
+
+- **`TurnId.0` field visibility (PR #7 review item K2).** Phase 1 left
+  `TurnId(pub u64)` so tests can construct `TurnId(7)` directly. Once
+  Phase 2's `Session::next_turn_id` allocator exists and is the
+  canonical mint site, drop the field to `pub(crate)` and add a
+  `pub fn new(value: u64) -> Self` constructor. Tests in
+  `src/session/events.rs` will need to switch from `TurnId(7)` to
+  `TurnId::new(7)`. Tracked in `docs/pr-review-pr7.md`.
 emitter of `PromptSubmitted` on the bus.
 
 ### Tasks
