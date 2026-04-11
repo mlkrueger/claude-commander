@@ -9,6 +9,7 @@
 
 mod events;
 mod manager;
+mod response_store;
 mod types;
 
 pub use events::EventBus;
@@ -17,4 +18,9 @@ pub use events::EventBus;
 #[allow(unused_imports)]
 pub use events::{SessionEvent, TurnId};
 pub use manager::{SessionManager, SpawnConfig};
+// Phase 3 Task 0 skeleton. Real implementation lands in Task 1.
+#[allow(unused_imports)]
+pub use response_store::{
+    DEFAULT_BUDGET_BYTES, DEFAULT_MIN_RETAIN, ResponseStore, StoredTurn, TurnSink,
+};
 pub use types::{Session, SessionStatus, lock_parser};
