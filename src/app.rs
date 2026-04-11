@@ -36,19 +36,36 @@ pub enum AppMode {
     QuitConfirm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    Claude,
+    Terminal,
+}
+
+impl SessionKind {
+    fn toggle(&self) -> Self {
+        match self {
+            SessionKind::Claude => SessionKind::Terminal,
+            SessionKind::Terminal => SessionKind::Claude,
+        }
+    }
+}
+
 pub struct NewSessionState {
+    pub kind: SessionKind,
     pub dir_input: String,
     pub flags_input: String,
-    pub focused: usize, // 0 = directory, 1 = flags
+    pub focused: usize, // 0 = type, 1 = directory, 2 = flags
     pub status_message: Option<String>,
 }
 
 impl NewSessionState {
     fn new() -> Self {
         Self {
+            kind: SessionKind::Claude,
             dir_input: String::new(),
             flags_input: String::new(),
-            focused: 0,
+            focused: 1,
             status_message: None,
         }
     }
@@ -60,7 +77,7 @@ impl NewSessionState {
     }
 
     fn field_count(&self) -> usize {
-        2
+        3
     }
 
     fn extra_args(&self) -> Vec<String> {
@@ -769,25 +786,41 @@ impl App {
                     }
                 }
             }
-            KeyCode::Tab if focused == 0 => {
+            KeyCode::Tab if focused == 1 => {
                 self.tab_complete_path();
+            }
+            KeyCode::Left | KeyCode::Right if focused == 0 => {
+                if let Some(state) = &mut self.new_session {
+                    state.kind = state.kind.toggle();
+                    state.status_message = None;
+                }
+            }
+            KeyCode::Char(' ') if focused == 0 => {
+                if let Some(state) = &mut self.new_session {
+                    state.kind = state.kind.toggle();
+                    state.status_message = None;
+                }
             }
             KeyCode::Backspace => {
                 if let Some(state) = &mut self.new_session {
-                    if focused == 0 {
-                        state.dir_input.pop();
-                    } else {
-                        state.flags_input.pop();
+                    match focused {
+                        1 => {
+                            state.dir_input.pop();
+                        }
+                        2 => {
+                            state.flags_input.pop();
+                        }
+                        _ => {}
                     }
                     state.status_message = None;
                 }
             }
             KeyCode::Char(c) => {
                 if let Some(state) = &mut self.new_session {
-                    if focused == 0 {
-                        state.dir_input.push(c);
-                    } else {
-                        state.flags_input.push(c);
+                    match focused {
+                        1 => state.dir_input.push(c),
+                        2 => state.flags_input.push(c),
+                        _ => {}
                     }
                     state.status_message = None;
                 }
@@ -829,7 +862,8 @@ impl App {
         }
 
         let extra_args = state.extra_args();
-        self.spawn_session_with_prompt(dir, extra_args, None);
+        let kind = state.kind;
+        self.spawn_session_kind(kind, dir, extra_args, None);
         self.mode = AppMode::Dashboard;
     }
 
@@ -909,17 +943,39 @@ impl App {
         extra_args: Vec<String>,
         initial_prompt: Option<String>,
     ) {
-        let label = format!("claude-{}", self.sessions.peek_next_id());
+        self.spawn_session_kind(SessionKind::Claude, working_dir, extra_args, initial_prompt);
+    }
 
-        let cmd = launcher::claude_command();
-        let mut args: Vec<String> = launcher::claude_args()
-            .into_iter()
-            .map(String::from)
-            .collect();
-        args.extend(extra_args);
-        if let Some(prompt) = initial_prompt {
-            args.push(prompt);
-        }
+    pub fn spawn_session_kind(
+        &mut self,
+        kind: SessionKind,
+        working_dir: PathBuf,
+        extra_args: Vec<String>,
+        initial_prompt: Option<String>,
+    ) {
+        let next_id = self.sessions.peek_next_id();
+        let (cmd_owned, args, label): (String, Vec<String>, String) = match kind {
+            SessionKind::Claude => {
+                let mut a: Vec<String> = launcher::claude_args()
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                a.extend(extra_args);
+                if let Some(prompt) = initial_prompt {
+                    a.push(prompt);
+                }
+                (
+                    launcher::claude_command().to_string(),
+                    a,
+                    format!("claude-{next_id}"),
+                )
+            }
+            SessionKind::Terminal => {
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                (shell, extra_args, format!("term-{next_id}"))
+            }
+        };
+        let cmd: &str = &cmd_owned;
 
         let cols = self.terminal_cols.saturating_sub(34).max(40); // account for file tree
         let rows = self.terminal_rows.saturating_sub(3).max(10);
@@ -1324,7 +1380,7 @@ impl App {
 
         let area = frame.area();
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 10u16.min(area.height.saturating_sub(2));
+        let height = 13u16.min(area.height.saturating_sub(2));
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let modal_area = Rect::new(x, y, width, height);
@@ -1344,8 +1400,53 @@ impl App {
         let mut row = inner.y;
         let field_width = inner.width.saturating_sub(4);
 
+        // Type field
+        let type_focused = state.focused == 0;
+        let type_style = if type_focused {
+            Style::default().fg(th.accent)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        let type_label = Line::styled("  Type:", type_style);
+        frame.render_widget(type_label, Rect::new(inner.x, row, inner.width, 1));
+        row += 1;
+        let claude_selected = state.kind == SessionKind::Claude;
+        let term_selected = state.kind == SessionKind::Terminal;
+        let sel_style = Style::default().fg(th.text);
+        let unsel_style = Style::default().fg(th.dim);
+        let type_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                if claude_selected {
+                    "● Claude"
+                } else {
+                    "○ Claude"
+                },
+                if claude_selected {
+                    sel_style
+                } else {
+                    unsel_style
+                },
+            ),
+            Span::raw("   "),
+            Span::styled(
+                if term_selected {
+                    "● Terminal"
+                } else {
+                    "○ Terminal"
+                },
+                if term_selected {
+                    sel_style
+                } else {
+                    unsel_style
+                },
+            ),
+        ]);
+        frame.render_widget(type_line, Rect::new(inner.x, row, inner.width, 1));
+        row += 2;
+
         // Directory field
-        let dir_focused = state.focused == 0;
+        let dir_focused = state.focused == 1;
         let dir_style = if dir_focused {
             Style::default().fg(th.accent)
         } else {
@@ -1378,7 +1479,7 @@ impl App {
         row += 2;
 
         // Flags field
-        let flags_focused = state.focused == 1;
+        let flags_focused = state.focused == 2;
         let flags_style = if flags_focused {
             Style::default().fg(th.accent)
         } else {
