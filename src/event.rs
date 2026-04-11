@@ -9,7 +9,6 @@ pub enum Event {
     Mouse(MouseEvent),
     PtyOutput {
         session_id: usize,
-        #[allow(dead_code)]
         data: Vec<u8>,
     },
     Tick,

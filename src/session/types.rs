@@ -10,6 +10,7 @@ use crate::claude::context;
 use crate::event::Event;
 use crate::pty::detector::PromptDetector;
 use crate::session::events::TurnId;
+use crate::session::response_store::ResponseStore;
 
 pub fn lock_parser(p: &Mutex<vt100::Parser>) -> MutexGuard<'_, vt100::Parser> {
     p.lock().unwrap_or_else(|e| e.into_inner())
@@ -51,6 +52,15 @@ pub struct Session {
     /// production code must allocate ids only via
     /// [`Session::allocate_turn_id`].
     pub(super) next_turn_id: u64,
+    /// Bounded per-session store of completed prompt/response turns.
+    /// Phase 3 added this; the response boundary detector pushes
+    /// `StoredTurn`s into it on idle-marker detection, and
+    /// `SessionManager::get_response` / `get_latest_response` read
+    /// from it on demand.
+    ///
+    /// `pub(super)` for the same reason as `next_turn_id` — direct
+    /// initialization in `make_dummy_session`.
+    pub(super) response_store: ResponseStore,
 }
 
 impl Session {
@@ -153,6 +163,7 @@ impl Session {
             context_percent: None,
             consecutive_write_failures: 0,
             next_turn_id: 0,
+            response_store: ResponseStore::new(),
         })
     }
 
@@ -288,6 +299,7 @@ impl Session {
             context_percent: None,
             consecutive_write_failures: 0,
             next_turn_id: 0,
+            response_store: ResponseStore::new(),
         }
     }
 }
