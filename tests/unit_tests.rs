@@ -388,6 +388,159 @@ mod session_bus_integration {
             assert_eq!(code, 0);
         }
     }
+
+    // ---------------- Phase 2 (send_prompt + broadcast) ----------------
+    //
+    // These exercise the production path against a real PTY backed by
+    // `/bin/cat`, which echoes its stdin to stdout. The PTY's line
+    // discipline ALSO echoes input back, so a successful write produces
+    // observable bytes on the PtyOutput event channel that the test
+    // reader thread feeds. We use that to confirm the bytes
+    // `send_prompt` and `broadcast` write actually reached the PTY.
+
+    use ccom::session::TurnId;
+
+    /// Drain PtyOutput events for the given session id, accumulate
+    /// bytes, return true as soon as `needle` appears anywhere in the
+    /// accumulated buffer or `timeout` elapses.
+    fn read_pty_until_contains(
+        rx: &mpsc::Receiver<ccom::event::Event>,
+        target_session: usize,
+        needle: &[u8],
+        timeout: Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            while let Ok(ev) = rx.try_recv() {
+                if let ccom::event::Event::PtyOutput { session_id, data } = ev
+                    && session_id == target_session
+                {
+                    buf.extend_from_slice(&data);
+                    if buf.windows(needle.len()).any(|w| w == needle) {
+                        return true;
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn send_prompt_through_real_pty_writes_bytes_and_publishes_event() {
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+        let (event_tx, event_rx) = mpsc::channel();
+
+        // `cat` reads its stdin and echoes back. The PTY line
+        // discipline also echoes input, so we'll see the bytes via
+        // the PtyOutput channel either way.
+        let id = manager
+            .spawn(SpawnConfig {
+                label: "smoke-send".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx,
+                cols: 80,
+                rows: 24,
+            })
+            .expect("real spawn should succeed");
+
+        let bus_rx = bus.subscribe();
+        let returned_turn = manager
+            .send_prompt(id, "phase2-marker")
+            .expect("send_prompt should succeed against a real PTY");
+
+        // First allocation on this fresh session — TurnId::new(0).
+        assert_eq!(returned_turn, TurnId::new(0));
+
+        // The bus must publish PromptSubmitted with the same turn id.
+        let bus_event = wait_for(&bus_rx, Duration::from_secs(2), |ev| {
+            matches!(
+                ev,
+                ccom::session::SessionEvent::PromptSubmitted { session_id, .. }
+                    if *session_id == id
+            )
+        })
+        .expect("PromptSubmitted should arrive on bus");
+        if let ccom::session::SessionEvent::PromptSubmitted { turn_id, .. } = bus_event {
+            assert_eq!(turn_id, returned_turn);
+        }
+
+        // The bytes we wrote must actually reach the PTY — verified
+        // via the PtyOutput echo through cat.
+        assert!(
+            read_pty_until_contains(&event_rx, id, b"phase2-marker", Duration::from_secs(3),),
+            "expected 'phase2-marker' to appear in PtyOutput from cat",
+        );
+
+        manager.kill(id);
+    }
+
+    #[test]
+    fn broadcast_through_real_pty_writes_to_each_session() {
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+        let (event_tx, event_rx) = mpsc::channel();
+
+        let id_a = manager
+            .spawn(SpawnConfig {
+                label: "smoke-bcast-a".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx: event_tx.clone(),
+                cols: 80,
+                rows: 24,
+            })
+            .expect("spawn a");
+
+        let id_b = manager
+            .spawn(SpawnConfig {
+                label: "smoke-bcast-b".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx,
+                cols: 80,
+                rows: 24,
+            })
+            .expect("spawn b");
+
+        // Subscribe AFTER spawn so we don't have to filter Spawned events.
+        let bus_rx = bus.subscribe();
+
+        let result = manager.broadcast(&[id_a, id_b], b"bcast-marker\r");
+        assert_eq!(result.sent, vec![id_a, id_b]);
+        assert!(result.not_found.is_empty());
+
+        // Bytes must reach BOTH sessions — verified via per-session
+        // PtyOutput echoes through their respective cat processes.
+        assert!(
+            read_pty_until_contains(&event_rx, id_a, b"bcast-marker", Duration::from_secs(3),),
+            "session a should have echoed 'bcast-marker'",
+        );
+        assert!(
+            read_pty_until_contains(&event_rx, id_b, b"bcast-marker", Duration::from_secs(3),),
+            "session b should have echoed 'bcast-marker'",
+        );
+
+        // Broadcast must NOT have published any SessionEvent on the bus.
+        let bus_events: Vec<_> = std::iter::from_fn(|| bus_rx.try_recv().ok()).collect();
+        assert!(
+            !bus_events
+                .iter()
+                .any(|ev| matches!(ev, ccom::session::SessionEvent::PromptSubmitted { .. })),
+            "broadcast must not publish PromptSubmitted, saw {bus_events:?}",
+        );
+
+        manager.kill(id_a);
+        manager.kill(id_b);
+    }
 }
 
 // Test key_event_to_bytes (need to make it pub or test via integration)
