@@ -60,11 +60,14 @@ pub enum SessionEvent {
     /// analysis can't reach this variant.
     #[allow(dead_code)]
     PromptSubmitted { session_id: usize, turn_id: TurnId },
-    /// The response boundary detector observed the target turn complete.
-    /// Fetch the body via `SessionManager::get_response` (Phase 3).
+    /// The response boundary detector observed the target turn
+    /// complete. Fetch the body via
+    /// `SessionManager::get_response` / `get_latest_response`.
     ///
-    /// Constructed by the response boundary detector in Phase 3.
-    #[allow(dead_code)]
+    /// Emitted by the `StoreAndBus` sink wrapper in
+    /// `SessionManager::check_response_boundaries`, which is called
+    /// from `App::check_all_attention` on the same cadence as the
+    /// prompt detector tick.
     ResponseComplete { session_id: usize, turn_id: TurnId },
     /// Claude Code is waiting on an interactive prompt (allow-once,
     /// Y/n, etc.). `kind` is a short label from `PromptDetector`.

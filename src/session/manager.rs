@@ -28,7 +28,9 @@ use crate::event::Event;
 use crate::pty::detector::PromptDetector;
 
 use super::events::{EventBus, SessionEvent, TurnId};
+use super::response_store::{StoredTurn, TurnSink};
 use super::types::{Session, SessionStatus};
+use crate::pty::response_boundary::ResponseBoundaryDetector;
 
 /// Byte sequence appended after a prompt's payload to submit it to the
 /// underlying interactive runner. Currently `\r` (carriage return),
@@ -80,6 +82,16 @@ pub struct SessionManager {
     selected: usize,
     next_id: usize,
     bus: Arc<EventBus>,
+    /// Response boundary detector shared across all sessions. Holds
+    /// per-session state internally (active turn, body buffer,
+    /// idle-marker watcher). Phase 3 added this; the production
+    /// instance uses `ResponseBoundaryDetector::for_claude_code()`
+    /// which currently has a placeholder marker that will never fire
+    /// — Phase 3 Task 8 (real-Claude integration test) is where the
+    /// real Claude Code idle prompt pattern gets pinned. Tests use
+    /// `set_boundary_detector_for_test` to inject a synthetic-marker
+    /// detector.
+    boundary_detector: ResponseBoundaryDetector,
 }
 
 // `impl Default for SessionManager` was removed in the PR #7
@@ -115,7 +127,18 @@ impl SessionManager {
             selected: 0,
             next_id: 1,
             bus,
+            boundary_detector: ResponseBoundaryDetector::for_claude_code(),
         }
+    }
+
+    /// Test-only: replace the production boundary detector with one
+    /// configured for synthetic test fixtures (e.g. the `## DONE`
+    /// marker the Phase 3 Task 3 detector tests use). Production code
+    /// should never call this — `with_bus` initializes the detector
+    /// to its Claude Code default.
+    #[cfg(test)]
+    pub(crate) fn set_boundary_detector_for_test(&mut self, detector: ResponseBoundaryDetector) {
+        self.boundary_detector = detector;
     }
 
     /// Return a shared reference to the event bus so callers (e.g. the
@@ -253,11 +276,70 @@ impl SessionManager {
             session.try_write(SUBMIT_SEQUENCE);
             turn_id
         };
+        // Notify the response boundary detector that a new turn has
+        // started for this session. From this point until the
+        // detector observes the idle marker, bytes from the PTY are
+        // accumulated as this turn's body.
+        self.boundary_detector.on_prompt_submitted(id, turn_id);
         self.bus.publish(SessionEvent::PromptSubmitted {
             session_id: id,
             turn_id,
         });
         Ok(turn_id)
+    }
+
+    /// Feed raw PTY bytes to the response boundary detector for the
+    /// given session. Called by `App::handle_event` from the
+    /// `Event::PtyOutput` branch — the detector accumulates the bytes
+    /// into the active turn's body buffer (no-op if no active turn).
+    pub fn feed_pty_data(&mut self, session_id: usize, data: &[u8]) {
+        self.boundary_detector.on_pty_data(session_id, data);
+    }
+
+    /// Run the response boundary detector against every live session.
+    /// On boundary detection, the detector pushes a `StoredTurn` into
+    /// that session's `response_store` AND publishes
+    /// `SessionEvent::ResponseComplete` on the bus via the
+    /// `StoreAndBus` sink wrapper.
+    ///
+    /// Called periodically from `App::check_all_attention` (same
+    /// cadence as `check_attention`).
+    pub fn check_response_boundaries(&mut self) {
+        // Disjoint field borrows: split `&mut self` into the pieces
+        // we need so the loop can mutate sessions while the detector
+        // also mutates its own state.
+        let detector = &mut self.boundary_detector;
+        let bus = &self.bus;
+        for session in self.sessions.iter_mut() {
+            let session_id = session.id;
+            let mut sink = StoreAndBus {
+                session_id,
+                store: &mut session.response_store,
+                bus,
+            };
+            detector.check_for_boundary(session_id, &mut sink);
+        }
+    }
+
+    /// Look up a stored turn body by id. Returns a clone so the
+    /// caller doesn't hold a borrow into the session's store.
+    /// Returns `None` if the session doesn't exist or the turn isn't
+    /// in its store (never completed, or evicted by the budget).
+    #[allow(dead_code)] // first production caller is Council Phase 3 / MCP read_response
+    pub fn get_response(&self, session_id: usize, turn_id: TurnId) -> Option<StoredTurn> {
+        self.get(session_id)
+            .and_then(|s| s.response_store.get(turn_id).cloned())
+    }
+
+    /// Look up the most recently completed turn for a session.
+    /// Convenience for late-subscribing consumers ("I subscribed after
+    /// the event fired, give me the most recent completed turn").
+    /// Returns `None` if the session doesn't exist or has no
+    /// completed turns yet.
+    #[allow(dead_code)] // first production caller is Council Phase 3 / MCP read_response
+    pub fn get_latest_response(&self, session_id: usize) -> Option<StoredTurn> {
+        self.get(session_id)
+            .and_then(|s| s.response_store.latest().cloned())
     }
 
     /// Write raw bytes to every session in `ids`, in order. Does not
@@ -420,6 +502,10 @@ impl SessionManager {
             session_id: id,
             code: exit_code,
         });
+        // PR #9 review C1: drop the detector's per-session state so
+        // a long-running TUI doesn't slowly leak `body_bytes`
+        // buffers for every killed session.
+        self.boundary_detector.forget_session(id);
         self.assert_invariant();
         true
     }
@@ -483,6 +569,11 @@ impl SessionManager {
         }
         for (session_id, code) in transitioned {
             self.bus.publish(SessionEvent::Exited { session_id, code });
+            // PR #9 review C1: drop the detector's per-session state
+            // so a long-running TUI doesn't slowly leak `body_bytes`
+            // buffers for every reaped session. Same rationale as
+            // the `kill` path above.
+            self.boundary_detector.forget_session(session_id);
         }
     }
 
@@ -527,6 +618,27 @@ impl SessionManager {
             self.selected,
             self.sessions.len()
         );
+    }
+}
+
+/// Sink wrapper used by [`SessionManager::check_response_boundaries`]:
+/// pushes the completed turn into the session's `ResponseStore` AND
+/// publishes [`SessionEvent::ResponseComplete`] on the bus in one
+/// `push_turn` call. Module-private — no callers outside this file.
+struct StoreAndBus<'a> {
+    session_id: usize,
+    store: &'a mut super::response_store::ResponseStore,
+    bus: &'a EventBus,
+}
+
+impl<'a> TurnSink for StoreAndBus<'a> {
+    fn push_turn(&mut self, turn: StoredTurn) {
+        let turn_id = turn.turn_id;
+        self.store.push_turn(turn);
+        self.bus.publish(SessionEvent::ResponseComplete {
+            session_id: self.session_id,
+            turn_id,
+        });
     }
 }
 
@@ -1263,6 +1375,323 @@ mod tests {
         assert!(result.not_found.is_empty());
         assert_eq!(rec.captured(), b"xxx");
     }
+
+    // ---------------- Phase 3 wiring (Tasks 4 + 5) ----------------
+    //
+    // These tests exercise the integration between SessionManager,
+    // ResponseBoundaryDetector, and ResponseStore. Each test injects
+    // a synthetic-marker detector via set_boundary_detector_for_test
+    // (the production for_claude_code() detector has a placeholder
+    // marker that never fires, so it would be useless here).
+    //
+    // The synthetic protocol uses `## DONE` as the idle marker —
+    // matches the fixtures in tests/fixtures/pty/ used by the
+    // detector unit tests in pty::response_boundary::tests.
+
+    use crate::pty::response_boundary::ResponseBoundaryDetector;
+    use regex::Regex;
+
+    /// Construct a manager with a synthetic-marker boundary detector
+    /// configured to fire on `## DONE`. Used by every Phase 3 wiring
+    /// test below.
+    fn manager_with_synthetic_detector() -> (SessionManager, Arc<EventBus>) {
+        let (mut m, bus) = manager_with_bus();
+        m.set_boundary_detector_for_test(ResponseBoundaryDetector::new(
+            Regex::new(r"## DONE").unwrap(),
+        ));
+        (m, bus)
+    }
+
+    #[test]
+    fn send_prompt_starts_an_active_turn_in_the_detector() {
+        // After send_prompt fires, feed_pty_data should accumulate
+        // bytes for the active turn. We verify indirectly by feeding
+        // bytes that include the marker and confirming the boundary
+        // check pushes a turn.
+        let (mut m, _bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+        let turn_id = m.send_prompt(id, "ping").expect("send_prompt");
+        m.feed_pty_data(id, b"some response\n## DONE\n");
+        m.check_response_boundaries();
+
+        let stored = m
+            .get_response(id, turn_id)
+            .expect("response should be in store");
+        assert_eq!(stored.turn_id, turn_id);
+        assert!(stored.body.contains("some response"));
+    }
+
+    #[test]
+    fn check_response_boundaries_publishes_response_complete() {
+        let (mut m, bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+        let turn_id = m.send_prompt(id, "ping").expect("send_prompt");
+        let rx = bus.subscribe();
+
+        m.feed_pty_data(id, b"hello\n## DONE\n");
+        m.check_response_boundaries();
+
+        // Drain bus events; expect exactly one ResponseComplete with
+        // matching session_id and turn_id.
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let completes: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                SessionEvent::ResponseComplete {
+                    session_id,
+                    turn_id,
+                } => Some((*session_id, *turn_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completes,
+            vec![(id, turn_id)],
+            "expected exactly one ResponseComplete, saw {events:?}"
+        );
+    }
+
+    #[test]
+    fn check_response_boundaries_does_not_fire_without_marker() {
+        let (mut m, bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+        let _ = m.send_prompt(id, "ping").expect("send_prompt");
+        let rx = bus.subscribe();
+
+        m.feed_pty_data(id, b"still working...");
+        m.check_response_boundaries();
+
+        // No marker, no boundary, no event.
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let completes: Vec<_> = events
+            .iter()
+            .filter(|ev| matches!(ev, SessionEvent::ResponseComplete { .. }))
+            .collect();
+        assert!(
+            completes.is_empty(),
+            "expected no ResponseComplete, saw {events:?}"
+        );
+        assert!(m.get_response(id, TurnId::new(0)).is_none());
+    }
+
+    #[test]
+    fn feed_pty_data_with_no_active_turn_is_noop() {
+        // No send_prompt has fired, so the detector has no active
+        // turn for this session. Feeding bytes (even with the marker)
+        // should not produce any stored turn.
+        let (mut m, bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+        let rx = bus.subscribe();
+
+        m.feed_pty_data(id, b"unsolicited bytes with ## DONE marker");
+        m.check_response_boundaries();
+
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|ev| matches!(ev, SessionEvent::ResponseComplete { .. })),
+            "expected no ResponseComplete from unsolicited bytes, saw {events:?}"
+        );
+        assert!(m.get_latest_response(id).is_none());
+    }
+
+    #[test]
+    fn check_response_boundaries_isolates_per_session_state() {
+        let (mut m, _bus) = manager_with_synthetic_detector();
+        let id_a = push_running(&mut m, "a");
+        let id_b = push_running(&mut m, "b");
+        let _ta = m.send_prompt(id_a, "ping").expect("send a");
+        let _tb = m.send_prompt(id_b, "ping").expect("send b");
+
+        // Only feed session a's marker.
+        m.feed_pty_data(id_a, b"a's body\n## DONE\n");
+        m.feed_pty_data(id_b, b"b is still working");
+        m.check_response_boundaries();
+
+        // a should have a stored turn, b should not.
+        assert!(m.get_latest_response(id_a).is_some());
+        assert!(m.get_latest_response(id_b).is_none());
+    }
+
+    #[test]
+    fn get_response_returns_none_for_unknown_session() {
+        let (m, _bus) = manager_with_synthetic_detector();
+        assert!(m.get_response(9999, TurnId::new(0)).is_none());
+        assert!(m.get_latest_response(9999).is_none());
+    }
+
+    #[test]
+    fn get_response_returns_none_for_unknown_turn_id() {
+        let (mut m, _bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+        // Session exists but no turn has completed yet.
+        assert!(m.get_response(id, TurnId::new(0)).is_none());
+        assert!(m.get_latest_response(id).is_none());
+    }
+
+    #[test]
+    fn kill_drops_boundary_detector_state_for_session() {
+        // PR #9 review C1 regression guard: killing a session must
+        // remove its entry from the response boundary detector's
+        // internal HashMap, otherwise body_bytes buffers would leak
+        // across the lifetime of a long-running TUI.
+        let (mut m, _bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "leak");
+        let _ = m.send_prompt(id, "ping").expect("send_prompt");
+
+        // Detector now has state for `id`.
+        assert!(
+            m.boundary_detector.knows_session(id),
+            "detector should know about active session"
+        );
+
+        m.kill(id);
+
+        assert!(
+            !m.boundary_detector.knows_session(id),
+            "kill must drop detector state for the session"
+        );
+    }
+
+    #[test]
+    fn reap_exited_drops_boundary_detector_state_for_transitioned_sessions() {
+        // PR #9 review C1 regression guard, reap_exited path.
+        let (mut m, _bus) = manager_with_synthetic_detector();
+        let id = m.peek_next_id();
+        m.push_for_test(test_support::make_exiting_session(id, 0));
+        let _ = m.send_prompt(id, "ping").expect("send_prompt");
+        assert!(m.boundary_detector.knows_session(id));
+
+        m.reap_exited();
+
+        assert!(
+            !m.boundary_detector.knows_session(id),
+            "reap_exited must drop detector state for transitioned sessions"
+        );
+    }
+
+    #[test]
+    fn end_to_end_real_pty_send_prompt_to_response_complete() {
+        // Phase 3 Task 8: full pipeline through a real PTY. Spawns
+        // /bin/cat (which echoes stdin to stdout via the line
+        // discipline), sends a prompt whose text includes the
+        // synthetic `## DONE` marker, drains PtyOutput events from
+        // the production reader thread into the detector via
+        // feed_pty_data, calls check_response_boundaries on a poll
+        // loop, and asserts that ResponseComplete fires on the bus
+        // and the body is retrievable via get_response.
+        //
+        // Lives in this module (not tests/unit_tests.rs) so it can
+        // access the pub(crate) set_boundary_detector_for_test seam.
+        // The set of real-PTY tests in tests/unit_tests.rs already
+        // covers spawn / kill / reap / send_prompt / broadcast; this
+        // adds the Phase 3 boundary detection wiring on top.
+
+        use crate::event::Event;
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+        manager.set_boundary_detector_for_test(ResponseBoundaryDetector::new(
+            Regex::new(r"## DONE").unwrap(),
+        ));
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let id = manager
+            .spawn(SpawnConfig {
+                label: "phase3-e2e".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx,
+                cols: 80,
+                rows: 24,
+            })
+            .expect("real spawn should succeed");
+
+        let bus_rx = bus.subscribe();
+
+        // Send a prompt whose text contains the synthetic marker. cat
+        // echoes it back via the line discipline, the bytes flow
+        // through the PTY reader thread → Event::PtyOutput →
+        // event_rx, and we forward them to the detector below.
+        let turn_id = manager
+            .send_prompt(id, "hello world ## DONE")
+            .expect("send_prompt should succeed");
+
+        // Mini-App loop: drain PtyOutput events into the detector,
+        // then run the boundary check, then peek at the bus for
+        // ResponseComplete. Mirrors what App::handle_event +
+        // App::check_all_attention do in production.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut response_complete_seen = false;
+        while Instant::now() < deadline && !response_complete_seen {
+            while let Ok(ev) = event_rx.try_recv() {
+                if let Event::PtyOutput { session_id, data } = ev {
+                    manager.feed_pty_data(session_id, &data);
+                }
+            }
+            manager.check_response_boundaries();
+            while let Ok(ev) = bus_rx.try_recv() {
+                if let SessionEvent::ResponseComplete {
+                    session_id: s,
+                    turn_id: t,
+                } = ev
+                    && s == id
+                    && t == turn_id
+                {
+                    response_complete_seen = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            response_complete_seen,
+            "expected ResponseComplete on bus within 3s timeout"
+        );
+
+        // Body is retrievable via get_response. cat echoes the input
+        // back, so the stored body should contain "hello world".
+        let stored = manager
+            .get_response(id, turn_id)
+            .expect("get_response should return the stored turn");
+        assert!(
+            stored.body.contains("hello world"),
+            "expected stored body to contain 'hello world', got {:?}",
+            stored.body
+        );
+
+        manager.kill(id);
+    }
+
+    #[test]
+    fn get_latest_response_returns_most_recently_completed() {
+        let (mut m, _bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+
+        // Complete turn 0.
+        let t0 = m.send_prompt(id, "first").expect("send 0");
+        m.feed_pty_data(id, b"first answer\n## DONE\n");
+        m.check_response_boundaries();
+
+        // Complete turn 1.
+        let t1 = m.send_prompt(id, "second").expect("send 1");
+        m.feed_pty_data(id, b"second answer\n## DONE\n");
+        m.check_response_boundaries();
+
+        let latest = m.get_latest_response(id).expect("latest");
+        assert_eq!(latest.turn_id, t1);
+        assert!(latest.body.contains("second answer"));
+
+        // Both turns are still retrievable individually (well within
+        // the default budget).
+        let stored0 = m.get_response(id, t0).expect("turn 0 retrievable");
+        assert!(stored0.body.contains("first answer"));
+    }
 }
 
 #[cfg(test)]
@@ -1421,6 +1850,7 @@ mod test_support {
             context_percent: None,
             consecutive_write_failures: 0,
             next_turn_id: 0,
+            response_store: crate::session::ResponseStore::new(),
         }
     }
 

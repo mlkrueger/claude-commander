@@ -7,16 +7,9 @@ use std::time::Duration;
 pub enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
-    PtyOutput {
-        session_id: usize,
-        #[allow(dead_code)]
-        data: Vec<u8>,
-    },
+    PtyOutput { session_id: usize, data: Vec<u8> },
     Tick,
-    SessionExited {
-        session_id: usize,
-        code: i32,
-    },
+    SessionExited { session_id: usize, code: i32 },
     Resize(u16, u16),
 }
 

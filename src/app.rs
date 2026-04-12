@@ -189,10 +189,14 @@ impl App {
         match event {
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
-            Event::PtyOutput { session_id, .. } => {
+            Event::PtyOutput { session_id, data } => {
                 if let Some(session) = self.sessions.get_mut(session_id) {
                     session.last_activity = Instant::now();
                 }
+                // Phase 3: feed bytes to the response boundary detector
+                // so it can accumulate the active turn's body and fire
+                // ResponseComplete on the next tick.
+                self.sessions.feed_pty_data(session_id, &data);
                 // Auto-scroll to bottom only when user hasn't manually scrolled up
                 if let AppMode::SessionView(id) = self.mode {
                     if id == session_id && !self.user_scrolled {
@@ -1100,6 +1104,11 @@ impl App {
 
     fn check_all_attention(&mut self) {
         self.sessions.check_attention(&self.detector);
+        // Phase 3: same cadence — check whether any session's active
+        // turn has produced its idle marker. On a hit, the detector
+        // pushes a `StoredTurn` into the session's response store
+        // and publishes `ResponseComplete` on the bus.
+        self.sessions.check_response_boundaries();
     }
 
     fn update_file_tree_for_selected(&mut self) {
