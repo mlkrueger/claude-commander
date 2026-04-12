@@ -290,10 +290,22 @@ smoke, manual verify), then open the phase PR against `main`.
 
 ## Phase 3 — Response boundary detector + response store
 
-**Branch:** `session-mgmt/phase-3-response-detector`
+**Branch:** `session-mgmt/phase-3-response-detector` ✅ merged as PR #9
 **Design ref:** session-management §4
 **Depends on:** Phases 1 and 2 merged to `main`.
 **Blocks:** Council Phase 3 (synthesizer).
+
+> **2026-04-11 follow-up:** Phase 3 shipped a regex-based detector
+> with a placeholder marker for Claude Code (`for_claude_code()`).
+> The placeholder is intentionally inert until Phase 3.5 lands. PR #9
+> review surfaced concerns about visual pattern matching's
+> false-positive risk — the canonical Claude Code detection path is
+> moving to a **hook-based** approach that uses Claude Code's
+> built-in Stop hook system instead. Full design + Phase 3.5 plan:
+> [`docs/designs/response-boundary-detection.md`](../designs/response-boundary-detection.md).
+> The regex detector remains in the tree as the fallback for
+> non-Claude runners (Terminal sessions, future Aider/OpenCode
+> integrations).
 
 ### Goal
 

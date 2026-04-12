@@ -138,7 +138,7 @@ guards for the C1 leak fix).
 |---|---|---|
 | **D1** | App-level `feed_pty_data` regression test | This file |
 | **D2** | Incremental ANSI strip optimization | This file |
-| **for_claude_code marker pinning** | Empirical Claude Code idle prompt regex | PR description + this file. Will be a follow-up commit after PR #9 merges. |
+| **for_claude_code marker pinning** | ~~Empirical Claude Code idle prompt regex~~ **Resolved by direction change after PR merge.** Visual pattern matching was the wrong primitive — too fragile to false-positive on punctuation, code blocks, and quoted text. Switching to a **hook-based detection path** using Claude Code's built-in Stop hook system. Full design in `docs/designs/response-boundary-detection.md` (Tier 1 chosen, Tiers 2 and 3 documented as alternatives). Phase 3.5 work plan included in that doc. The regex `for_claude_code()` placeholder stays in the tree as a fallback for non-Claude runners until Phase 3.5 ships. |
 
 ## Lessons learned
 
