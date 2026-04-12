@@ -544,3 +544,150 @@ visibility:
 - `docs/plans/session-management-phase-1-3.md` Phase 3 — the
   implementation plan that landed Tier 0.
 - Claude Code hooks documentation: TBD via spike.
+
+## 9. Rollout sequence
+
+The Phase 3.5 implementation plan in §4.11 breaks the work into
+sub-phases A–F for sequencing inside the implementation PR. This
+section is the higher-level **process** workflow — which PRs open
+when, what gates each one, and what happens if the spike comes back
+red. Three PRs total, in order:
+
+### PR 1 — Design doc (this PR)
+
+**Scope:** `docs/designs/response-boundary-detection.md` + three
+cross-reference updates. Doc-only, no code changes. Regex detector
+and placeholder marker stay in the tree as the non-Claude fallback.
+
+**Merge criteria:**
+- Reader agrees with the Tier 1 decision over Tiers 2 and 3
+- Reader agrees with the architectural choices flagged in §4.2,
+  §4.3, §4.5, §4.7 (or has pushed back and the doc has been
+  revised)
+- Cross-references resolve
+
+**On merge:** `main` has the full design and the Phase 3 regex
+detector is explicitly documented as the fallback path.
+
+### PR 2 — Spike findings
+
+**Trigger:** PR 1 merged.
+
+**Scope:** `docs/plans/notes/hook-spike.md` (new) + any revisions
+to §4 or §7 of the design doc that the empirical findings require.
+Doc-only.
+
+**What the spike actually does:**
+1. Read Claude Code's hook documentation via WebFetch /
+   `code.claude.com/docs`
+2. Build a minimal scratch project (not in the main repo — a
+   throwaway directory) that:
+   - Creates a temp config dir with a Stop hook in a
+     `settings.json`
+   - Spawns `claude` with the env var pointing at that dir
+   - Sends a prompt via interactive input or `-p` mode
+   - Watches a sidecar file/socket for the hook's signal
+3. Exercise the 6 open questions from §4.10 in turn:
+   - Config dir scoping
+   - Stop hook firing reliability (across text, tool-use loop,
+     error, and interrupt scenarios)
+   - Hook command format (inline vs script file)
+   - Hook latency tolerance
+   - Hook environment variables available to the script
+   - Per-session isolation (two concurrent ccom sessions)
+4. Write up findings — one question per sub-section, empirical
+   answer with the actual settings.json and hook script used.
+5. **Go/no-go decision at the bottom.**
+
+**Effort estimate:** 1–2 hours of focused work.
+
+**Merge criteria:**
+- `hook-spike.md` exists with an answer to each of the 6 questions
+- The go/no-go is explicit
+- If go: the design doc has been updated to reflect any empirical
+  deltas (e.g. "turns out Claude Code uses `X_CONFIG_DIR` not
+  `CLAUDE_CONFIG_DIR`")
+- If no-go: the design doc has been updated to explain why Tier 1
+  is blocked and what the next direction is (probably Tier 2)
+
+**On merge if go:** PR 3 is unblocked.
+**On merge if no-go:** we write a new design doc (or revise this
+one) for the Tier 2 path and restart the rollout from PR 1.
+
+### PR 3 — Phase 3.5 implementation
+
+**Trigger:** PR 2 merged with go decision.
+
+**Scope:** everything in §4.11 sub-phases B–F, in one PR. The
+sub-phases are sequential and not independently testable, so
+they're commits inside one PR rather than separate PRs:
+
+- Commit B: sidecar infrastructure (Unix socket + reader thread +
+  `ccom-stop-hook` helper binary)
+- Commit C: `HookBasedBoundaryDetector` type
+- Commit D: per-session config injection in `Session::spawn`
+- Commit E: wiring + replacement (remove the regex `for_claude_code`
+  placeholder path for Claude sessions, keep the regex detector for
+  `SessionKind::Terminal`)
+- Commit F: documentation updates (`session-management.md` §4 gets
+  its current "this is the fallback" note replaced with a "this is
+  the active path" note; `pr-review-pr9.md` limitation closed;
+  Phase 3.5 plan in §4.11 updated with "landed")
+
+**Testing strategy within PR 3:**
+- Each commit lands with its own unit tests (TDD red→green per our
+  workflow)
+- A real-Claude end-to-end test replaces or joins the existing
+  cat-based `end_to_end_real_pty_send_prompt_to_response_complete`
+  — the new test drives a real Claude session, sends a prompt,
+  expects `ResponseComplete` via the hook path, and asserts
+  `get_response` returns the actual response body
+- The existing 135 tests must still all pass
+
+**Effort estimate:** ~8 hours of focused work (§4.11 sub-phases
+B–F, minus the spike time that already happened in PR 2).
+
+**Merge criteria:**
+- Real Claude session fires `ResponseComplete` end-to-end
+- `for_claude_code()` placeholder is gone (or repurposed for
+  fallback)
+- All existing tests still pass
+- PR review pass completed
+
+### If the spike is red
+
+PR 2 documents the blocker. We then:
+
+1. Open a new design doc or revise §4 of this one to pivot to
+   Tier 2 (vt100 cursor position + idle timer — documented in §5).
+2. Start a new rollout sequence for the Tier 2 path. The design
+   doc PR, spike, and implementation PR structure is the same —
+   the only difference is what the detector reads from
+   (parser cursor state vs hook sidecar).
+3. The Tier 1 design doc stays in the tree as "considered, blocked
+   by <reason>" — valuable context for any future retry when
+   Claude Code's hook system changes.
+
+### What doesn't block what
+
+These work items are **parallel to** the hook rollout and can
+happen anytime:
+
+- Phases 4, 5, 6 of session-management (MCP + driver sessions)
+  can begin work on the read-only tools (`list_sessions`,
+  `subscribe`) that don't depend on `ResponseComplete` firing.
+  `read_response` is the one Phase 4 tool that's degraded until
+  Phase 3.5 lands — it'll return empty results for live Claude
+  turns until then.
+- Model Council Phase 1 (per-session model pinning via
+  `--model`) is fully independent and can start whenever.
+- Model Council Phase 2 (data model + broadcast writer) uses
+  Phase 2's `send_prompt` and `broadcast` and doesn't need
+  `ResponseComplete`.
+- Model Council Phase 3 (synthesizer) **is gated** on Phase 3.5
+  because the synthesizer waits on `ResponseComplete` to decide
+  when all panelists are done.
+
+So the practical ordering is: finish this rollout first (3 PRs),
+then the Council Phase 2+3 and the Phase 4+ MCP work unblock
+simultaneously.
