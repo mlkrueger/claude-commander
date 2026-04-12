@@ -123,6 +123,11 @@ impl ResponseStore {
         self.turns.len()
     }
 
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.turns.is_empty()
+    }
+
     /// Total bytes currently held in the store (sum of every
     /// `StoredTurn::body.len()`). Useful for tests asserting budget
     /// enforcement.

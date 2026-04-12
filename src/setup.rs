@@ -19,11 +19,7 @@ pub enum SetupStatus {
 
 /// Check all required configurations and return items that need attention.
 pub fn check_setup() -> Vec<SetupItem> {
-    let mut items = Vec::new();
-
-    items.push(check_statusline_hook());
-
-    items
+    vec![check_statusline_hook()]
 }
 
 /// Returns only items that are missing.
@@ -103,22 +99,21 @@ pub fn mark_initialized() {
 /// Find the statusline script, checking common locations.
 fn find_statusline_script() -> String {
     // Check relative to the ccom binary
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("scripts").join("ccom-statusline.sh");
-            if candidate.exists() {
-                return candidate.to_string_lossy().to_string();
-            }
-            // Check sibling scripts dir (dev layout)
-            let candidate = parent
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.join("scripts").join("ccom-statusline.sh"));
-            if let Some(c) = candidate {
-                if c.exists() {
-                    return c.to_string_lossy().to_string();
-                }
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        let candidate = parent.join("scripts").join("ccom-statusline.sh");
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+        let candidate = parent
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("scripts").join("ccom-statusline.sh"));
+        if let Some(c) = candidate
+            && c.exists()
+        {
+            return c.to_string_lossy().to_string();
         }
     }
 

@@ -54,8 +54,8 @@ impl Widget for TerminalWidget<'_> {
 
         // Render cursor if visible
         let cursor = self.screen.cursor_position();
-        let cursor_y = cursor.0 as u16;
-        let cursor_x = cursor.1 as u16;
+        let cursor_y = cursor.0;
+        let cursor_x = cursor.1;
         if cursor_y >= self.scroll_offset as u16
             && (cursor_y - self.scroll_offset as u16) < area.height
             && cursor_x < area.width

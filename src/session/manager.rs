@@ -22,9 +22,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc;
 
-use crate::event::Event;
 use crate::pty::detector::PromptDetector;
 
 use super::events::{EventBus, SessionEvent, TurnId};
@@ -56,7 +54,7 @@ pub struct SpawnConfig<'a> {
     pub working_dir: PathBuf,
     pub command: &'a str,
     pub args: Vec<String>,
-    pub event_tx: mpsc::Sender<Event>,
+    pub event_tx: crate::event::MonitoredSender,
     pub cols: u16,
     pub rows: u16,
 }
@@ -248,13 +246,13 @@ impl SessionManager {
     ///   - allocate the `TurnId`
     ///   - publish `PromptSubmitted` on the bus
     ///   - return `Ok(turn_id)`
-    /// even though no bytes reached the underlying process. Callers
-    /// that need write-failure visibility should consult
-    /// `Session::consecutive_write_failures` directly; the existing
-    /// logic transitions a session to `Exited(-3)` after three
-    /// consecutive failures, so a persistently broken session will
-    /// surface via `SessionEvent::Exited` on the next `reap_exited`
-    /// pass.
+    ///     even though no bytes reached the underlying process. Callers
+    ///     that need write-failure visibility should consult
+    ///     `Session::consecutive_write_failures` directly; the existing
+    ///     logic transitions a session to `Exited(-3)` after three
+    ///     consecutive failures, so a persistently broken session will
+    ///     surface via `SessionEvent::Exited` on the next `reap_exited`
+    ///     pass.
     ///
     /// PR #8 review item D1 made this limitation explicit. A future
     /// refactor may switch `try_write` to return a `Result` and
@@ -1590,6 +1588,7 @@ mod tests {
 
         use crate::event::Event;
         use std::path::PathBuf;
+        use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
         let bus = Arc::new(EventBus::new());
@@ -1598,7 +1597,8 @@ mod tests {
             Regex::new(r"## DONE").unwrap(),
         ));
 
-        let (event_tx, event_rx) = mpsc::channel();
+        let (raw_tx, event_rx) = mpsc::channel();
+        let event_tx = crate::event::MonitoredSender::wrap(raw_tx);
         let id = manager
             .spawn(SpawnConfig {
                 label: "phase3-e2e".to_string(),
@@ -1851,6 +1851,7 @@ mod test_support {
             consecutive_write_failures: 0,
             next_turn_id: 0,
             response_store: crate::session::ResponseStore::new(),
+            reader_handle: None,
         }
     }
 

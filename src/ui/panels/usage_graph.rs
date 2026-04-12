@@ -80,28 +80,28 @@ impl Widget for UsageGraphPanel<'_> {
             }
 
             // Session cost
-            if y < inner.bottom() {
-                if let Some(cost) = rl.cost_usd {
+            if y < inner.bottom()
+                && let Some(cost) = rl.cost_usd
+            {
+                render_text(
+                    buf,
+                    x,
+                    y,
+                    w,
+                    "Session cost",
+                    Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+                );
+                y += 1;
+                if y < inner.bottom() {
+                    let cost_text = format!("${:.2}", cost);
                     render_text(
                         buf,
-                        x,
+                        x + 1,
                         y,
-                        w,
-                        "Session cost",
-                        Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+                        w.saturating_sub(1),
+                        &cost_text,
+                        Style::default().fg(th.dim),
                     );
-                    y += 1;
-                    if y < inner.bottom() {
-                        let cost_text = format!("${:.2}", cost);
-                        render_text(
-                            buf,
-                            x + 1,
-                            y,
-                            w.saturating_sub(1),
-                            &cost_text,
-                            Style::default().fg(th.dim),
-                        );
-                    }
                 }
             }
         } else {
@@ -118,6 +118,7 @@ impl Widget for UsageGraphPanel<'_> {
 }
 
 /// Render a usage section (title, reset info, progress bar) and return the next y position.
+#[allow(clippy::too_many_arguments)]
 fn render_usage_section(
     buf: &mut Buffer,
     x: u16,

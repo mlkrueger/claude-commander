@@ -1,19 +1,21 @@
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
-use std::time::Instant;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::claude::context;
-use crate::event::Event;
+use crate::event::{Event, MonitoredSender};
 use crate::pty::detector::PromptDetector;
 use crate::session::events::TurnId;
 use crate::session::response_store::ResponseStore;
 
 pub fn lock_parser(p: &Mutex<vt100::Parser>) -> MutexGuard<'_, vt100::Parser> {
-    p.lock().unwrap_or_else(|e| e.into_inner())
+    p.lock().unwrap_or_else(|poisoned| {
+        log::warn!("vt100 parser mutex poisoned, recovering");
+        poisoned.into_inner()
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,16 +63,18 @@ pub struct Session {
     /// `pub(super)` for the same reason as `next_turn_id` — direct
     /// initialization in `make_dummy_session`.
     pub(super) response_store: ResponseStore,
+    pub(super) reader_handle: Option<JoinHandle<()>>,
 }
 
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: usize,
         label: String,
         working_dir: PathBuf,
         command: &str,
         args: &[&str],
-        event_tx: mpsc::Sender<Event>,
+        event_tx: MonitoredSender,
         cols: u16,
         rows: u16,
     ) -> anyhow::Result<Self> {
@@ -97,34 +101,43 @@ impl Session {
         let parser_clone = Arc::clone(&parser);
         let session_id = id;
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        match reader.read(&mut buf) {
-                            Ok(0) => {
-                                let _ = event_tx.send(Event::SessionExited {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match reader.read(&mut buf) {
+                        Ok(0) => {
+                            if event_tx
+                                .send(Event::SessionExited {
                                     session_id,
                                     code: 0,
-                                });
-                                true
+                                })
+                                .is_err()
+                            {
+                                return true; // receiver dropped
                             }
-                            Ok(n) => {
-                                let data = buf[..n].to_vec();
-                                lock_parser(&parser_clone).process(&data);
-                                let _ = event_tx.send(Event::PtyOutput { session_id, data });
-                                false
-                            }
-                            Err(_) => {
-                                let _ = event_tx.send(Event::SessionExited {
-                                    session_id,
-                                    code: -1,
-                                });
-                                true
-                            }
+                            true
                         }
-                    }));
+                        Ok(n) => {
+                            let data = buf[..n].to_vec();
+                            lock_parser(&parser_clone).process(&data);
+                            if event_tx
+                                .send(Event::PtyOutput { session_id, data })
+                                .is_err()
+                            {
+                                return true; // receiver dropped
+                            }
+                            false
+                        }
+                        Err(_) => {
+                            let _ = event_tx.send(Event::SessionExited {
+                                session_id,
+                                code: -1,
+                            });
+                            true
+                        }
+                    }
+                }));
                 match result {
                     Ok(true) => break,
                     Ok(false) => continue,
@@ -164,6 +177,7 @@ impl Session {
             consecutive_write_failures: 0,
             next_turn_id: 0,
             response_store: ResponseStore::new(),
+            reader_handle: Some(handle),
         })
     }
 
@@ -177,7 +191,6 @@ impl Session {
     /// `TurnId` is the correlation key the response boundary
     /// detector (Phase 3) will pair with the matching
     /// `ResponseComplete`.
-    #[allow(dead_code)] // first production caller is Phase 2 send_prompt
     pub(crate) fn allocate_turn_id(&mut self) -> TurnId {
         let id = TurnId::new(self.next_turn_id);
         self.next_turn_id += 1;
@@ -251,6 +264,23 @@ impl Session {
         self.status = SessionStatus::Exited(-1);
     }
 
+    pub fn join_reader(&mut self, timeout: Duration) {
+        if let Some(handle) = self.reader_handle.take() {
+            let start = Instant::now();
+            while !handle.is_finished() {
+                if start.elapsed() >= timeout {
+                    log::warn!(
+                        "session {} reader thread did not exit within timeout",
+                        self.id
+                    );
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = handle.join();
+        }
+    }
+
     pub fn refresh_context(&mut self) {
         if matches!(self.status, SessionStatus::Exited(_)) {
             return;
@@ -260,7 +290,6 @@ impl Session {
         }
     }
 
-    #[allow(dead_code)]
     pub fn elapsed_since_activity(&self) -> std::time::Duration {
         self.last_activity.elapsed()
     }
@@ -300,6 +329,7 @@ impl Session {
             consecutive_write_failures: 0,
             next_turn_id: 0,
             response_store: ResponseStore::new(),
+            reader_handle: None,
         }
     }
 }

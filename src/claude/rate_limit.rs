@@ -103,7 +103,7 @@ pub fn get_rate_limit_from_telemetry() -> Option<RateLimitInfo> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "json") {
+        if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
         let Ok(file) = fs::File::open(&path) else {
@@ -115,22 +115,21 @@ pub fn get_rate_limit_from_telemetry() -> Option<RateLimitInfo> {
                 continue;
             }
             // Extract timestamp and rate limit info
-            if let Some(ts) = extract_json_string_val(&line, "client_timestamp") {
-                if ts > latest_timestamp {
-                    latest_timestamp = ts;
-                    if let Some(meta) = extract_json_string_val(&line, "additional_metadata") {
-                        // Parse the nested JSON string
-                        if let Ok(meta_obj) = serde_json::from_str::<serde_json::Value>(&meta) {
-                            latest_status = meta_obj
-                                .get("status")
-                                .and_then(|s| s.as_str())
-                                .map(String::from);
-                            latest_resets_at = meta_obj
-                                .get("hoursTillReset")
-                                .and_then(|h| h.as_u64())
-                                .map(|h| format!("~{}h", h));
-                        }
-                    }
+            if let Some(ts) = extract_json_string_val(&line, "client_timestamp")
+                && ts > latest_timestamp
+            {
+                latest_timestamp = ts;
+                if let Some(meta) = extract_json_string_val(&line, "additional_metadata")
+                    && let Ok(meta_obj) = serde_json::from_str::<serde_json::Value>(&meta)
+                {
+                    latest_status = meta_obj
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .map(String::from);
+                    latest_resets_at = meta_obj
+                        .get("hoursTillReset")
+                        .and_then(|h| h.as_u64())
+                        .map(|h| format!("~{}h", h));
                 }
             }
         }

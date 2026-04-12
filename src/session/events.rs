@@ -112,10 +112,10 @@ impl EventBus {
     #[allow(dead_code)]
     pub fn subscribe(&self) -> mpsc::Receiver<SessionEvent> {
         let (tx, rx) = mpsc::channel();
-        let mut senders = self
-            .senders
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut senders = self.senders.lock().unwrap_or_else(|poisoned| {
+            log::warn!("EventBus senders mutex poisoned in subscribe, recovering");
+            poisoned.into_inner()
+        });
         senders.push(tx);
         rx
     }
@@ -125,25 +125,33 @@ impl EventBus {
     /// concurrently from multiple threads; safe to call on an empty
     /// bus (no-op).
     ///
-    /// **Held-lock invariant.** This implementation holds the
-    /// `senders` mutex while iterating and calling `tx.send` on every
-    /// subscriber. That's only safe because `std::sync::mpsc::channel`
-    /// is **unbounded** — `send` returns immediately on success and
-    /// only fails (without blocking) when the receiver has been
-    /// dropped. If we ever switch the backing store to a bounded
-    /// channel (`crossbeam::channel::bounded`, `tokio::sync::mpsc`
-    /// with capacity, etc.), a slow subscriber's full queue would
-    /// freeze every other subscriber under this lock, turning the
-    /// bus into a head-of-line blocker. Either revisit the lock
-    /// strategy (release-then-resend, RwLock + try_send) or accept
-    /// drops on backpressure (open question #4 in
-    /// `docs/designs/session-management.md` §7).
     pub fn publish(&self, event: SessionEvent) {
-        let mut senders = self
-            .senders
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        senders.retain(|tx| tx.send(event.clone()).is_ok());
+        let snapshot = {
+            let senders = self.senders.lock().unwrap_or_else(|poisoned| {
+                log::warn!("EventBus senders mutex poisoned in publish, recovering");
+                poisoned.into_inner()
+            });
+            senders.clone()
+        };
+
+        let mut dead: Vec<usize> = Vec::new();
+        for (i, tx) in snapshot.iter().enumerate() {
+            if tx.send(event.clone()).is_err() {
+                dead.push(i);
+            }
+        }
+
+        if !dead.is_empty() {
+            let mut senders = self.senders.lock().unwrap_or_else(|poisoned| {
+                log::warn!("EventBus senders mutex poisoned in publish prune, recovering");
+                poisoned.into_inner()
+            });
+            for &i in dead.iter().rev() {
+                if i < senders.len() {
+                    senders.swap_remove(i);
+                }
+            }
+        }
     }
 }
 

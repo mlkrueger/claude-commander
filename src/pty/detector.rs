@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use regex::Regex;
 
 #[derive(Debug, Clone)]
@@ -9,34 +11,65 @@ pub enum PromptKind {
     Unknown,
 }
 
+struct PatternEntry {
+    regex: &'static LazyLock<Regex>,
+    kind: PromptKind,
+}
+
+static RE_ALLOW_ONCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(Allow once|Allow always|allow tool|Don't allow)")
+        .expect("RE_ALLOW_ONCE is a valid regex")
+});
+
+static RE_YES_NO: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(Do you want to|Yes/No|Y/n|y/N|\[Y/n\]|\[y/N\]|approve|deny)")
+        .expect("RE_YES_NO is a valid regex")
+});
+
+static RE_PRESS_ENTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(press enter|Press Enter)").expect("RE_PRESS_ENTER is a valid regex")
+});
+
+static RE_ACCEPT_EDITS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(accept edits)").expect("RE_ACCEPT_EDITS is a valid regex"));
+
+static RE_UNKNOWN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(permission|⎕|Reject)").expect("RE_UNKNOWN is a valid regex")
+});
+
 pub struct PromptDetector {
-    patterns: Vec<(Regex, PromptKind)>,
+    patterns: Vec<PatternEntry>,
+}
+
+impl Default for PromptDetector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PromptDetector {
     pub fn new() -> Self {
         let patterns = vec![
-            (
-                Regex::new(r"(?i)(Allow once|Allow always|allow tool|Don't allow)").unwrap(),
-                PromptKind::AllowOnce,
-            ),
-            (
-                Regex::new(r"(?i)(Do you want to|Yes/No|Y/n|y/N|\[Y/n\]|\[y/N\]|approve|deny)")
-                    .unwrap(),
-                PromptKind::YesNo,
-            ),
-            (
-                Regex::new(r"(?i)(press enter|Press Enter)").unwrap(),
-                PromptKind::PressEnter,
-            ),
-            (
-                Regex::new(r"(?i)(accept edits)").unwrap(),
-                PromptKind::AcceptEdits,
-            ),
-            (
-                Regex::new(r"(?i)(permission|⎕|Reject)").unwrap(),
-                PromptKind::Unknown,
-            ),
+            PatternEntry {
+                regex: &RE_ALLOW_ONCE,
+                kind: PromptKind::AllowOnce,
+            },
+            PatternEntry {
+                regex: &RE_YES_NO,
+                kind: PromptKind::YesNo,
+            },
+            PatternEntry {
+                regex: &RE_PRESS_ENTER,
+                kind: PromptKind::PressEnter,
+            },
+            PatternEntry {
+                regex: &RE_ACCEPT_EDITS,
+                kind: PromptKind::AcceptEdits,
+            },
+            PatternEntry {
+                regex: &RE_UNKNOWN,
+                kind: PromptKind::Unknown,
+            },
         ];
         Self { patterns }
     }
@@ -49,9 +82,9 @@ impl PromptDetector {
         let start = total_rows.saturating_sub(15);
         let text: String = all_rows[start..].join("\n");
 
-        for (pattern, kind) in &self.patterns {
-            if pattern.is_match(&text) {
-                return Some(kind.clone());
+        for entry in &self.patterns {
+            if entry.regex.is_match(&text) {
+                return Some(entry.kind.clone());
             }
         }
         None
