@@ -691,3 +691,310 @@ mod key_encoding_tests {
         assert!(true); // placeholder — the function is private
     }
 }
+
+// Phase 3.5 review-fix Stream B: real-PTY hook integration tests.
+//
+// These exercise `Session::spawn` with `install_hook: true` and poke
+// the resulting FIFOs by hand. They require Unix (mkfifo + blocking
+// FIFO open). `check_hook_signals` + `send_prompt` are `pub` on
+// `SessionManager`; the `hook` module itself is `pub(crate)`, so these
+// tests write the hook's JSON payload as raw bytes to the FIFO and
+// rely on the sidecar reader to parse it.
+//
+// NOTE: all three hook-integration tests share a `/tmp/ccom-<pid>-<id>`
+// namespace keyed on the test-process pid and per-`SessionManager`
+// `next_id`. Because cargo runs tests in parallel within a single
+// process, two tests that both start from `next_id = 0` would collide
+// on mkfifo. We serialize them behind a single mutex so they run one
+// at a time without blocking the rest of the test suite.
+#[cfg(unix)]
+mod session_hook_integration {
+    use std::sync::Mutex;
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    use ccom::session::{EventBus, SessionEvent, SessionManager, SpawnConfig};
+    use std::fs;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn make_event_tx() -> ccom::event::MonitoredSender {
+        let (raw_tx, _event_rx) = mpsc::channel();
+        ccom::event::MonitoredSender::wrap(raw_tx)
+    }
+
+    /// Count directories under `/tmp` whose file name starts with
+    /// `ccom-<pid>-`. Used to detect leaked hook dirs on spawn failure.
+    fn count_hook_dirs_for_pid(pid: u32) -> usize {
+        let prefix = format!("ccom-{pid}-");
+        fs::read_dir(std::env::temp_dir())
+            .map(|iter| {
+                iter.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn spawn_cleans_up_hook_dir_on_spawn_command_failure() {
+        // T2: install_hook=true with a bad command must not leak a
+        // `/tmp/ccom-<pid>-*` dir. We spawn, expect an Err, and verify
+        // the dir count didn't increase.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+
+        let pid = std::process::id();
+        let before = count_hook_dirs_for_pid(pid);
+
+        // Use a nonexistent absolute binary so `spawn_command` fails
+        // synchronously at posix_spawn. (On some platforms/libcs the
+        // exec failure is deferred to the child, in which case spawn
+        // would return Ok and this test would no-op; but on macOS /
+        // Linux with an absolute path that doesn't exist, the parent
+        // sees ENOENT.)
+        //
+        // If the platform defers the error, `spawn` returns Ok(id);
+        // in that case we fall through to the cleanup validation via
+        // `kill`, which also tears down the hook dir — this is a
+        // weaker assertion but still catches a regression where the
+        // error path leaks a dir when it IS synchronous.
+        let result = manager.spawn(SpawnConfig {
+            label: "hook-fail-spawn".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            command: "/nonexistent/ccom-test-binary-that-does-not-exist",
+            args: vec![],
+            event_tx: make_event_tx(),
+            cols: 80,
+            rows: 24,
+            install_hook: true,
+        });
+        if let Ok(id) = result {
+            // Platform deferred the exec error. Kill the session so
+            // its hook dir gets cleaned up via the kill path — this
+            // still validates the cleanup *happens*, just via a
+            // different branch. The spawn error cleanup path is
+            // exercised indirectly via the other early-failure
+            // branches (create_stop_fifo, spawn_fifo_reader) which
+            // are harder to trigger in a test.
+            manager.kill(id);
+        }
+
+        let after = count_hook_dirs_for_pid(pid);
+        assert_eq!(
+            after,
+            before,
+            "spawn failure leaked {} hook dir(s) (before={before}, after={after})",
+            after.saturating_sub(before)
+        );
+    }
+
+    /// Open the FIFO for writing and append one JSON line terminated
+    /// by a newline — matches the format the real hook command emits
+    /// (`cat >> fifo; printf '\\n' >> fifo`).
+    fn write_hook_line(fifo: &std::path::Path, json: &str) {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .open(fifo)
+            .expect("open fifo for write");
+        f.write_all(json.as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
+    }
+
+    /// Poll `check_hook_signals` until the given predicate holds, up
+    /// to `timeout`. Returns true on success.
+    fn wait_for_signal<F>(
+        manager: &mut SessionManager,
+        bus_rx: &mpsc::Receiver<SessionEvent>,
+        timeout: Duration,
+        mut pred: F,
+    ) -> Vec<SessionEvent>
+    where
+        F: FnMut(&[SessionEvent]) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        let mut seen: Vec<SessionEvent> = Vec::new();
+        while Instant::now() < deadline {
+            manager.check_hook_signals();
+            while let Ok(ev) = bus_rx.try_recv() {
+                seen.push(ev);
+            }
+            if pred(&seen) {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        seen
+    }
+
+    #[test]
+    fn concurrent_sessions_have_isolated_hook_dirs() {
+        // T3: two hook-enabled sessions with /bin/cat get distinct
+        // hook dirs and signals route to the correct session.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+
+        let id_a = manager
+            .spawn(SpawnConfig {
+                label: "iso-a".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx: make_event_tx(),
+                cols: 80,
+                rows: 24,
+                install_hook: true,
+            })
+            .expect("spawn a");
+        let id_b = manager
+            .spawn(SpawnConfig {
+                label: "iso-b".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx: make_event_tx(),
+                cols: 80,
+                rows: 24,
+                install_hook: true,
+            })
+            .expect("spawn b");
+
+        // Distinct hook dir paths. We reach into the session via
+        // `get` / a public accessor — but those aren't exposed, so we
+        // infer isolation via the `/tmp/ccom-<pid>-<id>` naming scheme
+        // established by `create_hook_dir`.
+        let pid = std::process::id();
+        let dir_a = std::env::temp_dir().join(format!("ccom-{pid}-{id_a}"));
+        let dir_b = std::env::temp_dir().join(format!("ccom-{pid}-{id_b}"));
+        assert_ne!(dir_a, dir_b, "hook dirs must be distinct");
+        assert!(dir_a.is_dir(), "hook dir a exists: {dir_a:?}");
+        assert!(dir_b.is_dir(), "hook dir b exists: {dir_b:?}");
+
+        // send_prompt to each session so the detector has an active
+        // turn for both — otherwise the hook signal would be dropped.
+        let turn_a = manager.send_prompt(id_a, "hi-a").expect("send a");
+        let turn_b = manager.send_prompt(id_b, "hi-b").expect("send b");
+
+        let bus_rx = bus.subscribe();
+
+        // Write a distinct JSON line to each FIFO.
+        let fifo_a = dir_a.join("stop.fifo");
+        let fifo_b = dir_b.join("stop.fifo");
+        write_hook_line(
+            &fifo_a,
+            r#"{"session_id":"uuid-a","last_assistant_message":"body-for-a"}"#,
+        );
+        write_hook_line(
+            &fifo_b,
+            r#"{"session_id":"uuid-b","last_assistant_message":"body-for-b"}"#,
+        );
+
+        // Wait for both ResponseComplete events.
+        let events = wait_for_signal(&mut manager, &bus_rx, Duration::from_secs(3), |seen| {
+            let mut saw_a = false;
+            let mut saw_b = false;
+            for ev in seen {
+                if let SessionEvent::ResponseComplete {
+                    session_id,
+                    turn_id,
+                    ..
+                } = ev
+                {
+                    if *session_id == id_a && *turn_id == turn_a {
+                        saw_a = true;
+                    }
+                    if *session_id == id_b && *turn_id == turn_b {
+                        saw_b = true;
+                    }
+                }
+            }
+            saw_a && saw_b
+        });
+
+        let stored_a = manager.get_response(id_a, turn_a).expect("a stored");
+        let stored_b = manager.get_response(id_b, turn_b).expect("b stored");
+        assert_eq!(stored_a.body, "body-for-a");
+        assert_eq!(stored_b.body, "body-for-b");
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                SessionEvent::ResponseComplete { session_id, .. } if *session_id == id_a
+            )),
+            "expected ResponseComplete for session a"
+        );
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                SessionEvent::ResponseComplete { session_id, .. } if *session_id == id_b
+            )),
+            "expected ResponseComplete for session b"
+        );
+
+        manager.kill(id_a);
+        manager.kill(id_b);
+    }
+
+    #[test]
+    fn check_hook_signals_end_to_end_with_real_fifo() {
+        // T4: single-session end-to-end. send_prompt allocates a turn
+        // id, we write a real hook JSON line to the FIFO, call
+        // `check_hook_signals`, and assert the stored body matches.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+
+        let id = manager
+            .spawn(SpawnConfig {
+                label: "hook-e2e".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx: make_event_tx(),
+                cols: 80,
+                rows: 24,
+                install_hook: true,
+            })
+            .expect("spawn");
+
+        let turn = manager.send_prompt(id, "prompt").expect("send");
+
+        let pid = std::process::id();
+        let fifo = std::env::temp_dir()
+            .join(format!("ccom-{pid}-{id}"))
+            .join("stop.fifo");
+
+        let bus_rx = bus.subscribe();
+        write_hook_line(
+            &fifo,
+            r#"{"session_id":"uuid","last_assistant_message":"hook-body"}"#,
+        );
+
+        let events = wait_for_signal(&mut manager, &bus_rx, Duration::from_secs(3), |seen| {
+            seen.iter().any(|ev| {
+                matches!(
+                    ev,
+                    SessionEvent::ResponseComplete { session_id, turn_id, .. }
+                        if *session_id == id && *turn_id == turn
+                )
+            })
+        });
+
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                SessionEvent::ResponseComplete { session_id, turn_id, .. }
+                    if *session_id == id && *turn_id == turn
+            )),
+            "expected ResponseComplete on the bus; saw {events:?}"
+        );
+
+        let stored = manager.get_response(id, turn).expect("stored turn");
+        assert_eq!(stored.body, "hook-body");
+
+        manager.kill(id);
+    }
+}
