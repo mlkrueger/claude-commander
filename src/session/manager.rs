@@ -312,9 +312,13 @@ impl SessionManager {
     /// Called periodically from `App::check_all_attention` alongside
     /// `check_response_boundaries`.
     pub fn check_hook_signals(&mut self) {
-        // H5: single-pass drain + process. Uses disjoint field borrows
-        // (same pattern as `check_response_boundaries`) to avoid the
-        // old "collect into Vec, then iter_mut().find()" two-pass shape.
+        // H5: single outer loop over sessions. Each session's hook
+        // channel is drained into a local `Vec` and then processed
+        // against that same session's response store in place, using
+        // disjoint field borrows (same pattern as
+        // `check_response_boundaries`). This replaces the old two-pass
+        // shape that drained into a manager-wide `Vec<(id, body)>` and
+        // then did an O(n) `iter_mut().find()` lookup per item.
         let detector = &mut self.boundary_detector;
         let bus = &self.bus;
         for session in self.sessions.iter_mut() {

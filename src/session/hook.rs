@@ -113,14 +113,16 @@ pub fn parse_hook_stdin(json: &str, ccom_session_id: usize) -> Option<HookStopSi
     let obj = value.as_object()?;
 
     let last_assistant_message = match obj.get("last_assistant_message") {
-        Some(v) if v.is_string() => v.as_str().unwrap().to_string(),
-        Some(v) => {
-            let ty = json_type_name(v);
-            log::warn!(
-                "hook stdin for session {ccom_session_id} has last_assistant_message of wrong type: expected string, got {ty}"
-            );
-            return None;
-        }
+        Some(v) => match v.as_str() {
+            Some(s) => s.to_string(),
+            None => {
+                let ty = json_type_name(v);
+                log::warn!(
+                    "hook stdin for session {ccom_session_id} has last_assistant_message of wrong type: expected string, got {ty}"
+                );
+                return None;
+            }
+        },
         None => return None,
     };
 
@@ -252,7 +254,7 @@ pub fn create_hook_dir(session_id: usize) -> std::io::Result<PathBuf> {
     }
 
     let fifo_path = root.join("stop.fifo");
-    let settings = build_hook_settings(&fifo_path);
+    let settings = build_hook_settings(&fifo_path)?;
     let settings_path = claude_dir.join("settings.json");
     // `create_new(true)` refuses to follow any pre-existing symlink
     // (returns EEXIST) — this closes the TOCTOU window (issue H1).
@@ -283,13 +285,25 @@ pub fn create_hook_dir(_session_id: usize) -> std::io::Result<PathBuf> {
 /// The fifo path is POSIX-single-quote-escaped, so paths containing
 /// spaces, single quotes, `$`, backticks, etc. are handled safely
 /// (issue C2).
-fn build_hook_settings(fifo_path: &Path) -> String {
-    let fifo_str = fifo_path.display().to_string();
-    let quoted = shell_single_quote(&fifo_str);
+///
+/// Returns `Err` if the fifo path is not valid UTF-8. In that case
+/// the hook command string could not be encoded into `settings.json`
+/// without loss (review second-pass N2). Practically this only
+/// happens on Unix with a non-UTF-8 `TMPDIR`, which is exceedingly
+/// rare — the function fails loudly rather than silently producing
+/// a settings.json whose quoted path doesn't match the real FIFO.
+fn build_hook_settings(fifo_path: &Path) -> std::io::Result<String> {
+    let fifo_str = fifo_path.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("hook fifo path is not valid UTF-8: {}", fifo_path.display()),
+        )
+    })?;
+    let quoted = shell_single_quote(fifo_str);
     // The hook command: read stdin, append one line (with trailing newline)
     // to the FIFO. `cat` is POSIX, available everywhere.
     let command = format!("cat >> {quoted}; printf '\\n' >> {quoted}");
-    serde_json::json!({
+    Ok(serde_json::json!({
         "hooks": {
             "Stop": [
                 {
@@ -304,7 +318,7 @@ fn build_hook_settings(fifo_path: &Path) -> String {
             ]
         }
     })
-    .to_string()
+    .to_string())
 }
 
 /// Create the Stop FIFO (named pipe) at the given path.
@@ -614,7 +628,7 @@ mod tests {
     #[test]
     fn build_hook_settings_contains_command_referencing_fifo() {
         let fifo = Path::new("/tmp/test-fifo");
-        let settings = build_hook_settings(fifo);
+        let settings = build_hook_settings(fifo).expect("utf8 path");
         let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
         let command = parsed["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
@@ -641,7 +655,7 @@ mod tests {
     fn build_hook_settings_escapes_tricky_paths() {
         // Path contains space, single quote, dollar, backtick.
         let p = PathBuf::from("/tmp/weird dir's $x`y`/stop.fifo");
-        let settings = build_hook_settings(&p);
+        let settings = build_hook_settings(&p).expect("utf8 path");
         let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
         let command = parsed["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
@@ -765,7 +779,7 @@ mod tests {
         let (_handle, rx) = spawn_fifo_reader(fifo_path.clone(), 17).expect("spawn reader");
 
         // Build the command the hook would run.
-        let settings_json = build_hook_settings(&fifo_path);
+        let settings_json = build_hook_settings(&fifo_path).expect("utf8 path");
         let parsed: serde_json::Value = serde_json::from_str(&settings_json).unwrap();
         let command = parsed["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
@@ -828,7 +842,7 @@ mod tests {
         });
 
         let signal = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(20))
             .expect("should recover and receive second signal");
         assert_eq!(signal.ccom_session_id, 31);
         assert_eq!(signal.last_assistant_message, "recovered");

@@ -354,8 +354,8 @@ impl Session {
     /// Clean up hook-related resources and return any pending hook
     /// signals that were still in the channel.
     ///
-    /// Order of operations (deliberate — see review C3 in
-    /// `docs/pr-review-pr13.md`):
+    /// Order of operations (deliberate — see review C3 and the
+    /// second-pass N1 follow-up in `docs/pr-review-pr13.md`):
     ///
     /// 1. Drain `hook_rx` into a `Vec` of pending signals BEFORE
     ///    dropping the receiver, so final-turn signals aren't lost.
@@ -367,8 +367,12 @@ impl Session {
     /// 4. Join the sidecar thread with a bounded timeout. On timeout,
     ///    log at error level with session id and context — the thread
     ///    is leaked but cleanup continues.
-    /// 5. Drop the receiver.
-    /// 6. Remove the hook dir from disk.
+    /// 5. **Drain `hook_rx` a second time.** Between step 1 and the
+    ///    join returning, the reader thread may have sent one or more
+    ///    additional signals. After join returns the thread is gone,
+    ///    so this second drain is race-free.
+    /// 6. Drop the receiver.
+    /// 7. Remove the hook dir from disk.
     ///
     /// Idempotent — safe to call on a session without hook artifacts,
     /// and safe to call a second time (returns an empty Vec).
@@ -414,10 +418,22 @@ impl Session {
             }
         }
 
-        // 5. Drop the receiver.
+        // 5. Second drain. Between step 1 and join returning, the
+        //    reader may have pushed additional signals into the
+        //    channel. After join the thread is gone, so this is
+        //    race-free. Only runs if the receiver is still alive
+        //    (i.e. this isn't a second call on an already-cleaned
+        //    session).
+        if let Some(rx) = self.hook_rx.as_ref() {
+            while let Ok(signal) = rx.try_recv() {
+                drained.push(signal);
+            }
+        }
+
+        // 6. Drop the receiver.
         self.hook_rx = None;
 
-        // 6. Remove the hook dir. Still attempted even if the join
+        // 7. Remove the hook dir. Still attempted even if the join
         //    above timed out — the dir is on disk, not tied to the
         //    thread.
         if let Some(dir) = self.hook_dir.take() {

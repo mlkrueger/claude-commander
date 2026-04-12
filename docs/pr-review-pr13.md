@@ -3,7 +3,21 @@
 **Date:** 2026-04-12
 **Branch:** `session-mgmt/phase-3.5-hook-boundary`
 **Scope:** 13 files, +1041/-7
-**Status:** All critical and high-priority items resolved; all mediums except M5 applied. 296 tests pass, zero clippy warnings. See `docs/plans/phase-3.5-review-fixes.md` for the fix plan and Resolution column below.
+**Status:** All critical and high-priority items resolved; all mediums except M5 applied. Second-pass review items (N1, N2, T8, two nits) also applied. 296 tests pass, zero clippy warnings. See `docs/plans/phase-3.5-review-fixes.md` for the fix plan and Resolution column below.
+
+## Second-pass findings (2026-04-12 post-fix review)
+
+| ID | Item | Status |
+|---|---|---|
+| **N1** | Residual drain/send race in `cleanup_hook_artifacts` — signals sent between the first drain and `join_with_timeout` return could be lost. | ✅ Applied. Added a second drain pass *after* `join_with_timeout` returns (race-free because the thread is gone post-join). See `src/session/types.rs` step 5 of `cleanup_hook_artifacts`. |
+| **N2** | `build_hook_settings` uses `Path::display().to_string()`, which is lossy for non-UTF8 paths. A non-UTF8 `TMPDIR` would produce a settings.json whose quoted path doesn't match the real FIFO. | ✅ Applied. `build_hook_settings` now returns `io::Result<String>` and errors early with a clear message if the fifo path is not valid UTF-8. Caller in `create_hook_dir` propagates the error. |
+| **N3** | T2 structurally weak on macOS (portable_pty defers exec errors to the child). | ⏸️ Acknowledged. The test already tolerates both behaviors; tightening requires a mockable `spawn_command` — deferred. |
+| **T8 flake risk** | 17 MB FIFO round-trip with 10s timeout on contended CI. | ✅ Applied. Timeout bumped to 20s. |
+| **T3/T4 cross-process collision** | SERIAL mutex is intra-process only. | ⏸️ Low priority, deferred until we see a real cross-process collision. |
+| **Nit: `v.as_str().unwrap()`** after `is_string()` check in `parse_hook_stdin`. | ✅ Applied. Rewritten as `match v.as_str()` to avoid the unwrap. |
+| **Nit: misleading "single-pass drain + process" comment** in `check_hook_signals`. | ✅ Applied. Comment now accurately describes the single outer loop with per-session local `Vec`. |
+| **Nit: `SidecarHandle::join_with_timeout` 10ms polling** | ⏸️ Deferred. `thread::park_timeout` is more idiomatic but the current polling is correct and the overhead is bounded. |
+| **Nit: `shell_single_quote` iterates chars not bytes** | ⏸️ Moot after N2 — the function is only ever fed valid UTF-8 now. |
 
 ## Overview
 
