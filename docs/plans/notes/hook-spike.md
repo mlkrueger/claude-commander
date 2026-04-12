@@ -1,7 +1,7 @@
 # Phase 3.5 Spike: Hook-Based Response Boundary Detection
 
 **Date:** 2026-04-12
-**Status:** GO
+**Status:** GO — implemented in Phase 3.5 (2026-04-12). See `docs/plans/phase-3.5-hook-boundary.md` and `docs/designs/response-boundary-detection.md` §10 for implementation deltas.
 **Claude Code version tested:** 2.1.104
 
 ## Summary

@@ -8,6 +8,7 @@
 //! higher-level state machine (status, attention detection, context usage).
 
 mod events;
+pub(crate) mod hook;
 mod manager;
 mod response_store;
 mod types;

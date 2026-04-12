@@ -1,6 +1,7 @@
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -9,6 +10,7 @@ use crate::claude::context;
 use crate::event::{Event, MonitoredSender};
 use crate::pty::detector::PromptDetector;
 use crate::session::events::TurnId;
+use crate::session::hook::{self, HookStopSignal, SidecarHandle};
 use crate::session::response_store::ResponseStore;
 
 pub fn lock_parser(p: &Mutex<vt100::Parser>) -> MutexGuard<'_, vt100::Parser> {
@@ -64,6 +66,16 @@ pub struct Session {
     /// initialization in `make_dummy_session`.
     pub(super) response_store: ResponseStore,
     pub(super) reader_handle: Option<JoinHandle<()>>,
+    /// Per-session hook directory (Phase 3.5). `Some` for Claude
+    /// sessions that have a Stop hook installed; `None` for Terminal
+    /// sessions.
+    pub(super) hook_dir: Option<PathBuf>,
+    /// Receiver for parsed hook signals from the sidecar FIFO reader
+    /// thread. `Some` iff `hook_dir` is `Some`.
+    pub(super) hook_rx: Option<mpsc::Receiver<HookStopSignal>>,
+    /// Handle for the sidecar FIFO reader thread. `Some` iff
+    /// `hook_dir` is `Some`.
+    pub(super) hook_reader_handle: Option<SidecarHandle>,
 }
 
 impl Session {
@@ -77,6 +89,7 @@ impl Session {
         event_tx: MonitoredSender,
         cols: u16,
         rows: u16,
+        install_hook: bool,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pty_size = PtySize {
@@ -92,7 +105,54 @@ impl Session {
         cmd.args(args);
         cmd.cwd(&working_dir);
 
-        let child = pair.slave.spawn_command(cmd)?;
+        // Phase 3.5: install the per-session Stop hook for Claude
+        // sessions. Creates a temp dir with `.claude/settings.json`
+        // and a FIFO, spawns a sidecar reader thread, and points
+        // Claude Code at the temp dir via `CLAUDE_CONFIG_DIR`.
+        //
+        // M7: hook-based boundary detection is Unix-only (relies on
+        // mkfifo + blocking open semantics). Gate the entire branch
+        // behind `cfg(unix)` so non-Unix builds fail early with a
+        // clear error instead of deep inside `create_stop_fifo`.
+        let (hook_dir, hook_rx, hook_reader_handle) = if install_hook {
+            #[cfg(unix)]
+            {
+                let hook_dir = hook::create_hook_dir(id)?;
+                let fifo_path = hook_dir.join("stop.fifo");
+                if let Err(e) = hook::create_stop_fifo(&fifo_path) {
+                    hook::cleanup_hook_dir(&hook_dir);
+                    return Err(e.into());
+                }
+                let (handle, rx) = match hook::spawn_fifo_reader(fifo_path, id) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        hook::cleanup_hook_dir(&hook_dir);
+                        return Err(e.into());
+                    }
+                };
+                cmd.env("CLAUDE_CONFIG_DIR", hook_dir.join(".claude"));
+                cmd.env("CCOM_SESSION_ID", id.to_string());
+                (Some(hook_dir), Some(rx), Some(handle))
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(anyhow::anyhow!(
+                    "hook-based boundary detection requires Unix"
+                ));
+            }
+        } else {
+            (None, None, None)
+        };
+
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(child) => child,
+            Err(e) => {
+                if let Some(dir) = hook_dir.as_ref() {
+                    hook::cleanup_hook_dir(dir);
+                }
+                return Err(e);
+            }
+        };
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader()?;
@@ -178,6 +238,9 @@ impl Session {
             next_turn_id: 0,
             response_store: ResponseStore::new(),
             reader_handle: Some(handle),
+            hook_dir,
+            hook_rx,
+            hook_reader_handle,
         })
     }
 
@@ -262,6 +325,122 @@ impl Session {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         self.status = SessionStatus::Exited(-1);
+        // Drained signals are discarded here — we're killing the
+        // session, so there's nothing to publish.
+        let _ = self.cleanup_hook_artifacts();
+    }
+
+    /// Test seam: install a channel receiver for hook signals
+    /// directly on a session, bypassing `Session::spawn`. The returned
+    /// `Sender` lets tests inject synthetic `HookStopSignal`s that
+    /// `SessionManager::check_hook_signals` will consume.
+    ///
+    /// Also installs a dummy `hook_dir` path so the invariant
+    /// "`hook_rx` is `Some` iff `hook_dir` is `Some`" documented on
+    /// the fields holds for test-constructed sessions. The dummy path
+    /// does not exist on disk and `cleanup_hook_artifacts` will
+    /// harmlessly try (and fail) to remove it.
+    #[cfg(test)]
+    pub(crate) fn install_test_hook_channel(&mut self) -> mpsc::Sender<HookStopSignal> {
+        let (tx, rx) = mpsc::channel();
+        self.hook_rx = Some(rx);
+        self.hook_dir = Some(PathBuf::from(format!(
+            "/tmp/ccom-test-hook-dir-{}",
+            self.id
+        )));
+        tx
+    }
+
+    /// Clean up hook-related resources and return any pending hook
+    /// signals that were still in the channel.
+    ///
+    /// Order of operations (deliberate — see review C3 and the
+    /// second-pass N1 follow-up in `docs/pr-review-pr13.md`):
+    ///
+    /// 1. Drain `hook_rx` into a `Vec` of pending signals BEFORE
+    ///    dropping the receiver, so final-turn signals aren't lost.
+    /// 2. Request the sidecar reader thread to stop via its
+    ///    `SidecarHandle`'s atomic flag.
+    /// 3. Best-effort write-poke the FIFO to unblock a pending
+    ///    `File::open` in the reader (the stop flag alone can't wake
+    ///    a blocked open).
+    /// 4. Join the sidecar thread with a bounded timeout. On timeout,
+    ///    log at error level with session id and context — the thread
+    ///    is leaked but cleanup continues.
+    /// 5. **Drain `hook_rx` a second time.** Between step 1 and the
+    ///    join returning, the reader thread may have sent one or more
+    ///    additional signals. After join returns the thread is gone,
+    ///    so this second drain is race-free.
+    /// 6. Drop the receiver.
+    /// 7. Remove the hook dir from disk.
+    ///
+    /// Idempotent — safe to call on a session without hook artifacts,
+    /// and safe to call a second time (returns an empty Vec).
+    ///
+    /// Callers in `Session::kill` discard the returned signals
+    /// (the session is being killed; nothing to publish).
+    /// `SessionManager::reap_exited` consumes them and pushes them
+    /// through the boundary detector before publishing `Exited`, so
+    /// a final `ResponseComplete` still reaches subscribers.
+    pub(super) fn cleanup_hook_artifacts(&mut self) -> Vec<HookStopSignal> {
+        // 1. Drain pending signals BEFORE dropping the receiver.
+        let mut drained = Vec::new();
+        if let Some(rx) = self.hook_rx.as_ref() {
+            while let Ok(signal) = rx.try_recv() {
+                drained.push(signal);
+            }
+        }
+
+        // 2–4. Tell the sidecar to stop, unblock any pending
+        //      File::open, then bounded-join.
+        if let Some(mut handle) = self.hook_reader_handle.take() {
+            handle.request_stop();
+            // Fast path: if the reader already exited on its own
+            // (e.g. the child closed the FIFO before we got here),
+            // skip the write-poke and go straight to the join, which
+            // will return immediately.
+            if !handle.is_finished() {
+                // Best-effort write-poke: open the fifo for writing
+                // so a reader blocked inside `File::open` wakes up.
+                if let Some(dir) = self.hook_dir.as_ref() {
+                    let fifo = dir.join("stop.fifo");
+                    if fifo.exists() {
+                        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                    }
+                }
+            }
+            if let Err(e) = handle.join_with_timeout(Duration::from_millis(500)) {
+                // Loud on leak — the thread is now orphaned.
+                log::error!(
+                    "session {} sidecar reader thread leaked during cleanup: {e}",
+                    self.id
+                );
+            }
+        }
+
+        // 5. Second drain. Between step 1 and join returning, the
+        //    reader may have pushed additional signals into the
+        //    channel. After join the thread is gone, so this is
+        //    race-free. Only runs if the receiver is still alive
+        //    (i.e. this isn't a second call on an already-cleaned
+        //    session).
+        if let Some(rx) = self.hook_rx.as_ref() {
+            while let Ok(signal) = rx.try_recv() {
+                drained.push(signal);
+            }
+        }
+
+        // 6. Drop the receiver.
+        self.hook_rx = None;
+
+        // 7. Remove the hook dir. Still attempted even if the join
+        //    above timed out — the dir is on disk, not tied to the
+        //    thread.
+        if let Some(dir) = self.hook_dir.take() {
+            hook::cleanup_hook_dir(&dir);
+        }
+
+        drained
     }
 
     pub fn join_reader(&mut self, timeout: Duration) {
@@ -330,6 +509,9 @@ impl Session {
             next_turn_id: 0,
             response_store: ResponseStore::new(),
             reader_handle: None,
+            hook_dir: None,
+            hook_rx: None,
+            hook_reader_handle: None,
         }
     }
 }

@@ -1,10 +1,13 @@
 # Design: Response Boundary Detection
 
-**Status:** Design phase. Tier 1 (hook-based) chosen; spike pending.
+**Status:** Implemented in Phase 3.5 (2026-04-12). This doc captures the
+original design; see `## 10. Implementation deltas` at the bottom for
+how the implementation differs from the design after the spike findings
+drove simplifications.
 **Author:** @mkrueger
-**Date:** 2026-04-11
-**Supersedes:** the placeholder pattern in `crate::pty::response_boundary::ResponseBoundaryDetector::for_claude_code` (Phase 3)
-**Related:** `docs/designs/session-management.md` §4, `docs/pr-review-pr9.md` (the limitation this resolves)
+**Date:** 2026-04-11 (design) / 2026-04-12 (implementation)
+**Supersedes:** the placeholder pattern in `crate::pty::response_boundary::ResponseBoundaryDetector::for_claude_code` (Phase 3) for Claude sessions. The placeholder remains as the fallback path for non-Claude runners (e.g. `SessionKind::Terminal`).
+**Related:** `docs/designs/session-management.md` §4, `docs/pr-review-pr9.md` (the limitation this resolves), `docs/plans/notes/hook-spike.md` (spike findings), `docs/plans/phase-3.5-hook-boundary.md` (implementation plan)
 
 ## 1. Problem statement
 
@@ -691,3 +694,160 @@ happen anytime:
 So the practical ordering is: finish this rollout first (3 PRs),
 then the Council Phase 2+3 and the Phase 4+ MCP work unblock
 simultaneously.
+
+---
+
+## 10. Implementation deltas
+
+The spike (`docs/plans/notes/hook-spike.md`) surfaced several
+simplifications that the original §4 design did not anticipate.
+Those simplifications were taken during Phase 3.5 implementation.
+This section captures the deltas so a future reader comparing the
+design against `src/session/hook.rs` and `src/session/manager.rs`
+is not confused by the drift.
+
+### 10.1 `last_assistant_message` eliminates body capture
+
+**Design said (§4.7):** Reuse the existing regex detector's byte
+accumulator to capture the response body in parallel with hook
+signalling. Refactor needed to split the detector into a "body
+accumulator" trait and a "boundary signal source" trait.
+
+**Implementation does:** Nothing. Claude Code's Stop hook passes
+the full `last_assistant_message` on stdin. No PTY byte capture
+is needed for hook-based sessions. The `StoredTurn::body` field is
+populated directly from the JSON field. The `BodyAccumulator`
+refactor was cancelled — `ResponseBoundaryDetector` keeps its
+existing shape and a new method (`complete_active_turn_with_body`)
+short-circuits the regex path when the body is known.
+
+### 10.2 No separate `HookBasedBoundaryDetector` type
+
+**Design said (§4.6):** Add a new `HookBasedBoundaryDetector` struct
+in `src/pty/hook_boundary.rs` alongside the existing regex detector,
+and an enum/trait dispatch layer in `SessionManager` to pick one at
+runtime.
+
+**Implementation does:** Keep the single
+`ResponseBoundaryDetector` and add a new method
+`complete_active_turn_with_body` that bypasses the regex match and
+completes the active turn using an externally-supplied body. For
+Claude sessions, `SessionManager::check_hook_signals` drains hook
+signals and calls this method; for non-Claude sessions, the existing
+`check_response_boundaries` path runs regex-based detection as
+before. Both paths share the same per-session `active_turn` /
+`started_at` bookkeeping.
+
+Why: the simpler shape fell out of deleting `BodyAccumulator`. With
+no body capture needed, a whole new detector struct would have been
+~50 lines of duplicated active-turn bookkeeping. One extra method
+on the existing type does the same job.
+
+### 10.3 FIFO instead of Unix socket
+
+**Design said (§4.4):** Use a Unix domain socket for the sidecar
+transport. ccom owns a reader thread that accepts connections,
+reads one JSON line, closes. Recommended for async + structured
+delivery.
+
+**Implementation does:** Uses a named pipe (FIFO) at
+`/tmp/ccom-<pid>-<sid>/stop.fifo`, created via `libc::mkfifo`.
+The sidecar reader thread uses `std::fs::File::open` + `BufReader`;
+when the writer closes, it loops back to reopen for the next
+hook fire.
+
+Why: FIFOs are dramatically simpler than sockets for the
+write-once-per-fire pattern. No `accept`, no connection lifecycle,
+just open/read/reopen. The design's concern about "only one reader
+at a time" doesn't bite us — there's exactly one reader per session
+by construction.
+
+### 10.4 No `ccom-stop-hook` helper binary
+
+**Design said (§4.3):** Ship a tiny `ccom-stop-hook` binary that
+opens the sidecar and writes JSON. Removes the socat/nc dependency
+from the hook script.
+
+**Implementation does:** The hook command is an inline shell
+snippet in `.claude/settings.json`:
+
+```sh
+cat >> <fifo>; printf '\n' >> <fifo>
+```
+
+`cat` is POSIX and available everywhere. No helper binary, no
+socat, no nc. The trailing `printf '\n'` ensures each hook fire
+produces one newline-terminated line for the reader's `BufRead::lines`
+loop.
+
+### 10.5 Symlinked config dir for auth preservation
+
+**Design said (§4.2):** Set `CLAUDE_CONFIG_DIR` to a fresh temp
+dir per session containing only our `settings.json`. Open question
+whether Claude Code respects the env var.
+
+**Spike finding:** `CLAUDE_CONFIG_DIR` is respected, but pointing
+at a fresh dir loses authentication — credentials live inside the
+config dir. A fully-isolated temp dir leaves Claude Code in the
+"Not logged in" state.
+
+**Implementation does:** Creates `/tmp/ccom-<pid>-<sid>/.claude/`,
+symlinks every entry from the user's real `~/.claude/` into it
+*except* `settings.json` and `settings.local.json`, then writes
+our own hook-only `settings.json`. Auth, session history, plugins,
+and everything else that isn't a settings file still point at the
+real user data. Claude Code sees our hook config and merges it
+with the rest of the user's environment.
+
+### 10.6 Direct channel instead of trait-based dispatch
+
+**Design said (§4.9):** Use a `BoundaryDetectorSource` trait with
+per-session detector boxed as `dyn`. `SessionManager::spawn` picks
+the concrete type based on `SessionKind`.
+
+**Implementation does:** The session itself carries an
+`Option<mpsc::Receiver<HookStopSignal>>` field. Claude sessions
+have `Some(rx)`, Terminal sessions have `None`. `check_hook_signals`
+drains any sessions with `Some`, `check_response_boundaries` runs
+regex detection for all sessions (no-op for sessions with no
+active turn in the detector). No trait object, no enum dispatch —
+Phase 3.5 found that the runtime distinction can be carried as
+data on the session rather than as a type.
+
+### 10.7 Per-session cleanup is explicit, not Drop-based
+
+**Design said (§4.8):** Wrap hook-related cleanup in a
+`Session::cleanup_phase3_artifacts` method called from `kill` /
+`reap_exited`.
+
+**Implementation does:** Adds `Session::cleanup_hook_artifacts`
+(private, called from `kill`) which drops the receiver, briefly
+opens the FIFO for write to unblock the reader thread's
+`File::open` call, joins the sidecar thread with a 500ms timeout,
+and removes the temp dir. `Drop` is **not** implemented — the
+cleanup is side-effectful (logs warnings on failure) and must
+happen at a well-defined point in the lifecycle, not whenever
+Rust decides to drop the value.
+
+### 10.8 Hook fields on `Session`
+
+**Design said (§4.6):** Active turn state lives inside a new
+`HookBasedBoundaryDetector`.
+
+**Implementation does:** Active turn state stays inside the
+existing `ResponseBoundaryDetector`. The per-session *hook
+infrastructure* (temp dir, receiver, reader thread handle) lives
+on the `Session` struct itself:
+
+```rust
+pub(super) hook_dir: Option<PathBuf>,
+pub(super) hook_rx: Option<mpsc::Receiver<HookStopSignal>>,
+pub(super) hook_reader_handle: Option<JoinHandle<()>>,
+```
+
+Why: the hook infrastructure is per-session by construction, and
+the session is the natural owner of resources that need cleanup on
+`kill` / `reap_exited`. The existing detector owns correlation
+state that's indexed by session id but conceptually shared across
+the detector's map — keeping it there preserves the existing
+test seams and avoids duplicating `HashMap<usize, …>` bookkeeping.

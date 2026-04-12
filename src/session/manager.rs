@@ -57,6 +57,10 @@ pub struct SpawnConfig<'a> {
     pub event_tx: crate::event::MonitoredSender,
     pub cols: u16,
     pub rows: u16,
+    /// Install a per-session Stop hook for response boundary
+    /// detection (Phase 3.5). Set to `true` for Claude sessions,
+    /// `false` for Terminal sessions.
+    pub install_hook: bool,
 }
 
 /// Outcome of a [`SessionManager::broadcast`] call. Reports which
@@ -294,6 +298,70 @@ impl SessionManager {
         self.boundary_detector.on_pty_data(session_id, data);
     }
 
+    /// Drain hook-based Stop signals from all sessions with an
+    /// installed hook (Phase 3.5). For each signal received, complete
+    /// the active turn using the hook's `last_assistant_message` as
+    /// the response body, push the result into the session's
+    /// `response_store`, and publish `SessionEvent::ResponseComplete`
+    /// on the bus.
+    ///
+    /// Signals arriving while no turn is active (e.g. user typed
+    /// directly into the PTY instead of going through `send_prompt`)
+    /// are silently dropped — there's no `TurnId` to attach them to.
+    ///
+    /// Called periodically from `App::check_all_attention` alongside
+    /// `check_response_boundaries`.
+    pub fn check_hook_signals(&mut self) {
+        // H5: single outer loop over sessions. Each session's hook
+        // channel is drained into a local `Vec` and then processed
+        // against that same session's response store in place, using
+        // disjoint field borrows (same pattern as
+        // `check_response_boundaries`). This replaces the old two-pass
+        // shape that drained into a manager-wide `Vec<(id, body)>` and
+        // then did an O(n) `iter_mut().find()` lookup per item.
+        let detector = &mut self.boundary_detector;
+        let bus = &self.bus;
+        for session in self.sessions.iter_mut() {
+            let session_id = session.id;
+            // Drain without needing `&mut session` for the drain itself.
+            let signals: Vec<_> = session
+                .hook_rx
+                .as_ref()
+                .map(|rx| {
+                    let mut v = Vec::new();
+                    while let Ok(sig) = rx.try_recv() {
+                        v.push(sig);
+                    }
+                    v
+                })
+                .unwrap_or_default();
+            if signals.is_empty() {
+                continue;
+            }
+            for signal in signals {
+                log::debug!(
+                    "hook signal received for session {session_id}: {} bytes",
+                    signal.last_assistant_message.len()
+                );
+                let mut sink = StoreAndBus {
+                    session_id,
+                    store: &mut session.response_store,
+                    bus,
+                };
+                let completed = detector.complete_active_turn_with_body(
+                    session_id,
+                    signal.last_assistant_message,
+                    &mut sink,
+                );
+                if !completed {
+                    log::debug!(
+                        "hook signal for session {session_id} had no active turn, dropping"
+                    );
+                }
+            }
+        }
+    }
+
     /// Run the response boundary detector against every live session.
     /// On boundary detection, the detector pushes a `StoredTurn` into
     /// that session's `response_store` AND publishes
@@ -455,6 +523,7 @@ impl SessionManager {
             config.event_tx,
             config.cols,
             config.rows,
+            config.install_hook,
         )?;
 
         self.sessions.push(session);
@@ -552,26 +621,59 @@ impl SessionManager {
     /// `SessionEvent::Exited` for each session that transitioned in
     /// this call.
     pub fn reap_exited(&mut self) {
-        // Collect transitions inside the mutable loop, then publish
-        // afterwards. This sidesteps the borrow conflict between
-        // `&mut self.sessions` and `&self.bus`.
-        let mut transitioned = Vec::new();
-        for session in &mut self.sessions {
-            if !matches!(session.status, SessionStatus::Exited(_))
-                && let Ok(Some(status)) = session.child.try_wait()
-            {
-                let code = status.exit_code() as i32;
-                session.status = SessionStatus::Exited(code);
-                transitioned.push((session.id, code));
+        // Disjoint field borrows so the loop can (a) mutate each
+        // session's status and drive cleanup, (b) drive the boundary
+        // detector with any drained hook signals, and (c) publish on
+        // the bus — all in a single pass. See review C1 in
+        // `docs/pr-review-pr13.md`.
+        let detector = &mut self.boundary_detector;
+        let bus = &self.bus;
+
+        for session in self.sessions.iter_mut() {
+            if matches!(session.status, SessionStatus::Exited(_)) {
+                continue;
             }
-        }
-        for (session_id, code) in transitioned {
-            self.bus.publish(SessionEvent::Exited { session_id, code });
+            let Ok(Some(status)) = session.child.try_wait() else {
+                continue;
+            };
+            let code = status.exit_code() as i32;
+            session.status = SessionStatus::Exited(code);
+            let session_id = session.id;
+
+            // Tear down hook resources and capture any in-flight
+            // signals that were queued but not yet processed. These
+            // must be pushed through the detector BEFORE we publish
+            // `Exited`, so subscribers see a `ResponseComplete` for
+            // the final turn ahead of the exit notification.
+            let pending = session.cleanup_hook_artifacts();
+            for signal in pending {
+                log::debug!(
+                    "reap_exited: flushing final hook signal for session {session_id}: {} bytes",
+                    signal.last_assistant_message.len()
+                );
+                let mut sink = StoreAndBus {
+                    session_id,
+                    store: &mut session.response_store,
+                    bus,
+                };
+                let completed = detector.complete_active_turn_with_body(
+                    session_id,
+                    signal.last_assistant_message,
+                    &mut sink,
+                );
+                if !completed {
+                    log::debug!(
+                        "reap_exited: final hook signal for session {session_id} had no active turn, dropping"
+                    );
+                }
+            }
+
+            bus.publish(SessionEvent::Exited { session_id, code });
             // PR #9 review C1: drop the detector's per-session state
             // so a long-running TUI doesn't slowly leak `body_bytes`
             // buffers for every reaped session. Same rationale as
             // the `kill` path above.
-            self.boundary_detector.forget_session(session_id);
+            detector.forget_session(session_id);
         }
     }
 
@@ -1450,6 +1552,87 @@ mod tests {
     }
 
     #[test]
+    fn check_hook_signals_completes_active_turn_and_publishes_event() {
+        use crate::session::hook::HookStopSignal;
+
+        let (mut m, bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+        let turn_id = m.send_prompt(id, "ping").expect("send_prompt");
+        let rx = bus.subscribe();
+
+        // Install a test hook channel on the session and send a signal.
+        let tx = m
+            .get_mut(id)
+            .expect("session exists")
+            .install_test_hook_channel();
+        tx.send(HookStopSignal {
+            ccom_session_id: id,
+            claude_session_id: "fake-uuid".to_string(),
+            last_assistant_message: "hello from hook".to_string(),
+            transcript_path: None,
+        })
+        .unwrap();
+
+        m.check_hook_signals();
+
+        // Verify the stored turn contains the hook's body.
+        let stored = m
+            .get_response(id, turn_id)
+            .expect("stored turn should exist");
+        assert_eq!(stored.turn_id, turn_id);
+        assert_eq!(stored.body, "hello from hook");
+        assert!(stored.completed_at.is_some());
+
+        // Verify the bus received a ResponseComplete event.
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let completes: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                SessionEvent::ResponseComplete {
+                    session_id,
+                    turn_id,
+                } => Some((*session_id, *turn_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completes, vec![(id, turn_id)]);
+    }
+
+    #[test]
+    fn check_hook_signals_drops_signals_without_active_turn() {
+        use crate::session::hook::HookStopSignal;
+
+        let (mut m, bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+        // Deliberately skip send_prompt — no active turn.
+        let rx = bus.subscribe();
+
+        let tx = m
+            .get_mut(id)
+            .expect("session exists")
+            .install_test_hook_channel();
+        tx.send(HookStopSignal {
+            ccom_session_id: id,
+            claude_session_id: "fake-uuid".to_string(),
+            last_assistant_message: "orphaned".to_string(),
+            transcript_path: None,
+        })
+        .unwrap();
+
+        m.check_hook_signals();
+
+        // No stored turn, no bus event.
+        assert!(m.get_latest_response(id).is_none());
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|ev| matches!(ev, SessionEvent::ResponseComplete { .. })),
+            "expected no ResponseComplete, saw {events:?}"
+        );
+    }
+
+    #[test]
     fn check_response_boundaries_does_not_fire_without_marker() {
         let (mut m, bus) = manager_with_synthetic_detector();
         let id = push_running(&mut m, "a");
@@ -1608,6 +1791,7 @@ mod tests {
                 event_tx,
                 cols: 80,
                 rows: 24,
+                install_hook: false,
             })
             .expect("real spawn should succeed");
 
@@ -1691,6 +1875,141 @@ mod tests {
         // the default budget).
         let stored0 = m.get_response(id, t0).expect("turn 0 retrievable");
         assert!(stored0.body.contains("first answer"));
+    }
+
+    // ------------------------------------------------------------
+    // Phase 3.5 review-fix Stream B: reap_exited hook cleanup tests.
+    // ------------------------------------------------------------
+
+    #[test]
+    fn reap_exited_cleans_up_hook_artifacts() {
+        // T1: after `reap_exited` transitions a session to Exited,
+        // the session's `hook_rx` must be cleared (the cleanup path
+        // ran). We use the test seam plus `make_exiting_session` so
+        // no real PTY / FIFO is involved.
+        let (mut m, _bus) = manager_with_synthetic_detector();
+        let id = m.peek_next_id();
+        m.push_for_test(test_support::make_exiting_session(id, 0));
+        let _tx = m
+            .get_mut(id)
+            .expect("session exists")
+            .install_test_hook_channel();
+        // Sanity-check the SidecarHandle accessor — the test seam
+        // doesn't install one, so `hook_reader_handle` is None and
+        // (trivially) "finished" for any production path that holds
+        // a real handle. This line keeps `SidecarHandle::is_finished`
+        // reachable from the test target so its dead-code warning
+        // doesn't regress.
+        let _finished_probe = m
+            .get(id)
+            .unwrap()
+            .hook_reader_handle
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(true);
+
+        m.reap_exited();
+
+        let session = m.get(id).expect("session still present");
+        assert!(
+            session.hook_rx.is_none(),
+            "reap_exited must clear hook_rx after cleanup"
+        );
+        assert!(
+            session.hook_dir.is_none(),
+            "reap_exited must clear hook_dir after cleanup"
+        );
+    }
+
+    #[test]
+    fn reap_exited_publishes_response_complete_before_exited() {
+        // T1b: a hook signal arriving on the final turn (queued but
+        // not yet processed when the child exits) must still surface
+        // as a `ResponseComplete` *before* the `Exited` event.
+        use crate::session::hook::HookStopSignal;
+
+        let (mut m, bus) = manager_with_synthetic_detector();
+        let id = m.peek_next_id();
+        m.push_for_test(test_support::make_exiting_session(id, 0));
+
+        // Allocate a turn so the detector has an active turn to
+        // complete.
+        let turn_id = m.send_prompt(id, "final prompt").expect("send_prompt");
+
+        // Inject a hook signal that `check_hook_signals` has NOT
+        // drained yet — this is what `cleanup_hook_artifacts` must
+        // pick up during reap.
+        let tx = m
+            .get_mut(id)
+            .expect("session exists")
+            .install_test_hook_channel();
+        tx.send(HookStopSignal {
+            ccom_session_id: id,
+            claude_session_id: "fake-uuid".to_string(),
+            last_assistant_message: "final answer".to_string(),
+            transcript_path: None,
+        })
+        .unwrap();
+
+        let rx = bus.subscribe();
+        m.reap_exited();
+
+        // Collect all events in order. We expect (at minimum)
+        // ResponseComplete followed by Exited for this session.
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let positions: Vec<(usize, &SessionEvent)> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| match ev {
+                SessionEvent::ResponseComplete { session_id, .. }
+                | SessionEvent::Exited { session_id, .. } => *session_id == id,
+                _ => false,
+            })
+            .collect();
+
+        let complete_idx = positions.iter().position(|(_, ev)| {
+            matches!(ev, SessionEvent::ResponseComplete { session_id, turn_id: tid, .. }
+                if *session_id == id && *tid == turn_id)
+        });
+        let exited_idx = positions.iter().position(
+            |(_, ev)| matches!(ev, SessionEvent::Exited { session_id, .. } if *session_id == id),
+        );
+
+        let complete_idx =
+            complete_idx.expect("expected ResponseComplete on bus before Exited, not found");
+        let exited_idx = exited_idx.expect("expected Exited on bus");
+        assert!(
+            complete_idx < exited_idx,
+            "ResponseComplete must precede Exited; positions={positions:?}"
+        );
+
+        // And the stored turn body should match the hook signal.
+        let stored = m
+            .get_response(id, turn_id)
+            .expect("stored turn should exist");
+        assert_eq!(stored.body, "final answer");
+    }
+
+    #[test]
+    fn cleanup_hook_artifacts_is_idempotent() {
+        // T5: calling cleanup twice on a session with test-installed
+        // hook fields must not panic; the second call is a no-op and
+        // returns an empty Vec.
+        let id = 42;
+        let mut s = Session::dummy_exited(id, "idem");
+        let _tx = s.install_test_hook_channel();
+
+        let first = s.cleanup_hook_artifacts();
+        // First call drains nothing (no signals sent) and tears down
+        // the fields.
+        assert!(first.is_empty());
+        assert!(s.hook_rx.is_none());
+        assert!(s.hook_dir.is_none());
+
+        let second = s.cleanup_hook_artifacts();
+        assert!(second.is_empty(), "second call must return empty Vec");
+        assert!(s.hook_rx.is_none());
+        assert!(s.hook_dir.is_none());
     }
 }
 
@@ -1852,6 +2171,9 @@ mod test_support {
             next_turn_id: 0,
             response_store: crate::session::ResponseStore::new(),
             reader_handle: None,
+            hook_dir: None,
+            hook_rx: None,
+            hook_reader_handle: None,
         }
     }
 
