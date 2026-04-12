@@ -283,6 +283,7 @@ impl App {
         let cols = self.terminal_cols.saturating_sub(PTY_COL_OVERHEAD).max(40);
         let rows = self.terminal_rows.saturating_sub(PTY_ROW_OVERHEAD).max(10);
 
+        let install_hook = matches!(kind, SessionKind::Claude);
         let config = SpawnConfig {
             label,
             working_dir,
@@ -291,6 +292,7 @@ impl App {
             event_tx: self.event_tx.clone(),
             cols,
             rows,
+            install_hook,
         };
 
         match self.sessions.spawn(config) {
@@ -490,6 +492,7 @@ impl App {
 
     fn check_all_attention(&mut self) {
         self.sessions.check_attention(&self.detector);
+        self.sessions.check_hook_signals();
         self.sessions.check_response_boundaries();
     }
 

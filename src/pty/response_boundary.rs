@@ -154,6 +154,45 @@ impl ResponseBoundaryDetector {
         self.states.contains_key(&session_id)
     }
 
+    /// Complete the active turn for `session_id` using an
+    /// externally-supplied body. Used by hook-based boundary
+    /// detection (Phase 3.5): the Stop hook fires with
+    /// `last_assistant_message` as the body, eliminating the need
+    /// for regex-based visual inference.
+    ///
+    /// If there is no active turn for this session, returns `false`
+    /// and the body is silently dropped. (This happens when the user
+    /// types into the session directly — no `send_prompt`, no
+    /// `TurnId`, nothing to complete.)
+    pub fn complete_active_turn_with_body<S: TurnSink>(
+        &mut self,
+        session_id: usize,
+        body: String,
+        sink: &mut S,
+    ) -> bool {
+        let Some(state) = self.states.get_mut(&session_id) else {
+            return false;
+        };
+        let Some(turn_id) = state.active_turn else {
+            return false;
+        };
+
+        let started_at = state.started_at.unwrap_or_else(Instant::now);
+        let stored = StoredTurn {
+            turn_id,
+            started_at,
+            completed_at: Some(Instant::now()),
+            body,
+        };
+
+        state.active_turn = None;
+        state.started_at = None;
+        state.body_bytes.clear();
+
+        sink.push_turn(stored);
+        true
+    }
+
     /// Check whether the active turn for `session_id` has ended
     /// (idle marker found). If so, push the completed `StoredTurn`
     /// to `sink` and reset session state.
@@ -523,6 +562,50 @@ mod tests {
             "body must not leak prior partial: {:?}",
             body
         );
+    }
+
+    // ---------------- hook-based completion ----------------
+
+    #[test]
+    fn complete_active_turn_with_body_pushes_stored_turn() {
+        let mut det = synthetic_detector();
+        let mut sink = RecordingSink::new();
+
+        det.on_prompt_submitted(1, TurnId::new(5));
+        let completed =
+            det.complete_active_turn_with_body(1, "hook-supplied body".to_string(), &mut sink);
+
+        assert!(completed);
+        assert_eq!(sink.turns.len(), 1);
+        assert_eq!(sink.turns[0].turn_id, TurnId::new(5));
+        assert_eq!(sink.turns[0].body, "hook-supplied body");
+        assert!(sink.turns[0].completed_at.is_some());
+    }
+
+    #[test]
+    fn complete_active_turn_with_body_returns_false_without_active_turn() {
+        let mut det = synthetic_detector();
+        let mut sink = RecordingSink::new();
+
+        // No prompt submitted → no active turn.
+        let completed = det.complete_active_turn_with_body(1, "orphan body".to_string(), &mut sink);
+
+        assert!(!completed);
+        assert!(sink.turns.is_empty());
+    }
+
+    #[test]
+    fn complete_active_turn_with_body_clears_active_turn() {
+        let mut det = synthetic_detector();
+        let mut sink = RecordingSink::new();
+
+        det.on_prompt_submitted(1, TurnId::new(0));
+        det.complete_active_turn_with_body(1, "first".to_string(), &mut sink);
+
+        // Second call without a new prompt should be a no-op.
+        let completed = det.complete_active_turn_with_body(1, "stray".to_string(), &mut sink);
+        assert!(!completed);
+        assert_eq!(sink.turns.len(), 1);
     }
 
     // ---------------- constructor ----------------

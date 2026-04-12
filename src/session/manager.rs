@@ -57,6 +57,10 @@ pub struct SpawnConfig<'a> {
     pub event_tx: crate::event::MonitoredSender,
     pub cols: u16,
     pub rows: u16,
+    /// Install a per-session Stop hook for response boundary
+    /// detection (Phase 3.5). Set to `true` for Claude sessions,
+    /// `false` for Terminal sessions.
+    pub install_hook: bool,
 }
 
 /// Outcome of a [`SessionManager::broadcast`] call. Reports which
@@ -294,6 +298,57 @@ impl SessionManager {
         self.boundary_detector.on_pty_data(session_id, data);
     }
 
+    /// Drain hook-based Stop signals from all sessions with an
+    /// installed hook (Phase 3.5). For each signal received, complete
+    /// the active turn using the hook's `last_assistant_message` as
+    /// the response body, push the result into the session's
+    /// `response_store`, and publish `SessionEvent::ResponseComplete`
+    /// on the bus.
+    ///
+    /// Signals arriving while no turn is active (e.g. user typed
+    /// directly into the PTY instead of going through `send_prompt`)
+    /// are silently dropped — there's no `TurnId` to attach them to.
+    ///
+    /// Called periodically from `App::check_all_attention` alongside
+    /// `check_response_boundaries`.
+    pub fn check_hook_signals(&mut self) {
+        // Drain signals from each session first (requires only &self),
+        // then process them (requires &mut self fields).
+        let mut pending: Vec<(usize, String)> = Vec::new();
+        for session in self.sessions.iter() {
+            for signal in session.drain_hook_signals() {
+                log::debug!(
+                    "hook signal received for session {}: {} bytes",
+                    session.id,
+                    signal.last_assistant_message.len()
+                );
+                pending.push((session.id, signal.last_assistant_message));
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+
+        let detector = &mut self.boundary_detector;
+        let bus = &self.bus;
+        for (session_id, body) in pending {
+            if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                let mut sink = StoreAndBus {
+                    session_id,
+                    store: &mut session.response_store,
+                    bus,
+                };
+                let completed =
+                    detector.complete_active_turn_with_body(session_id, body, &mut sink);
+                if !completed {
+                    log::debug!(
+                        "hook signal for session {session_id} had no active turn, dropping"
+                    );
+                }
+            }
+        }
+    }
+
     /// Run the response boundary detector against every live session.
     /// On boundary detection, the detector pushes a `StoredTurn` into
     /// that session's `response_store` AND publishes
@@ -455,6 +510,7 @@ impl SessionManager {
             config.event_tx,
             config.cols,
             config.rows,
+            config.install_hook,
         )?;
 
         self.sessions.push(session);
@@ -1450,6 +1506,87 @@ mod tests {
     }
 
     #[test]
+    fn check_hook_signals_completes_active_turn_and_publishes_event() {
+        use crate::session::hook::HookStopSignal;
+
+        let (mut m, bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+        let turn_id = m.send_prompt(id, "ping").expect("send_prompt");
+        let rx = bus.subscribe();
+
+        // Install a test hook channel on the session and send a signal.
+        let tx = m
+            .get_mut(id)
+            .expect("session exists")
+            .install_test_hook_channel();
+        tx.send(HookStopSignal {
+            ccom_session_id: id,
+            claude_session_id: "fake-uuid".to_string(),
+            last_assistant_message: "hello from hook".to_string(),
+            transcript_path: None,
+        })
+        .unwrap();
+
+        m.check_hook_signals();
+
+        // Verify the stored turn contains the hook's body.
+        let stored = m
+            .get_response(id, turn_id)
+            .expect("stored turn should exist");
+        assert_eq!(stored.turn_id, turn_id);
+        assert_eq!(stored.body, "hello from hook");
+        assert!(stored.completed_at.is_some());
+
+        // Verify the bus received a ResponseComplete event.
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let completes: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                SessionEvent::ResponseComplete {
+                    session_id,
+                    turn_id,
+                } => Some((*session_id, *turn_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completes, vec![(id, turn_id)]);
+    }
+
+    #[test]
+    fn check_hook_signals_drops_signals_without_active_turn() {
+        use crate::session::hook::HookStopSignal;
+
+        let (mut m, bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+        // Deliberately skip send_prompt — no active turn.
+        let rx = bus.subscribe();
+
+        let tx = m
+            .get_mut(id)
+            .expect("session exists")
+            .install_test_hook_channel();
+        tx.send(HookStopSignal {
+            ccom_session_id: id,
+            claude_session_id: "fake-uuid".to_string(),
+            last_assistant_message: "orphaned".to_string(),
+            transcript_path: None,
+        })
+        .unwrap();
+
+        m.check_hook_signals();
+
+        // No stored turn, no bus event.
+        assert!(m.get_latest_response(id).is_none());
+        let events: Vec<SessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|ev| matches!(ev, SessionEvent::ResponseComplete { .. })),
+            "expected no ResponseComplete, saw {events:?}"
+        );
+    }
+
+    #[test]
     fn check_response_boundaries_does_not_fire_without_marker() {
         let (mut m, bus) = manager_with_synthetic_detector();
         let id = push_running(&mut m, "a");
@@ -1608,6 +1745,7 @@ mod tests {
                 event_tx,
                 cols: 80,
                 rows: 24,
+                install_hook: false,
             })
             .expect("real spawn should succeed");
 
@@ -1852,6 +1990,9 @@ mod test_support {
             next_turn_id: 0,
             response_store: crate::session::ResponseStore::new(),
             reader_handle: None,
+            hook_dir: None,
+            hook_rx: None,
+            hook_reader_handle: None,
         }
     }
 

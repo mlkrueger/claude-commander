@@ -1,6 +1,7 @@
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -9,6 +10,7 @@ use crate::claude::context;
 use crate::event::{Event, MonitoredSender};
 use crate::pty::detector::PromptDetector;
 use crate::session::events::TurnId;
+use crate::session::hook::{self, HookStopSignal};
 use crate::session::response_store::ResponseStore;
 
 pub fn lock_parser(p: &Mutex<vt100::Parser>) -> MutexGuard<'_, vt100::Parser> {
@@ -64,6 +66,16 @@ pub struct Session {
     /// initialization in `make_dummy_session`.
     pub(super) response_store: ResponseStore,
     pub(super) reader_handle: Option<JoinHandle<()>>,
+    /// Per-session hook directory (Phase 3.5). `Some` for Claude
+    /// sessions that have a Stop hook installed; `None` for Terminal
+    /// sessions.
+    pub(super) hook_dir: Option<PathBuf>,
+    /// Receiver for parsed hook signals from the sidecar FIFO reader
+    /// thread. `Some` iff `hook_dir` is `Some`.
+    pub(super) hook_rx: Option<mpsc::Receiver<HookStopSignal>>,
+    /// Handle for the sidecar FIFO reader thread. `Some` iff
+    /// `hook_dir` is `Some`.
+    pub(super) hook_reader_handle: Option<JoinHandle<()>>,
 }
 
 impl Session {
@@ -77,6 +89,7 @@ impl Session {
         event_tx: MonitoredSender,
         cols: u16,
         rows: u16,
+        install_hook: bool,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pty_size = PtySize {
@@ -92,7 +105,40 @@ impl Session {
         cmd.args(args);
         cmd.cwd(&working_dir);
 
-        let child = pair.slave.spawn_command(cmd)?;
+        // Phase 3.5: install the per-session Stop hook for Claude
+        // sessions. Creates a temp dir with `.claude/settings.json`
+        // and a FIFO, spawns a sidecar reader thread, and points
+        // Claude Code at the temp dir via `CLAUDE_CONFIG_DIR`.
+        let (hook_dir, hook_rx, hook_reader_handle) = if install_hook {
+            let hook_dir = hook::create_hook_dir(id)?;
+            let fifo_path = hook_dir.join("stop.fifo");
+            if let Err(e) = hook::create_stop_fifo(&fifo_path) {
+                hook::cleanup_hook_dir(&hook_dir);
+                return Err(e.into());
+            }
+            let (handle, rx) = match hook::spawn_fifo_reader(fifo_path, id) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    hook::cleanup_hook_dir(&hook_dir);
+                    return Err(e.into());
+                }
+            };
+            cmd.env("CLAUDE_CONFIG_DIR", hook_dir.join(".claude"));
+            cmd.env("CCOM_SESSION_ID", id.to_string());
+            (Some(hook_dir), Some(rx), Some(handle))
+        } else {
+            (None, None, None)
+        };
+
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(child) => child,
+            Err(e) => {
+                if let Some(dir) = hook_dir.as_ref() {
+                    hook::cleanup_hook_dir(dir);
+                }
+                return Err(e);
+            }
+        };
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader()?;
@@ -178,6 +224,9 @@ impl Session {
             next_turn_id: 0,
             response_store: ResponseStore::new(),
             reader_handle: Some(handle),
+            hook_dir,
+            hook_rx,
+            hook_reader_handle,
         })
     }
 
@@ -262,6 +311,75 @@ impl Session {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         self.status = SessionStatus::Exited(-1);
+        self.cleanup_hook_artifacts();
+    }
+
+    /// Test seam: install a channel receiver for hook signals
+    /// directly on a session, bypassing `Session::spawn`. The returned
+    /// `Sender` lets tests inject synthetic `HookStopSignal`s that
+    /// `SessionManager::check_hook_signals` will consume.
+    #[cfg(test)]
+    pub(crate) fn install_test_hook_channel(&mut self) -> mpsc::Sender<HookStopSignal> {
+        let (tx, rx) = mpsc::channel();
+        self.hook_rx = Some(rx);
+        tx
+    }
+
+    /// Drain any pending hook signals, non-blocking. Returns all
+    /// signals that are immediately available without waiting. Called
+    /// periodically from `SessionManager::check_hook_signals`.
+    pub(super) fn drain_hook_signals(&self) -> Vec<HookStopSignal> {
+        let Some(rx) = self.hook_rx.as_ref() else {
+            return Vec::new();
+        };
+        let mut signals = Vec::new();
+        while let Ok(signal) = rx.try_recv() {
+            signals.push(signal);
+        }
+        signals
+    }
+
+    /// Clean up hook-related resources: drop the receiver so the
+    /// FIFO reader thread exits, then remove the hook dir from disk.
+    /// Idempotent — safe to call on a session without hook artifacts.
+    pub(super) fn cleanup_hook_artifacts(&mut self) {
+        // Drop the receiver first so the FIFO reader thread's next
+        // send() fails and the thread exits. The reader holds the
+        // FIFO open, so removing the file on disk isn't enough to
+        // wake it up.
+        self.hook_rx = None;
+        if let Some(handle) = self.hook_reader_handle.take() {
+            // Open and close the FIFO for write once to unblock any
+            // pending `File::open(fifo)` call in the reader thread.
+            if let Some(dir) = self.hook_dir.as_ref() {
+                let fifo = dir.join("stop.fifo");
+                if fifo.exists() {
+                    // Best-effort: opening for write returns once the
+                    // reader accepts the connection. Immediate close
+                    // sends EOF and the reader exits.
+                    let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                }
+            }
+            // Don't block forever waiting for the thread — it should
+            // exit promptly once EOF is observed.
+            let start = Instant::now();
+            while !handle.is_finished() {
+                if start.elapsed() >= Duration::from_millis(500) {
+                    log::warn!(
+                        "session {} hook reader thread did not exit within 500ms",
+                        self.id
+                    );
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+        if let Some(dir) = self.hook_dir.take() {
+            hook::cleanup_hook_dir(&dir);
+        }
     }
 
     pub fn join_reader(&mut self, timeout: Duration) {
@@ -330,6 +448,9 @@ impl Session {
             next_turn_id: 0,
             response_store: ResponseStore::new(),
             reader_handle: None,
+            hook_dir: None,
+            hook_rx: None,
+            hook_reader_handle: None,
         }
     }
 }

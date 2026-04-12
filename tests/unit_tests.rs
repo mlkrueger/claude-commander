@@ -283,6 +283,7 @@ mod session_bus_integration {
                 event_tx,
                 cols: 80,
                 rows: 24,
+                install_hook: false,
             })
             .expect("real spawn should succeed");
 
@@ -325,6 +326,7 @@ mod session_bus_integration {
                 event_tx,
                 cols: 80,
                 rows: 24,
+                install_hook: false,
             })
             .expect("real spawn should succeed");
 
@@ -367,6 +369,7 @@ mod session_bus_integration {
                 event_tx,
                 cols: 80,
                 rows: 24,
+                install_hook: false,
             })
             .expect("real spawn should succeed");
 
@@ -488,6 +491,7 @@ mod session_bus_integration {
                 event_tx,
                 cols: 80,
                 rows: 24,
+                install_hook: false,
             })
             .expect("real spawn should succeed");
 
@@ -539,6 +543,7 @@ mod session_bus_integration {
                 event_tx: event_tx.clone(),
                 cols: 80,
                 rows: 24,
+                install_hook: false,
             })
             .expect("spawn a");
 
@@ -551,6 +556,7 @@ mod session_bus_integration {
                 event_tx,
                 cols: 80,
                 rows: 24,
+                install_hook: false,
             })
             .expect("spawn b");
 
@@ -614,6 +620,7 @@ mod session_lifecycle {
                 event_tx,
                 cols: 80,
                 rows: 24,
+                install_hook: false,
             })
             .expect("spawn should succeed");
 
@@ -663,6 +670,7 @@ mod session_lifecycle {
                 event_tx,
                 cols: 80,
                 rows: 24,
+                install_hook: false,
             })
             .expect("spawn should succeed");
 
