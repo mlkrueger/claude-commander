@@ -271,7 +271,8 @@ mod session_bus_integration {
 
         // We need an event_tx for the PTY reader thread. We don't read
         // from it here — the test only cares about the bus.
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (raw_tx, _event_rx) = mpsc::channel();
+        let event_tx = ccom::event::MonitoredSender::wrap(raw_tx);
 
         let id = manager
             .spawn(SpawnConfig {
@@ -312,7 +313,8 @@ mod session_bus_integration {
         let bus = Arc::new(EventBus::new());
         let mut manager = SessionManager::with_bus(Arc::clone(&bus));
 
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (raw_tx, _event_rx) = mpsc::channel();
+        let event_tx = ccom::event::MonitoredSender::wrap(raw_tx);
         // Use `sleep 30` so the child is reliably alive when we kill it.
         let id = manager
             .spawn(SpawnConfig {
@@ -354,7 +356,8 @@ mod session_bus_integration {
         let bus = Arc::new(EventBus::new());
         let mut manager = SessionManager::with_bus(Arc::clone(&bus));
 
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (raw_tx, _event_rx) = mpsc::channel();
+        let event_tx = ccom::event::MonitoredSender::wrap(raw_tx);
         let id = manager
             .spawn(SpawnConfig {
                 label: "smoke-reap".to_string(),
@@ -470,7 +473,8 @@ mod session_bus_integration {
     fn send_prompt_through_real_pty_writes_bytes_and_publishes_event() {
         let bus = Arc::new(EventBus::new());
         let mut manager = SessionManager::with_bus(Arc::clone(&bus));
-        let (event_tx, event_rx) = mpsc::channel();
+        let (raw_tx, event_rx) = mpsc::channel();
+        let event_tx = ccom::event::MonitoredSender::wrap(raw_tx);
 
         // `cat` reads its stdin and echoes back. The PTY line
         // discipline also echoes input, so we'll see the bytes via
@@ -523,7 +527,8 @@ mod session_bus_integration {
     fn broadcast_through_real_pty_writes_to_each_session() {
         let bus = Arc::new(EventBus::new());
         let mut manager = SessionManager::with_bus(Arc::clone(&bus));
-        let (event_tx, event_rx) = mpsc::channel();
+        let (raw_tx, event_rx) = mpsc::channel();
+        let event_tx = ccom::event::MonitoredSender::wrap(raw_tx);
 
         let id_a = manager
             .spawn(SpawnConfig {
@@ -585,7 +590,90 @@ mod session_bus_integration {
     }
 }
 
-// Test key_event_to_bytes (need to make it pub or test via integration)
+mod session_lifecycle {
+    use ccom::event::{Event, MonitoredSender};
+    use ccom::session::{EventBus, SessionManager, SessionStatus, SpawnConfig};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn spawn_read_output_exit_cleanup() {
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+        let (raw_tx, event_rx) = mpsc::channel();
+        let event_tx = MonitoredSender::wrap(raw_tx);
+
+        let id = manager
+            .spawn(SpawnConfig {
+                label: "lifecycle".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/sh",
+                args: vec!["-c".to_string(), "echo hello && exit 0".to_string()],
+                event_tx,
+                cols: 80,
+                rows: 24,
+            })
+            .expect("spawn should succeed");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_output = false;
+        let mut saw_exit = false;
+        let mut exit_code = None;
+
+        while Instant::now() < deadline && !saw_exit {
+            match event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Event::PtyOutput { session_id, data }) if session_id == id => {
+                    if data.windows(5).any(|w| w == b"hello") {
+                        saw_output = true;
+                    }
+                }
+                Ok(Event::SessionExited { session_id, code }) if session_id == id => {
+                    saw_exit = true;
+                    exit_code = Some(code);
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_output, "should have seen 'hello' in PtyOutput");
+        assert!(saw_exit, "should have received SessionExited");
+        assert_eq!(exit_code, Some(0));
+
+        if let Some(session) = manager.get_mut(id) {
+            session.status = SessionStatus::Exited(0);
+            session.join_reader(Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    fn kill_stops_reader_thread() {
+        let bus = Arc::new(EventBus::new());
+        let mut manager = SessionManager::with_bus(Arc::clone(&bus));
+        let (raw_tx, _event_rx) = mpsc::channel();
+        let event_tx = MonitoredSender::wrap(raw_tx);
+
+        let id = manager
+            .spawn(SpawnConfig {
+                label: "kill-test".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                command: "/bin/sh",
+                args: vec!["-c".to_string(), "sleep 30".to_string()],
+                event_tx,
+                cols: 80,
+                rows: 24,
+            })
+            .expect("spawn should succeed");
+
+        manager.kill(id);
+
+        if let Some(session) = manager.get_mut(id) {
+            session.join_reader(Duration::from_millis(1000));
+        }
+    }
+}
+
 mod key_encoding_tests {
     #[test]
     fn test_common_prefix_helper() {

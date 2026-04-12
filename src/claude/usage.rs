@@ -48,12 +48,12 @@ pub fn get_daily_usage(days: usize) -> Vec<DailyUsage> {
             let path = file_entry.path();
             if path.extension().is_some_and(|e| e == "jsonl") {
                 // Only process files modified recently
-                if let Ok(meta) = path.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        let age = modified.elapsed().unwrap_or_default();
-                        if age.as_secs() > (days as u64 + 1) * 86400 {
-                            continue;
-                        }
+                if let Ok(meta) = path.metadata()
+                    && let Ok(modified) = meta.modified()
+                {
+                    let age = modified.elapsed().unwrap_or_default();
+                    if age.as_secs() > (days as u64 + 1) * 86400 {
+                        continue;
                     }
                 }
                 parse_jsonl_usage(&path, &cutoff, &mut daily);

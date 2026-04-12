@@ -23,6 +23,8 @@ use ratatui::backend::CrosstermBackend;
 use app::App;
 use event::EventCollector;
 
+const TICK_INTERVAL: Duration = Duration::from_millis(200);
+
 #[derive(Parser)]
 #[command(
     name = "ccom",
@@ -44,54 +46,38 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let working_dir = cli.dir.canonicalize().unwrap_or_else(|_| cli.dir.clone());
 
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Get initial terminal size
     let size = terminal.size()?;
 
-    // Create event collector with 50ms tick rate
     let events = EventCollector::new(Duration::from_millis(50));
     let event_tx = events.sender();
-
-    // Send periodic ticks
-    let tick_tx = event_tx.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_millis(200));
-            if tick_tx.send(event::Event::Tick).is_err() {
-                break;
-            }
-        }
-    });
 
     let mut app = App::new(event_tx, working_dir.clone());
     app.terminal_cols = size.width;
     app.terminal_rows = size.height;
 
-    // Spawn initial sessions if requested
     for _ in 0..cli.spawn {
         app.spawn_session(working_dir.clone());
     }
 
-    // Main loop
     loop {
         terminal.draw(|frame| app.draw(frame))?;
 
-        if let Ok(event) = events.next() {
+        if let Some(event) = events.next_timeout(TICK_INTERVAL) {
             app.handle_event(event);
+        } else {
+            app.handle_event(event::Event::Tick);
         }
 
-        // Drain any queued events
         while let Some(event) = events.try_next() {
             app.handle_event(event);
         }
 
-        // Handle mouse capture toggle
         if app.toggle_mouse_capture {
             app.toggle_mouse_capture = false;
             if app.mouse_captured {
@@ -111,12 +97,14 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Cleanup: kill all sessions
     for session in app.sessions.iter_mut() {
         session.kill();
     }
+    drop(events);
+    for session in app.sessions.iter_mut() {
+        session.join_reader(Duration::from_millis(500));
+    }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 

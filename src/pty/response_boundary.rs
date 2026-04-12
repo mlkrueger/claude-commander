@@ -22,11 +22,17 @@
 //! synthetic `## DONE` marker.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use regex::Regex;
 
 use crate::session::{StoredTurn, TurnId, TurnSink};
+
+static RE_CLAUDE_IDLE_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"__CCOM_PLACEHOLDER_CLAUDE_IDLE__")
+        .expect("RE_CLAUDE_IDLE_PLACEHOLDER is a valid regex")
+});
 
 /// Per-session response boundary detector.
 ///
@@ -46,20 +52,11 @@ pub struct ResponseBoundaryDetector {
     states: HashMap<usize, PerSessionState>,
 }
 
+#[derive(Default)]
 struct PerSessionState {
     active_turn: Option<TurnId>,
     started_at: Option<Instant>,
     body_bytes: Vec<u8>,
-}
-
-impl Default for PerSessionState {
-    fn default() -> Self {
-        Self {
-            active_turn: None,
-            started_at: None,
-            body_bytes: Vec::new(),
-        }
-    }
 }
 
 impl ResponseBoundaryDetector {
@@ -111,8 +108,7 @@ impl ResponseBoundaryDetector {
         // PLACEHOLDER: a pattern that is extremely unlikely to appear
         // in normal output. Phase 3 Task 8 will replace this with the
         // real empirically-pinned Claude Code idle prompt shape.
-        let placeholder = Regex::new(r"__CCOM_PLACEHOLDER_CLAUDE_IDLE__").unwrap();
-        Self::new(placeholder)
+        Self::new(RE_CLAUDE_IDLE_PLACEHOLDER.clone())
     }
 
     /// Begin tracking a new turn for `session_id`. Resets any
@@ -268,11 +264,11 @@ mod tests {
 
     // ---------------- helpers ----------------
 
-    fn load_fixture(name: &str) -> Vec<u8> {
+    fn load_fixture(name: &str) -> anyhow::Result<Vec<u8>> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pty")
             .join(name);
-        std::fs::read(&path).unwrap_or_else(|e| panic!("failed to load fixture {name}: {e}"))
+        Ok(std::fs::read(&path)?)
     }
 
     fn synthetic_detector() -> ResponseBoundaryDetector {
@@ -340,11 +336,11 @@ mod tests {
     }
 
     #[test]
-    fn detector_pushes_completed_turn_on_idle_marker() {
+    fn detector_pushes_completed_turn_on_idle_marker() -> anyhow::Result<()> {
         let mut det = synthetic_detector();
         let mut sink = RecordingSink::new();
 
-        let fixture = load_fixture("short_response.bin");
+        let fixture = load_fixture("short_response.bin")?;
         det.on_prompt_submitted(1, TurnId::new(0));
         det.on_pty_data(1, &fixture);
         det.check_for_boundary(1, &mut sink);
@@ -357,14 +353,15 @@ mod tests {
             sink.turns[0].body
         );
         assert!(sink.turns[0].completed_at.is_some());
+        Ok(())
     }
 
     #[test]
-    fn detector_strips_ansi_from_body() {
+    fn detector_strips_ansi_from_body() -> anyhow::Result<()> {
         let mut det = synthetic_detector();
         let mut sink = RecordingSink::new();
 
-        let fixture = load_fixture("with_ansi.bin");
+        let fixture = load_fixture("with_ansi.bin")?;
         det.on_prompt_submitted(1, TurnId::new(0));
         det.on_pty_data(1, &fixture);
         det.check_for_boundary(1, &mut sink);
@@ -377,14 +374,15 @@ mod tests {
             body
         );
         assert!(body.contains("Hello! How can I help you?"));
+        Ok(())
     }
 
     #[test]
-    fn detector_handles_chunked_arrival() {
+    fn detector_handles_chunked_arrival() -> anyhow::Result<()> {
         let mut det = synthetic_detector();
         let mut sink = RecordingSink::new();
 
-        let fixture = load_fixture("multi_chunk.bin");
+        let fixture = load_fixture("multi_chunk.bin")?;
         det.on_prompt_submitted(1, TurnId::new(0));
 
         // Slice into ~3 chunks at arbitrary byte boundaries.
@@ -400,14 +398,15 @@ mod tests {
 
         assert_eq!(sink.turns.len(), 1);
         assert!(sink.turns[0].body.contains("Here's the answer: 42."));
+        Ok(())
     }
 
     #[test]
-    fn detector_does_not_push_without_idle_marker() {
+    fn detector_does_not_push_without_idle_marker() -> anyhow::Result<()> {
         let mut det = synthetic_detector();
         let mut sink = RecordingSink::new();
 
-        let fixture = load_fixture("no_marker.bin");
+        let fixture = load_fixture("no_marker.bin")?;
         det.on_prompt_submitted(1, TurnId::new(0));
         det.on_pty_data(1, &fixture);
         det.check_for_boundary(1, &mut sink);
@@ -418,14 +417,15 @@ mod tests {
             det.check_for_boundary(1, &mut sink);
         }
         assert!(sink.turns.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn detector_resets_after_pushing() {
+    fn detector_resets_after_pushing() -> anyhow::Result<()> {
         let mut det = synthetic_detector();
         let mut sink = RecordingSink::new();
 
-        let fixture = load_fixture("short_response.bin");
+        let fixture = load_fixture("short_response.bin")?;
         det.on_prompt_submitted(1, TurnId::new(0));
         det.on_pty_data(1, &fixture);
         det.check_for_boundary(1, &mut sink);
@@ -436,16 +436,17 @@ mod tests {
         det.on_pty_data(1, b"more bytes ## DONE");
         det.check_for_boundary(1, &mut sink);
         assert_eq!(sink.turns.len(), 1);
+        Ok(())
     }
 
     // ---------------- detector: multi-turn ----------------
 
     #[test]
-    fn detector_handles_two_consecutive_turns() {
+    fn detector_handles_two_consecutive_turns() -> anyhow::Result<()> {
         let mut det = synthetic_detector();
         let mut sink = RecordingSink::new();
 
-        let fixture = load_fixture("two_turns.bin");
+        let fixture = load_fixture("two_turns.bin")?;
         // Find the end of the first "## DONE\n" block.
         let marker = b"## DONE\n";
         let first_end = {
@@ -474,10 +475,11 @@ mod tests {
         assert_eq!(sink.turns[1].turn_id, TurnId::new(1));
         assert!(sink.turns[0].body.contains("First answer here."));
         assert!(sink.turns[1].body.contains("Second answer here."));
+        Ok(())
     }
 
     #[test]
-    fn detector_isolates_per_session_state() {
+    fn detector_isolates_per_session_state() -> anyhow::Result<()> {
         let mut det = synthetic_detector();
         let mut sink = RecordingSink::new();
 
@@ -485,7 +487,7 @@ mod tests {
         det.on_prompt_submitted(2, TurnId::new(0));
 
         // Only session 1 receives bytes.
-        let fixture = load_fixture("short_response.bin");
+        let fixture = load_fixture("short_response.bin")?;
         det.on_pty_data(1, &fixture);
 
         det.check_for_boundary(1, &mut sink);
@@ -495,6 +497,7 @@ mod tests {
         // The one pushed turn must be session 1's (id 0).
         assert_eq!(sink.turns[0].turn_id, TurnId::new(0));
         assert!(sink.turns[0].body.contains("Hello!"));
+        Ok(())
     }
 
     #[test]

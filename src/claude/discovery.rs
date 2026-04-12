@@ -43,12 +43,11 @@ pub fn list_claude_sessions() -> Vec<(u32, String)> {
         let Ok(pid) = stem.parse::<u32>() else {
             continue;
         };
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(parsed) = serde_json::from_str::<SessionFile>(&content) {
-                if let Some(sid) = parsed.session_id {
-                    results.push((pid, sid));
-                }
-            }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Ok(parsed) = serde_json::from_str::<SessionFile>(&content)
+            && let Some(sid) = parsed.session_id
+        {
+            results.push((pid, sid));
         }
     }
     results

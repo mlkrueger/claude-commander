@@ -42,9 +42,15 @@ pub fn find_claude_binary() -> Option<String> {
 }
 
 fn which_exists(cmd: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    use std::path::Path;
+    if Path::new(cmd).is_absolute() {
+        return Path::new(cmd).is_file();
+    }
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(cmd))
+                .find(|p| p.is_file())
+        })
+        .is_some()
 }
