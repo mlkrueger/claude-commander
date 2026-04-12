@@ -1,0 +1,212 @@
+//! `McpServer` lifecycle: spawn a dedicated thread, run tokio
+//! inside it, serve rmcp over streamable HTTP on loopback.
+//!
+//! See `docs/plans/phase-4-mcp-readonly.md` Task 3 for the full
+//! design rationale and `docs/plans/notes/rmcp-spike.md` for the
+//! empirical rmcp 1.4.0 findings this module is built against.
+//!
+//! Architecture: the main TUI thread calls [`McpServer::start`],
+//! which spawns a dedicated OS thread named `ccom-mcp`. That thread
+//! owns a current-thread tokio runtime and `block_on`s the axum
+//! server. The main thread receives the assigned loopback port back
+//! via a `std::sync::mpsc` channel and stores a shutdown
+//! `oneshot::Sender` + a `CancellationToken` for graceful teardown.
+//! No tokio primitives ever escape the `ccom-mcp` thread.
+
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
+use tokio_util::sync::CancellationToken;
+
+use super::handlers::Ccom;
+use super::state::ReadOnlyCtx;
+
+/// Handle to the running MCP server. `start` spawns the `ccom-mcp`
+/// thread; `stop` consumes the handle and joins cleanly.
+pub struct McpServer {
+    port: u16,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+    cancel: CancellationToken,
+}
+
+impl McpServer {
+    /// Spawn the dedicated `ccom-mcp` thread, bind to
+    /// `127.0.0.1:0`, and return a handle once the assigned port
+    /// is available. Waits up to 2 seconds for the thread to report
+    /// its assigned port.
+    pub fn start(ctx: Arc<ReadOnlyCtx>) -> anyhow::Result<Self> {
+        let (port_tx, port_rx) = std::sync::mpsc::sync_channel::<u16>(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel = CancellationToken::new();
+        let cancel_for_thread = cancel.clone();
+
+        let thread = std::thread::Builder::new()
+            .name("ccom-mcp".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        log::error!("ccom-mcp tokio runtime build failed: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(run_server(ctx, port_tx, shutdown_rx, cancel_for_thread));
+            })?;
+
+        let port = port_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|e| anyhow::anyhow!("ccom-mcp thread did not report port: {e}"))?;
+
+        Ok(Self {
+            port,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+            cancel,
+        })
+    }
+
+    /// Test/integration helper: construct a [`ReadOnlyCtx`] internally
+    /// from the provided `sessions` and `bus` and start the server.
+    /// Lets integration tests (which can't name the `pub(crate)`
+    /// `ReadOnlyCtx` type) drive the full server lifecycle without
+    /// widening the visibility of the ctx type itself.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn start_with(
+        sessions: Arc<Mutex<crate::session::SessionManager>>,
+        bus: Arc<crate::session::EventBus>,
+    ) -> anyhow::Result<Self> {
+        Self::start(Arc::new(ReadOnlyCtx { sessions, bus }))
+    }
+
+    /// Assigned loopback port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Graceful shutdown: signal axum to stop accepting new
+    /// connections, cancel in-flight SSE streams, and join the
+    /// `ccom-mcp` thread with a 2-second timeout. Mirrors the
+    /// polling pattern in `SidecarHandle::join_with_timeout`.
+    pub fn stop(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        self.cancel.cancel();
+        if let Some(handle) = self.thread.take() {
+            let start = Instant::now();
+            let timeout = Duration::from_secs(2);
+            while !handle.is_finished() {
+                if start.elapsed() >= timeout {
+                    log::error!("ccom-mcp thread did not exit within {timeout:?}; orphaning");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if let Err(e) = handle.join() {
+                log::error!("ccom-mcp thread panicked on join: {e:?}");
+            }
+        }
+    }
+}
+
+async fn run_server(
+    ctx: Arc<ReadOnlyCtx>,
+    port_tx: std::sync::mpsc::SyncSender<u16>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    cancel: CancellationToken,
+) {
+    let service = StreamableHttpService::new(
+        {
+            let ctx = Arc::clone(&ctx);
+            move || Ok(Ccom::new(Arc::clone(&ctx)))
+        },
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default(),
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+
+    // Task 7: bind loopback ONLY. A future refactor that accidentally
+    // flips this to `0.0.0.0` would expose ccom's internal state to
+    // the network; the runtime assertion below refuses to start the
+    // server in that case.
+    const BIND_ADDR: &str = "127.0.0.1:0";
+    let listener = match tokio::net::TcpListener::bind(BIND_ADDR).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("ccom-mcp listener bind failed: {e}");
+            let _ = port_tx.send(0);
+            return;
+        }
+    };
+    let local_addr = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            log::error!("ccom-mcp local_addr() failed: {e}");
+            let _ = port_tx.send(0);
+            return;
+        }
+    };
+    if !local_addr.ip().is_loopback() {
+        log::error!(
+            "ccom-mcp refusing to serve: bound address {} is not loopback",
+            local_addr.ip()
+        );
+        let _ = port_tx.send(0);
+        return;
+    }
+    let port = local_addr.port();
+    if port_tx.send(port).is_err() {
+        log::error!("ccom-mcp port channel closed before send; main thread gone");
+        return;
+    }
+
+    let cancel_for_shutdown = cancel.clone();
+    if let Err(e) = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.await;
+            cancel_for_shutdown.cancel();
+        })
+        .await
+    {
+        log::error!("ccom-mcp axum::serve exited with error: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{EventBus, SessionManager};
+    use std::sync::Mutex;
+
+    fn test_ctx() -> Arc<ReadOnlyCtx> {
+        let bus = Arc::new(EventBus::new());
+        let sessions = Arc::new(Mutex::new(SessionManager::with_bus(Arc::clone(&bus))));
+        Arc::new(ReadOnlyCtx { sessions, bus })
+    }
+
+    #[test]
+    fn server_start_binds_nonzero_port_and_stops_cleanly() {
+        let server = McpServer::start(test_ctx()).expect("start");
+        assert!(server.port() > 0, "port must be nonzero");
+        server.stop();
+    }
+
+    #[test]
+    fn server_port_is_loopback_accessible() {
+        let server = McpServer::start(test_ctx()).expect("start");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", server.port()).parse().unwrap();
+        let conn = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2));
+        assert!(conn.is_ok(), "tcp connect failed: {:?}", conn.err());
+        server.stop();
+    }
+}

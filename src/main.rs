@@ -2,6 +2,7 @@ mod app;
 mod claude;
 mod event;
 mod fs;
+mod mcp;
 mod pty;
 mod session;
 mod setup;
@@ -97,12 +98,24 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    for session in app.sessions.iter_mut() {
-        session.kill();
+    {
+        let mut mgr = app.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        for session in mgr.iter_mut() {
+            session.kill();
+        }
     }
     drop(events);
-    for session in app.sessions.iter_mut() {
-        session.join_reader(Duration::from_millis(500));
+    {
+        let mut mgr = app.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        for session in mgr.iter_mut() {
+            session.join_reader(Duration::from_millis(500));
+        }
+    }
+
+    // Stop the embedded MCP server before clearing the terminal so
+    // any log::error! on orphan thread teardown still reaches stderr.
+    if let Some(mcp) = app.mcp.take() {
+        mcp.stop();
     }
 
     disable_raw_mode()?;

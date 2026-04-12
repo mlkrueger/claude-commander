@@ -63,11 +63,14 @@ impl App {
                 PanelFocus::FileTree => PanelFocus::SessionList,
                 PanelFocus::SessionList => PanelFocus::FileTree,
             };
-            if self.focus == PanelFocus::FileTree
-                && let Some(session) = self.sessions.selected()
-            {
-                let dir = session.working_dir.clone();
-                if dir != self.file_tree.root.path {
+            if self.focus == PanelFocus::FileTree {
+                let dir = self
+                    .sessions_lock()
+                    .selected()
+                    .map(|s| s.working_dir.clone());
+                if let Some(dir) = dir
+                    && dir != self.file_tree.root.path
+                {
                     self.file_tree.set_root(dir);
                 }
             }
@@ -84,23 +87,45 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.mode = AppMode::QuitConfirm,
             KeyCode::Down => {
-                if !self.sessions.is_empty() {
-                    self.sessions.select_next();
+                let moved = {
+                    let mut mgr = self.sessions_lock();
+                    if !mgr.is_empty() {
+                        mgr.select_next();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if moved {
                     self.update_file_tree_for_selected();
                 }
             }
             KeyCode::Up => {
-                if !self.sessions.is_empty() {
-                    self.sessions.select_prev();
+                let moved = {
+                    let mut mgr = self.sessions_lock();
+                    if !mgr.is_empty() {
+                        mgr.select_prev();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if moved {
                     self.update_file_tree_for_selected();
                 }
             }
             KeyCode::Enter => {
                 let inner_rows = self.terminal_rows.saturating_sub(3);
                 let inner_cols = self.terminal_cols.saturating_sub(2);
-                if let Some(session) = self.sessions.selected_mut() {
-                    let id = session.id;
-                    session.try_resize(inner_cols, inner_rows);
+                let id = {
+                    let mut mgr = self.sessions_lock();
+                    mgr.selected_mut().map(|session| {
+                        let id = session.id;
+                        session.try_resize(inner_cols, inner_rows);
+                        id
+                    })
+                };
+                if let Some(id) = id {
                     self.session_view_scroll = 0;
                     self.user_scrolled = false;
                     self.mode = AppMode::SessionView(id);
@@ -113,8 +138,9 @@ impl App {
             KeyCode::Char('a') => self.approve_selected(),
             KeyCode::Char('d') => self.deny_selected(),
             KeyCode::Char('r') => {
-                if let Some(session) = self.sessions.selected() {
-                    self.input_buffer = session.label.clone();
+                let label = self.sessions_lock().selected().map(|s| s.label.clone());
+                if let Some(label) = label {
+                    self.input_buffer = label;
                     self.mode = AppMode::RenamePrompt;
                 }
             }
@@ -203,7 +229,8 @@ impl App {
                 self.mode = AppMode::Dashboard;
             }
             KeyCode::Char('p') if ctrl => {
-                if !self.sessions.is_empty() {
+                let has_any = !self.sessions_lock().is_empty();
+                if has_any {
                     self.mode = AppMode::SendFilePrompt;
                 } else if let Some(editor) = &mut self.editor {
                     editor.message = Some("No sessions to send to.".to_string());
@@ -298,7 +325,7 @@ impl App {
                 self.mode = AppMode::Editor;
             }
             KeyCode::Enter => {
-                if !self.sessions.is_empty() {
+                if !self.sessions_lock().is_empty() {
                     self.send_file_to_session(0);
                 }
                 self.mode = AppMode::Editor;
@@ -314,22 +341,25 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('s') {
-            if self.sessions.len() > 1 {
-                self.picker_selected = self
-                    .sessions
-                    .iter()
-                    .position(|s| s.id == session_id)
-                    .unwrap_or(0);
+            let (len, pos) = {
+                let mgr = self.sessions_lock();
+                let len = mgr.len();
+                let pos = mgr.iter().position(|s| s.id == session_id).unwrap_or(0);
+                (len, pos)
+            };
+            if len > 1 {
+                self.picker_selected = pos;
                 self.mode = AppMode::SessionPicker(session_id);
             }
             return;
         }
 
         let bytes = key_event_to_bytes(&key);
-        if !bytes.is_empty()
-            && let Some(session) = self.sessions.get_mut(session_id)
-        {
-            session.try_write(&bytes);
+        if !bytes.is_empty() {
+            let mut mgr = self.sessions_lock();
+            if let Some(session) = mgr.get_mut(session_id) {
+                session.try_write(&bytes);
+            }
         }
     }
 
@@ -339,28 +369,35 @@ impl App {
                 self.mode = AppMode::SessionView(from_session_id);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if !self.sessions.is_empty() {
-                    self.picker_selected = (self.picker_selected + 1) % self.sessions.len();
+                let len = self.sessions_lock().len();
+                if len > 0 {
+                    self.picker_selected = (self.picker_selected + 1) % len;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if !self.sessions.is_empty() {
-                    self.picker_selected = self
-                        .picker_selected
-                        .checked_sub(1)
-                        .unwrap_or(self.sessions.len() - 1);
+                let len = self.sessions_lock().len();
+                if len > 0 {
+                    self.picker_selected = self.picker_selected.checked_sub(1).unwrap_or(len - 1);
                 }
             }
             KeyCode::Enter => {
                 let picker_idx = self.picker_selected;
-                let id = self.sessions.iter().nth(picker_idx).map(|s| s.id);
-                if let Some(id) = id {
-                    if let Some(session) = self.sessions.get_mut(id) {
-                        let inner_rows = self.terminal_rows.saturating_sub(3);
-                        let inner_cols = self.terminal_cols.saturating_sub(2);
+                let inner_rows = self.terminal_rows.saturating_sub(3);
+                let inner_cols = self.terminal_cols.saturating_sub(2);
+                let id = {
+                    let mut mgr = self.sessions_lock();
+                    let id = mgr.iter().nth(picker_idx).map(|s| s.id);
+                    if let Some(id) = id
+                        && let Some(session) = mgr.get_mut(id)
+                    {
                         session.try_resize(inner_cols, inner_rows);
                     }
-                    self.sessions.set_selected(picker_idx);
+                    if id.is_some() {
+                        mgr.set_selected(picker_idx);
+                    }
+                    id
+                };
+                if let Some(id) = id {
                     self.mode = AppMode::SessionView(id);
                 }
             }
@@ -371,10 +408,11 @@ impl App {
     fn handle_rename_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
-                if !self.input_buffer.is_empty()
-                    && let Some(session) = self.sessions.selected_mut()
-                {
-                    session.label = self.input_buffer.clone();
+                if !self.input_buffer.is_empty() {
+                    let mut mgr = self.sessions_lock();
+                    if let Some(session) = mgr.selected_mut() {
+                        session.label = self.input_buffer.clone();
+                    }
                 }
                 self.input_buffer.clear();
                 self.mode = AppMode::Dashboard;
@@ -508,8 +546,16 @@ impl App {
             MouseEventKind::ScrollUp => match &self.mode {
                 AppMode::Dashboard => match self.focus {
                     PanelFocus::SessionList => {
-                        if !self.sessions.is_empty() {
-                            self.sessions.select_up_by(scroll_lines);
+                        let moved = {
+                            let mut mgr = self.sessions_lock();
+                            if !mgr.is_empty() {
+                                mgr.select_up_by(scroll_lines);
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if moved {
                             self.update_file_tree_for_selected();
                         }
                     }
@@ -522,14 +568,20 @@ impl App {
                 },
                 AppMode::SessionView(id) => {
                     let id = *id;
-                    if let Some(session) = self.sessions.get(id) {
-                        let mut parser = crate::session::lock_parser(&session.parser);
-                        parser.screen_mut().set_scrollback(usize::MAX);
-                        let max_scroll = parser.screen().scrollback();
+                    let max_scroll = {
+                        let mgr = self.sessions_lock();
+                        mgr.get(id).map(|session| {
+                            let mut parser = crate::session::lock_parser(&session.parser);
+                            parser.screen_mut().set_scrollback(usize::MAX);
+                            let max = parser.screen().scrollback();
+                            parser.screen_mut().set_scrollback(0);
+                            max
+                        })
+                    };
+                    if let Some(max_scroll) = max_scroll {
                         let desired = self.session_view_scroll + scroll_lines;
                         self.session_view_scroll = desired.min(max_scroll);
                         self.user_scrolled = self.session_view_scroll > 0;
-                        parser.screen_mut().set_scrollback(0);
                     }
                 }
                 AppMode::Editor => {
@@ -546,8 +598,16 @@ impl App {
             MouseEventKind::ScrollDown => match &self.mode {
                 AppMode::Dashboard => match self.focus {
                     PanelFocus::SessionList => {
-                        if !self.sessions.is_empty() {
-                            self.sessions.select_down_by(scroll_lines);
+                        let moved = {
+                            let mut mgr = self.sessions_lock();
+                            if !mgr.is_empty() {
+                                mgr.select_down_by(scroll_lines);
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if moved {
                             self.update_file_tree_for_selected();
                         }
                     }

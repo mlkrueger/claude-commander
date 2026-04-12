@@ -275,6 +275,63 @@ pub fn create_hook_dir(_session_id: usize) -> std::io::Result<PathBuf> {
     ))
 }
 
+/// Phase 4 Task 6: write a per-session `.mcp.json` pointing the
+/// spawned Claude Code process at ccom's embedded MCP server on
+/// `http://127.0.0.1:<port>/mcp`.
+///
+/// Claude Code reads `.mcp.json` from the config dir (`CLAUDE_CONFIG_DIR`
+/// or `~/.claude`) during session startup. Since Phase 3.5 already
+/// points `CLAUDE_CONFIG_DIR` at `<hook_dir>/.claude/` for every
+/// installed-hook session, writing the file there gets it picked up
+/// automatically.
+///
+/// Schema (confirmed against Claude Code 2.1.x docs):
+/// ```json
+/// {
+///   "mcpServers": {
+///     "ccom": {
+///       "type": "http",
+///       "url": "http://127.0.0.1:<port>/mcp"
+///     }
+///   }
+/// }
+/// ```
+///
+/// File is written mode 0600 via `create_new` to avoid overwriting
+/// anything pre-existing.
+#[cfg(unix)]
+pub fn write_mcp_config(hook_dir: &Path, port: u16) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let claude_dir = hook_dir.join(".claude");
+    let path = claude_dir.join(".mcp.json");
+    let contents = serde_json::json!({
+        "mcpServers": {
+            "ccom": {
+                "type": "http",
+                "url": format!("http://127.0.0.1:{port}/mcp"),
+            }
+        }
+    })
+    .to_string();
+
+    let mut f = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    f.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn write_mcp_config(_hook_dir: &Path, _port: u16) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        ".mcp.json injection is only supported on Unix",
+    ))
+}
+
 /// Build the `.claude/settings.json` contents for our Stop hook.
 ///
 /// The hook command reads stdin (the JSON blob from Claude Code) and

@@ -61,6 +61,12 @@ pub struct SpawnConfig<'a> {
     /// detection (Phase 3.5). Set to `true` for Claude sessions,
     /// `false` for Terminal sessions.
     pub install_hook: bool,
+    /// Loopback port the ccom MCP server is listening on. When
+    /// `Some`, a `.mcp.json` is written to the session's hook dir
+    /// pointing Claude Code at `http://127.0.0.1:<port>/mcp`. `None`
+    /// disables the injection (Terminal sessions, or when the MCP
+    /// server failed to start). Phase 4 Task 6.
+    pub mcp_port: Option<u16>,
 }
 
 /// Outcome of a [`SessionManager::broadcast`] call. Reports which
@@ -391,7 +397,6 @@ impl SessionManager {
     /// caller doesn't hold a borrow into the session's store.
     /// Returns `None` if the session doesn't exist or the turn isn't
     /// in its store (never completed, or evicted by the budget).
-    #[allow(dead_code)] // first production caller is Council Phase 3 / MCP read_response
     pub fn get_response(&self, session_id: usize, turn_id: TurnId) -> Option<StoredTurn> {
         self.get(session_id)
             .and_then(|s| s.response_store.get(turn_id).cloned())
@@ -402,7 +407,6 @@ impl SessionManager {
     /// the event fired, give me the most recent completed turn").
     /// Returns `None` if the session doesn't exist or has no
     /// completed turns yet.
-    #[allow(dead_code)] // first production caller is Council Phase 3 / MCP read_response
     pub fn get_latest_response(&self, session_id: usize) -> Option<StoredTurn> {
         self.get(session_id)
             .and_then(|s| s.response_store.latest().cloned())
@@ -524,6 +528,7 @@ impl SessionManager {
             config.cols,
             config.rows,
             config.install_hook,
+            config.mcp_port,
         )?;
 
         self.sessions.push(session);
@@ -682,8 +687,9 @@ impl SessionManager {
     /// the monotonic-id invariant survives subsequent test spawns.
     /// Publishes `Spawned` on the bus for parity with the production
     /// `spawn` path.
-    #[cfg(test)]
-    pub(crate) fn push_for_test(&mut self, session: Session) -> usize {
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn push_for_test(&mut self, session: Session) -> usize {
         let id = session.id;
         let label = session.label.clone();
         self.sessions.push(session);
@@ -1792,6 +1798,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 install_hook: false,
+                mcp_port: None,
             })
             .expect("real spawn should succeed");
 

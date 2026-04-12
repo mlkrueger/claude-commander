@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod event;
 pub mod fs;
+pub mod mcp;
 pub mod pty;
 pub mod session;
 pub mod setup;

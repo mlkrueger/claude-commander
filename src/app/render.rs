@@ -50,7 +50,11 @@ impl App {
                 );
                 frame.render_widget(line, cmd_area);
             } else if self.mode == AppMode::SendFilePrompt {
-                let labels: Vec<String> = self.sessions.iter().map(|s| s.label.clone()).collect();
+                let labels: Vec<String> = self
+                    .sessions_lock()
+                    .iter()
+                    .map(|s| s.label.clone())
+                    .collect();
                 let bar = CommandBar::new(CommandBarMode::SendFile(labels), th);
                 frame.render_widget(bar, cmd_area);
             } else {
@@ -75,14 +79,17 @@ impl App {
         .with_git_status(self.git_status.as_ref());
         frame.render_widget(tree_panel, layout.file_tree);
 
-        let session_list = SessionListPanel::new(
-            self.sessions.as_slice(),
-            self.sel_idx_or_zero(),
-            self.focus == PanelFocus::SessionList,
-            th,
-            tick,
-        );
-        frame.render_widget(session_list, layout.main);
+        {
+            let mgr = self.sessions_lock();
+            let session_list = SessionListPanel::new(
+                mgr.as_slice(),
+                mgr.selected_index().unwrap_or(0),
+                self.focus == PanelFocus::SessionList,
+                th,
+                tick,
+            );
+            frame.render_widget(session_list, layout.main);
+        }
 
         let show_banner = !self.setup_banner_dismissed && !self.setup_items.is_empty();
         let usage_area = if show_banner && layout.usage_graph.height > 1 {
@@ -152,7 +159,8 @@ impl App {
     ) {
         let (main_area, cmd_area) = AppLayout::session_view(frame.area());
 
-        let context_pct = if let Some(session) = self.sessions.get(id) {
+        let mgr = self.sessions_lock();
+        let context_pct = if let Some(session) = mgr.get(id) {
             let view =
                 SessionViewPanel::new(session, th, tick).with_scroll(self.session_view_scroll);
             frame.render_widget(view, main_area);
@@ -162,13 +170,14 @@ impl App {
         };
 
         if matches!(self.mode, AppMode::SessionPicker(_)) {
-            let picker =
-                SessionPickerPanel::new(self.sessions.as_slice(), self.picker_selected, th);
+            let picker = SessionPickerPanel::new(mgr.as_slice(), self.picker_selected, th);
             frame.render_widget(picker, main_area);
+            drop(mgr);
 
             let command_bar = CommandBar::new(CommandBarMode::SessionPicker, th);
             frame.render_widget(command_bar, cmd_area);
         } else {
+            drop(mgr);
             let usage = command_bar::UsageStats {
                 context_pct,
                 session_pct: self.rate_limit.as_ref().and_then(|r| r.session_pct),
@@ -455,7 +464,7 @@ impl App {
         }
 
         let has_running = self
-            .sessions
+            .sessions_lock()
             .iter()
             .any(|s| !matches!(s.status, SessionStatus::Exited(_)));
         let msg = if has_running {

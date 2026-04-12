@@ -8,6 +8,7 @@ repository = "https://github.com/mlkrueger/claude-commander"
 
 [dependencies]
 anyhow = "1.0.102"
+axum = "0.7"
 chrono = "0.4.44"
 clap = { version = "4.6.0", features = ["derive"] }
 crossterm = "0.29.0"
@@ -18,11 +19,20 @@ log = "0.4.29"
 portable-pty = "0.9.0"
 ratatui = "0.30.0"
 regex = "1.12.3"
+rmcp = { version = "=1.4.0", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+schemars = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 shellexpand = "3.1.2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tokio-util = "0.7"
 unicode-width = "0.2.2"
 vt100 = "0.16.2"
 
 [dev-dependencies]
 proptest = "1"
+ureq = "2"

@@ -90,6 +90,7 @@ impl Session {
         cols: u16,
         rows: u16,
         install_hook: bool,
+        mcp_port: Option<u16>,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pty_size = PtySize {
@@ -132,6 +133,25 @@ impl Session {
                 };
                 cmd.env("CLAUDE_CONFIG_DIR", hook_dir.join(".claude"));
                 cmd.env("CCOM_SESSION_ID", id.to_string());
+
+                // Phase 4 Task 6: if the MCP server is running,
+                // write a `.mcp.json` in the hook dir so the spawned
+                // Claude Code session auto-connects. The file lives
+                // in the session's working dir at Claude Code's
+                // conventional location: `$CWD/.mcp.json`. Since our
+                // hook dir is NOT the session's working dir, we
+                // instead write it to `$CLAUDE_CONFIG_DIR/.mcp.json`
+                // which Claude Code picks up via the config-dir
+                // discovery path. Best-effort — failure logs a
+                // warning but does not fail the spawn.
+                if let Some(port) = mcp_port
+                    && let Err(e) = hook::write_mcp_config(&hook_dir, port)
+                {
+                    log::warn!(
+                        "session {id} failed to write .mcp.json: {e} (MCP tools will be unavailable to this session)"
+                    );
+                }
+
                 (Some(hook_dir), Some(rx), Some(handle))
             }
             #[cfg(not(unix))]
@@ -479,8 +499,9 @@ impl Session {
     /// `writer`, and `child` fields are stub objects that panic if anything
     /// tries to drive them — tests that exercise lifecycle bookkeeping only
     /// (id/label/status/selection) should never touch them.
-    #[cfg(test)]
-    pub(crate) fn dummy_exited(id: usize, label: &str) -> Self {
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn dummy_exited(id: usize, label: &str) -> Self {
         use portable_pty::PtySize;
         use test_helpers::{DummyChild, DummyPty, DummyWriter};
 
@@ -516,8 +537,9 @@ impl Session {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_helpers {
+#[doc(hidden)]
+#[allow(dead_code)]
+pub mod test_helpers {
     use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
     use std::io::{Result as IoResult, Write};
 
