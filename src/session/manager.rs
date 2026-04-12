@@ -341,36 +341,7 @@ impl SessionManager {
         self.get(session_id)
             .and_then(|s| s.response_store.latest().cloned())
     }
-}
 
-/// Sink wrapper used by `check_response_boundaries`: pushes the
-/// completed turn into the session's `ResponseStore` AND publishes
-/// `SessionEvent::ResponseComplete` on the bus. Lives at module level
-/// so the borrow checker can verify the disjoint field borrows in
-/// `check_response_boundaries` cleanly.
-struct StoreAndBus<'a> {
-    session_id: usize,
-    store: &'a mut super::response_store::ResponseStore,
-    bus: &'a EventBus,
-}
-
-impl<'a> TurnSink for StoreAndBus<'a> {
-    fn push_turn(&mut self, turn: StoredTurn) {
-        let turn_id = turn.turn_id;
-        self.store.push_turn(turn);
-        self.bus.publish(SessionEvent::ResponseComplete {
-            session_id: self.session_id,
-            turn_id,
-        });
-    }
-}
-
-// `SessionManager` continues with the methods that were already in
-// the original impl block. Two impl blocks for the same type are
-// fine; splitting let me put `StoreAndBus` between them so the
-// borrow-checker tooling sees disjoint field access cleanly in
-// `check_response_boundaries`.
-impl SessionManager {
     /// Write raw bytes to every session in `ids`, in order. Does not
     /// allocate a `TurnId`, does not publish `SessionEvent`s, does not
     /// dedupe `ids`. See `BroadcastResult` for the return shape and the
@@ -531,6 +502,10 @@ impl SessionManager {
             session_id: id,
             code: exit_code,
         });
+        // PR #9 review C1: drop the detector's per-session state so
+        // a long-running TUI doesn't slowly leak `body_bytes`
+        // buffers for every killed session.
+        self.boundary_detector.forget_session(id);
         self.assert_invariant();
         true
     }
@@ -594,6 +569,11 @@ impl SessionManager {
         }
         for (session_id, code) in transitioned {
             self.bus.publish(SessionEvent::Exited { session_id, code });
+            // PR #9 review C1: drop the detector's per-session state
+            // so a long-running TUI doesn't slowly leak `body_bytes`
+            // buffers for every reaped session. Same rationale as
+            // the `kill` path above.
+            self.boundary_detector.forget_session(session_id);
         }
     }
 
@@ -638,6 +618,27 @@ impl SessionManager {
             self.selected,
             self.sessions.len()
         );
+    }
+}
+
+/// Sink wrapper used by [`SessionManager::check_response_boundaries`]:
+/// pushes the completed turn into the session's `ResponseStore` AND
+/// publishes [`SessionEvent::ResponseComplete`] on the bus in one
+/// `push_turn` call. Module-private — no callers outside this file.
+struct StoreAndBus<'a> {
+    session_id: usize,
+    store: &'a mut super::response_store::ResponseStore,
+    bus: &'a EventBus,
+}
+
+impl<'a> TurnSink for StoreAndBus<'a> {
+    fn push_turn(&mut self, turn: StoredTurn) {
+        let turn_id = turn.turn_id;
+        self.store.push_turn(turn);
+        self.bus.publish(SessionEvent::ResponseComplete {
+            session_id: self.session_id,
+            turn_id,
+        });
     }
 }
 
@@ -1530,6 +1531,47 @@ mod tests {
     }
 
     #[test]
+    fn kill_drops_boundary_detector_state_for_session() {
+        // PR #9 review C1 regression guard: killing a session must
+        // remove its entry from the response boundary detector's
+        // internal HashMap, otherwise body_bytes buffers would leak
+        // across the lifetime of a long-running TUI.
+        let (mut m, _bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "leak");
+        let _ = m.send_prompt(id, "ping").expect("send_prompt");
+
+        // Detector now has state for `id`.
+        assert!(
+            m.boundary_detector.knows_session(id),
+            "detector should know about active session"
+        );
+
+        m.kill(id);
+
+        assert!(
+            !m.boundary_detector.knows_session(id),
+            "kill must drop detector state for the session"
+        );
+    }
+
+    #[test]
+    fn reap_exited_drops_boundary_detector_state_for_transitioned_sessions() {
+        // PR #9 review C1 regression guard, reap_exited path.
+        let (mut m, _bus) = manager_with_synthetic_detector();
+        let id = m.peek_next_id();
+        m.push_for_test(test_support::make_exiting_session(id, 0));
+        let _ = m.send_prompt(id, "ping").expect("send_prompt");
+        assert!(m.boundary_detector.knows_session(id));
+
+        m.reap_exited();
+
+        assert!(
+            !m.boundary_detector.knows_session(id),
+            "reap_exited must drop detector state for transitioned sessions"
+        );
+    }
+
+    #[test]
     fn end_to_end_real_pty_send_prompt_to_response_complete() {
         // Phase 3 Task 8: full pipeline through a real PTY. Spawns
         // /bin/cat (which echoes stdin to stdout via the line
@@ -1808,7 +1850,7 @@ mod test_support {
             context_percent: None,
             consecutive_write_failures: 0,
             next_turn_id: 0,
-            response_store: super::super::response_store::ResponseStore::new(),
+            response_store: crate::session::ResponseStore::new(),
         }
     }
 
