@@ -125,6 +125,21 @@ a terminal stream, not structured data. To emit `ResponseComplete` on
 the bus we need to recognize when a session has transitioned from
 "working" to "idle" with new content since the last prompt.
 
+> **2026-04-11 update:** The PTY-scraping approach described in the
+> rest of this section was the Phase 3 implementation. After PR #9
+> review surfaced concerns about visual pattern matching's
+> false-positive risk, the canonical approach **for Claude Code
+> sessions** has shifted to a **hook-based detection path** that
+> uses Claude Code's built-in Stop hook system to signal turn
+> completion via a side channel. The PTY-scraping detector is now
+> the **fallback** for non-Claude runners (e.g. shell sessions). See
+> `docs/designs/response-boundary-detection.md` for the full design,
+> alternatives considered, and Phase 3.5 implementation plan.
+>
+> The rest of this section reflects the original Phase 3 (Tier 0)
+> design and remains accurate for the regex-detector code path that
+> still ships in `src/pty/response_boundary.rs`.
+
 **Approach.** Extend `PromptDetector` (`src/pty/detector.rs`) — or add
 a sibling `ResponseBoundaryDetector` — that tracks:
 
