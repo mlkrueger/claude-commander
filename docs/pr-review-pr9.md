@@ -149,3 +149,50 @@ guards for the C1 leak fix).
   manual verification** — the safety isn't immediately obvious. Worth
   considering whether to write up the byte-level argument as a code
   comment so the next reader doesn't have to re-derive it.
+- **Empirically verify before removing dead-code annotations.** The
+  K1 review item correctly identified that A4's annotations were
+  stale this time — but only because `cargo build` was actually run
+  after each removal. The PR #8 K1 lesson was the inverse mistake
+  (removed annotations that were still load-bearing). The general
+  rule: never trust analytical reasoning about reachability without
+  running the relevant cargo command.
+
+---
+
+## Second review pass — delta commit `3a46e54`
+
+After applying A1–A5 and pushing the follow-up commit, ran the
+review flow again on just the delta (+269 / −32, 3 files). This
+appendix is the second pass's record.
+
+### Action item verification
+
+| ID | Verified |
+|---|---|
+| **A1** | `forget_session` is a simple `HashMap::remove`. Called from `kill` after the existing publish, and from inside `reap_exited`'s transition loop. Order verified safe (the response store is reachable independently of detector state, so the `Exited` publish can fire before the detector cleanup without race). Two regression tests sandwich the cleanup with `knows_session` pre/post asserts. |
+| **A2** | Both doc warnings present and loud (⚠️ + bold). `new` warning gives a concrete pitfall example (`\x1b[0m> ` would never match) AND a positive-example regex shape. `for_claude_code` warning is prescriptive ("pipe through `cat -v` and write your regex against that form"). Doc-links to `ansi_strip` resolve. |
+| **A3** | `crate::session::ResponseStore::new()` resolves through the re-export. |
+| **A4** | Both annotations removed. `cargo build` empirically clean — annotations were genuinely stale (Task 4's wiring made the type reachable). |
+| **A5** | Single `impl SessionManager` block. `StoreAndBus` moved to module scope between the impl and `mod tests`. Misleading old "borrow-checker assistance" comment removed. |
+
+### New issues found by the second pass
+
+**None substantive in production code.** One stylistic nit
+considered and rejected: `StoreAndBus` still uses
+`super::response_store::ResponseStore` (one-level relative path).
+For consistency with C3's fix this could also use
+`crate::session::ResponseStore`, but `super::` is one level only and
+not fragile, so the consistency win isn't worth the churn.
+
+### Stylistic nits — considered, not actionable
+
+| # | Nit | Why not fixing |
+|---|---|---|
+| **N1** | `StoreAndBus.store: &'a mut super::response_store::ResponseStore` uses a one-level relative path while C3 standardized on `crate::session::ResponseStore`. | One-level relative is not fragile in the same way C3's two-level relative was. Consistency-only win, not worth the diff. |
+| **N2** | The `expect("ansi_strip preserves utf8")` claim isn't visually obvious from the code — readers have to walk the byte cases to convince themselves. | Worth adding a longer safety comment in a future cleanup pass, but not blocking. The claim IS correct (verified during the first review pass), just non-obvious. |
+
+### Final disposition
+
+**Approved on second pass.** Delta commit is tight, every action item
+is verifiably applied, two regression guards added, no new issues
+introduced. Ready to merge.
