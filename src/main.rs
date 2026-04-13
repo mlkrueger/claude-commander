@@ -1,5 +1,6 @@
 mod app;
 mod claude;
+mod driver_config;
 mod event;
 mod fs;
 mod mcp;
@@ -39,6 +40,23 @@ struct Cli {
     /// Immediately spawn N claude sessions on start
     #[arg(short, long, default_value_t = 0)]
     spawn: usize,
+
+    /// Promote the first Claude session spawned by ccom to a driver
+    /// (Phase 6 fleet orchestrator). No-op if more spawns have
+    /// already happened.
+    #[arg(long)]
+    driver: bool,
+
+    /// Spawn policy for the driver: `ask` (default — modal every
+    /// spawn), `budget` (silent until budget is exhausted), or
+    /// `trust` (always silent). Requires `--driver`.
+    #[arg(long, value_enum, requires = "driver")]
+    spawn_policy: Option<driver_config::SpawnPolicyArg>,
+
+    /// Pre-authorized silent spawn budget for the driver. Requires
+    /// `--driver`. Ignored unless `--spawn-policy budget`.
+    #[arg(long, requires = "driver")]
+    budget: Option<u32>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -79,6 +97,11 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let working_dir = cli.dir.canonicalize().unwrap_or_else(|_| cli.dir.clone());
 
+    // Phase 6 Task 2: resolve the driver config from CLI + TOML
+    // before constructing the App so `App::new`'s caller gets to
+    // decide whether the first Claude spawn should be promoted.
+    let driver_cfg = driver_config::load_driver_config(cli.driver, cli.spawn_policy, cli.budget);
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -93,6 +116,13 @@ fn main() -> anyhow::Result<()> {
     let mut app = App::new(event_tx, working_dir.clone());
     app.terminal_cols = size.width;
     app.terminal_rows = size.height;
+    // Phase 6 Task 2: stash the pending driver role on the App so
+    // the first Claude session spawned (via `spawn_session_kind`)
+    // gets promoted post-construction. `take()`-once semantics
+    // inside `spawn_session_kind` guarantee only the first Claude
+    // session is touched even if multiple spawn up-front via
+    // `--spawn N`.
+    app.pending_driver_role = driver_cfg.as_ref().map(|c| c.to_role());
 
     for _ in 0..cli.spawn {
         app.spawn_session(working_dir.clone());
