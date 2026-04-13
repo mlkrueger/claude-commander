@@ -508,6 +508,7 @@ impl App {
         let tool_name = match req.tool {
             ConfirmTool::SendPrompt => "send_prompt",
             ConfirmTool::KillSession => "kill_session",
+            ConfirmTool::SpawnSession => "spawn_session",
         };
 
         // Look up the session label so the prompt is human-readable.

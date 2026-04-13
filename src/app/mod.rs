@@ -223,6 +223,10 @@ impl App {
                 bus: Arc::clone(&event_bus),
                 confirm: Some(Arc::clone(&confirm_bridge)),
                 attachments: Arc::clone(&attachment_map),
+                // Phase 6 Task 3: hand the event sender to the MCP
+                // ctx so `spawn_session` can spawn new sessions
+                // whose PTY output reaches the main TUI event loop.
+                event_tx: Some(event_tx.clone()),
             });
             match crate::mcp::McpServer::start(ctx) {
                 Ok(server) => {
