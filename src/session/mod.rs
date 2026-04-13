@@ -24,4 +24,9 @@ pub use manager::{SessionManager, SpawnConfig};
 pub use response_store::{
     DEFAULT_BUDGET_BYTES, DEFAULT_MIN_RETAIN, ResponseStore, StoredTurn, TurnSink,
 };
-pub use types::{Session, SessionStatus, lock_parser};
+// Phase 6 Task 1: `SessionRole` + `SpawnPolicy` are re-exported so
+// Task 2's driver_config module (and the MCP handlers in Tasks 3-6)
+// can reference them through `crate::session::` without reaching into
+// the private `types` submodule.
+#[allow(unused_imports)]
+pub use types::{Session, SessionRole, SessionStatus, SpawnPolicy, lock_parser};

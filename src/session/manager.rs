@@ -511,6 +511,21 @@ impl SessionManager {
     }
 
     /// Spawn a new session, append it, and select it. Returns the new id.
+    /// Phase 6 Task 2: post-construction role promotion. The
+    /// session is already in `self.sessions`; find it by id and
+    /// overwrite its `role` field. No-op if the id is not found.
+    ///
+    /// This is the integration seam between `driver_config` and
+    /// `Session::spawn`: we deliberately do NOT thread a role
+    /// through `SpawnConfig`, because only one session per ccom
+    /// run is ever promoted, and `Session::spawn`'s signature is
+    /// already load-bearing for the rest of the codebase.
+    pub fn set_role(&mut self, id: usize, role: crate::session::SessionRole) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+            session.role = role;
+        }
+    }
+
     pub fn spawn(&mut self, config: SpawnConfig<'_>) -> anyhow::Result<usize> {
         let id = self.next_id;
         self.next_id += 1;
@@ -797,6 +812,25 @@ mod tests {
         m.kill(id_b);
         let id_d = push(&mut m, "d");
         assert!(id_d > id_c, "freed ids must not be reused");
+    }
+
+    #[test]
+    fn set_role_promotes_existing_session() {
+        use crate::session::{SessionRole, SpawnPolicy};
+        let mut m = SessionManager::new();
+        let id = push(&mut m, "driver");
+        // Baseline: pushed sessions default to Solo.
+        assert_eq!(m.get(id).unwrap().role, SessionRole::Solo);
+
+        let role = SessionRole::Driver {
+            spawn_budget: 3,
+            spawn_policy: SpawnPolicy::Budget,
+        };
+        m.set_role(id, role.clone());
+        assert_eq!(m.get(id).unwrap().role, role);
+
+        // Unknown id is a no-op, not a panic.
+        m.set_role(9999, SessionRole::Solo);
     }
 
     #[test]
@@ -2178,6 +2212,8 @@ mod test_support {
             next_turn_id: 0,
             response_store: crate::session::ResponseStore::new(),
             reader_handle: None,
+            role: crate::session::types::SessionRole::Solo,
+            spawned_by: None,
             hook_dir: None,
             hook_rx: None,
             hook_reader_handle: None,

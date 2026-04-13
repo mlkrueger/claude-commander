@@ -13,7 +13,7 @@ use crate::event::Event;
 use crate::fs::git::{self, GitStatusMap};
 use crate::fs::tree::FileTree;
 use crate::pty::detector::PromptDetector;
-use crate::session::{EventBus, SessionManager, SessionStatus, SpawnConfig};
+use crate::session::{EventBus, SessionManager, SessionRole, SessionStatus, SpawnConfig};
 use crate::setup::{self, SetupItem};
 use crate::ui::panels::editor::EditorState;
 use crate::ui::theme::{Theme, ThemeName};
@@ -141,6 +141,12 @@ pub struct App {
     pub theme: Theme,
     pub tick_count: u64,
     pub picker_selected: usize,
+    /// Phase 6 Task 2: pending driver role to apply to the very
+    /// next Claude session spawned through `spawn_session_kind`.
+    /// Populated by `main` from the resolved `DriverConfig` when
+    /// `--driver` is passed. `take()`n on first use so subsequent
+    /// spawns stay `Solo`.
+    pub pending_driver_role: Option<SessionRole>,
 }
 
 const ATTENTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -235,6 +241,7 @@ impl App {
             theme: Theme::new(ThemeName::Default),
             tick_count: 0,
             picker_selected: 0,
+            pending_driver_role: None,
         }
     }
 
@@ -380,7 +387,18 @@ impl App {
 
         let spawn_res = self.sessions_lock().spawn(config);
         match spawn_res {
-            Ok(_id) => {
+            Ok(id) => {
+                // Phase 6 Task 2: if a pending driver role is
+                // queued and this is a Claude session, promote it
+                // in-place. `take()` ensures only the first Claude
+                // spawn is promoted — subsequent spawns (including
+                // any further `--spawn N` startup spawns) stay Solo.
+                if matches!(kind, SessionKind::Claude)
+                    && let Some(role) = self.pending_driver_role.take()
+                {
+                    log::info!("promoting session {id} to driver role: {role:?}");
+                    self.sessions_lock().set_role(id, role);
+                }
                 self.update_file_tree_for_selected();
             }
             Err(e) => {
