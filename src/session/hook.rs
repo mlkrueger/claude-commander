@@ -172,28 +172,39 @@ fn shell_single_quote(s: &str) -> String {
     out
 }
 
-/// Create the per-session hook directory and write the `.claude/settings.json`
-/// containing our Stop hook. Returns the root directory path (not the
-/// `.claude` subdirectory).
+/// Create the per-session hook directory and write the flat
+/// `settings.json` containing our Stop hook. Returns the root
+/// directory path.
 ///
-/// Layout:
+/// Layout (flat — no `.claude/` subdir, no symlinks):
 /// ```text
 /// /tmp/ccom-<pid>-<session_id>/
-///   .claude/
-///     settings.json           ← our Stop hook config (mode 0600)
-///     <other-files>           ← symlinked from ~/.claude/
-///   stop.fifo                 ← created separately by create_stop_fifo
+///   settings.json    ← our Stop hook config (loaded via `--settings`)
+///   .mcp.json        ← MCP server config (loaded via `--mcp-config`,
+///                       written by write_mcp_config)
+///   stop.fifo        ← created separately by create_stop_fifo
 /// ```
 ///
-/// To preserve Claude Code's authentication state, we symlink every
-/// entry in the user's real `~/.claude/` into our `.claude/` *except*
-/// `settings.json` and `settings.local.json` — those we override with
-/// our own hook-only config. The real config dir is resolved from
-/// `$CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
+/// **History / important**: an earlier Phase 3.5 approach created a
+/// `.claude/` subdir, symlinked the user's real `~/.claude/*` into
+/// it, and pointed Claude Code at the result via `CLAUDE_CONFIG_DIR`.
+/// That broke **macOS Keychain authentication**: Claude Code binds
+/// its OAuth credential entry to the config-dir path, so changing
+/// `CLAUDE_CONFIG_DIR` invalidates the Keychain binding and forces
+/// a fresh login every session. Symlinking the credential subdirs
+/// didn't help because the Keychain ACL is path-based, not
+/// filesystem-based.
 ///
-/// Directories are created with mode 0700 and `settings.json` with
+/// The fix: don't touch `CLAUDE_CONFIG_DIR`. Use Claude Code's
+/// `--settings <file>` CLI flag to layer our hook config on top of
+/// the user's real config, and `--mcp-config <file>` for the MCP
+/// server. `Session::spawn` injects both flags into the command
+/// line. The user's `~/.claude/` stays the source of truth for
+/// credentials, history, plugins, and everything else.
+///
+/// Directory is created with mode 0700 and `settings.json` with
 /// mode 0600 via `create_new` to refuse following a pre-existing
-/// symlink (closes the TOCTOU review issue H1).
+/// symlink (TOCTOU review issue H1).
 #[cfg(unix)]
 pub fn create_hook_dir(session_id: usize) -> std::io::Result<PathBuf> {
     use std::io::Write;
@@ -202,60 +213,16 @@ pub fn create_hook_dir(session_id: usize) -> std::io::Result<PathBuf> {
     let pid = process::id();
     let root = std::env::temp_dir().join(format!("ccom-{pid}-{session_id}"));
     // If a previous run with the same pid+id leaked a dir, clean it
-    // first. Otherwise `create_new` on settings.json would fail, and
-    // this also ensures we're not inheriting stale symlinks.
+    // first. Otherwise `create_new` on settings.json would fail.
     cleanup_hook_dir(&root);
 
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     builder.create(&root)?;
-    let claude_dir = root.join(".claude");
-    builder.create(&claude_dir)?;
-
-    // Resolve the user's real Claude config dir. `CLAUDE_CONFIG_DIR`
-    // takes precedence over `~/.claude` (issue H3).
-    let user_claude = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
-
-    if let Some(user_claude) = user_claude
-        && user_claude.is_dir()
-    {
-        match fs::read_dir(&user_claude) {
-            Ok(iter) => {
-                for entry in iter {
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(e) => {
-                            log::warn!("failed to read entry in {}: {e}", user_claude.display());
-                            continue;
-                        }
-                    };
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str == "settings.json" || name_str == "settings.local.json" {
-                        continue;
-                    }
-                    let target = entry.path();
-                    let link = claude_dir.join(&name);
-                    if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
-                        log::warn!(
-                            "failed to symlink {} → {}: {e}",
-                            target.display(),
-                            link.display()
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("failed to read_dir {}: {e}", user_claude.display());
-            }
-        }
-    }
 
     let fifo_path = root.join("stop.fifo");
     let settings = build_hook_settings(&fifo_path)?;
-    let settings_path = claude_dir.join("settings.json");
+    let settings_path = root.join("settings.json");
     // `create_new(true)` refuses to follow any pre-existing symlink
     // (returns EEXIST) — this closes the TOCTOU window (issue H1).
     let mut f = fs::OpenOptions::new()
@@ -275,15 +242,14 @@ pub fn create_hook_dir(_session_id: usize) -> std::io::Result<PathBuf> {
     ))
 }
 
-/// Phase 4 Task 6: write a per-session `.mcp.json` pointing the
-/// spawned Claude Code process at ccom's embedded MCP server on
-/// `http://127.0.0.1:<port>/mcp`.
+/// Phase 4 Task 6: write a per-session `.mcp.json` in the hook dir
+/// pointing the spawned Claude Code process at ccom's embedded MCP
+/// server on `http://127.0.0.1:<port>/mcp`.
 ///
-/// Claude Code reads `.mcp.json` from the config dir (`CLAUDE_CONFIG_DIR`
-/// or `~/.claude`) during session startup. Since Phase 3.5 already
-/// points `CLAUDE_CONFIG_DIR` at `<hook_dir>/.claude/` for every
-/// installed-hook session, writing the file there gets it picked up
-/// automatically.
+/// The file is loaded by passing `--mcp-config <hook_dir>/.mcp.json`
+/// on the Claude command line (done in `Session::spawn`). This
+/// avoids touching `CLAUDE_CONFIG_DIR` — see `create_hook_dir`'s doc
+/// for why the config-dir approach was abandoned.
 ///
 /// Schema (confirmed against Claude Code 2.1.x docs):
 /// ```json
@@ -304,8 +270,7 @@ pub fn write_mcp_config(hook_dir: &Path, port: u16) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let claude_dir = hook_dir.join(".claude");
-    let path = claude_dir.join(".mcp.json");
+    let path = hook_dir.join(".mcp.json");
     let contents = serde_json::json!({
         "mcpServers": {
             "ccom": {
@@ -726,7 +691,7 @@ mod tests {
     #[test]
     fn create_hook_dir_writes_settings() {
         let dir = create_hook_dir(999_999_001).expect("should create dir");
-        let settings_path = dir.join(".claude/settings.json");
+        let settings_path = dir.join("settings.json");
         assert!(settings_path.exists());
         let contents = std::fs::read_to_string(&settings_path).unwrap();
         assert!(contents.contains("Stop"));
@@ -742,16 +707,25 @@ mod tests {
         let dir = create_hook_dir(999_999_010).expect("create dir");
         let root_mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(root_mode & 0o777, 0o700, "root dir should be 0700");
-        let claude_mode = std::fs::metadata(dir.join(".claude"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(claude_mode & 0o777, 0o700, ".claude should be 0700");
-        let settings_mode = std::fs::metadata(dir.join(".claude/settings.json"))
+        let settings_mode = std::fs::metadata(dir.join("settings.json"))
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(settings_mode & 0o777, 0o600, "settings.json should be 0600");
+        cleanup_hook_dir(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_hook_dir_does_not_touch_claude_config_dir() {
+        // Regression guard for the `CLAUDE_CONFIG_DIR`-keychain bug:
+        // the flat layout must NOT create a `.claude/` subdir, and
+        // must not symlink anything from the user's real config dir.
+        let dir = create_hook_dir(999_999_012).expect("create dir");
+        assert!(
+            !dir.join(".claude").exists(),
+            "hook dir must not contain a .claude/ subdir (would force CLAUDE_CONFIG_DIR override)"
+        );
         cleanup_hook_dir(&dir);
     }
 
