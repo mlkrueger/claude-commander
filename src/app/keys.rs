@@ -567,21 +567,32 @@ impl App {
                     }
                 },
                 AppMode::SessionView(id) => {
+                    // Probe the vt100 parser's max scrollback without
+                    // leaving it in a transient state. Previously we
+                    // set scrollback to `usize::MAX`, read the clamped
+                    // value back, then reset to 0 — but the 0 reset
+                    // caused visible flicker because render() on the
+                    // next tick sets scrollback to
+                    // `self.session_view_scroll` while the parser is
+                    // still at 0. Instead: probe max, then leave the
+                    // parser at the NEW scroll position so there's
+                    // no transient mid-state the renderer can observe.
                     let id = *id;
-                    let max_scroll = {
+                    let next_scroll = {
                         let mgr = self.sessions_lock();
                         mgr.get(id).map(|session| {
                             let mut parser = crate::session::lock_parser(&session.parser);
                             parser.screen_mut().set_scrollback(usize::MAX);
                             let max = parser.screen().scrollback();
-                            parser.screen_mut().set_scrollback(0);
-                            max
+                            let desired = self.session_view_scroll + scroll_lines;
+                            let clamped = desired.min(max);
+                            parser.screen_mut().set_scrollback(clamped);
+                            clamped
                         })
                     };
-                    if let Some(max_scroll) = max_scroll {
-                        let desired = self.session_view_scroll + scroll_lines;
-                        self.session_view_scroll = desired.min(max_scroll);
-                        self.user_scrolled = self.session_view_scroll > 0;
+                    if let Some(next) = next_scroll {
+                        self.session_view_scroll = next;
+                        self.user_scrolled = next > 0;
                     }
                 }
                 AppMode::Editor => {
@@ -618,10 +629,22 @@ impl App {
                         self.adjust_file_tree_scroll();
                     }
                 },
-                AppMode::SessionView(_) => {
-                    self.session_view_scroll =
-                        self.session_view_scroll.saturating_sub(scroll_lines);
-                    self.user_scrolled = self.session_view_scroll > 0;
+                AppMode::SessionView(id) => {
+                    // Sync the vt100 parser's scrollback to the new
+                    // position so the next render doesn't observe a
+                    // transient mid-state. See the ScrollUp comment
+                    // above for the flicker history.
+                    let id = *id;
+                    let next = self.session_view_scroll.saturating_sub(scroll_lines);
+                    {
+                        let mgr = self.sessions_lock();
+                        if let Some(session) = mgr.get(id) {
+                            let mut parser = crate::session::lock_parser(&session.parser);
+                            parser.screen_mut().set_scrollback(next);
+                        }
+                    }
+                    self.session_view_scroll = next;
+                    self.user_scrolled = next > 0;
                 }
                 AppMode::Editor => {
                     if let Some(editor) = &mut self.editor {
