@@ -125,8 +125,23 @@ pub fn resolve_driver_config(
         SpawnPolicy::Ask
     };
 
-    // Budget: CLI > TOML > 0
-    let spawn_budget = cli_budget.or(toml_cfg.budget).unwrap_or(0);
+    // Budget: CLI > TOML > 0. Zero out if the resolved policy is
+    // not `Budget` — `SessionRole::Driver::spawn_budget`'s doc comment
+    // pins the convention that the counter is meaningless (and must
+    // be 0) unless the policy is `Budget`. Enforcing it here closes
+    // a latent bug where Task 3's `spawn_session` handler would read
+    // a non-zero budget on an `Ask`/`Trust` driver and mis-apply
+    // budget-decrement logic. See pr-review-pr18.md §Issue 2.
+    let spawn_budget = if matches!(spawn_policy, SpawnPolicy::Budget) {
+        cli_budget.or(toml_cfg.budget).unwrap_or(0)
+    } else {
+        if cli_budget.is_some() || toml_cfg.budget.is_some() {
+            log::warn!(
+                "driver budget specified but spawn_policy is {spawn_policy:?} — ignoring budget (meaningless unless policy is Budget)"
+            );
+        }
+        0
+    };
 
     Some(DriverConfig {
         spawn_policy,
@@ -241,8 +256,39 @@ mod tests {
         "#;
         let cfg = resolve_driver_config(true, None, None, Some(toml)).expect("driver mode");
         assert_eq!(cfg.spawn_policy, SpawnPolicy::Ask);
-        // Budget is still honored — it's a separate field and parsed fine.
-        assert_eq!(cfg.spawn_budget, 4);
+        // Budget is zeroed because the resolved policy is `Ask` —
+        // see `pr-review-pr18.md §Issue 2`. The doc comment on
+        // `SessionRole::Driver::spawn_budget` states the counter is
+        // meaningless (and must be 0) unless the policy is `Budget`,
+        // and `resolve_driver_config` is the single choke point that
+        // enforces that invariant.
+        assert_eq!(cfg.spawn_budget, 0);
+    }
+
+    #[test]
+    fn budget_is_zeroed_when_policy_is_ask_even_with_cli_budget() {
+        // Load-bearing regression test for pr-review-pr18 §Issue 2.
+        // User passes `--driver --budget 42` without `--spawn-policy`:
+        // the policy falls back to `Ask`, so the budget MUST be
+        // clamped to 0 to match `SessionRole::Driver::spawn_budget`'s
+        // documented convention. If this ever flips back to honoring
+        // the raw 42, Task 3's `spawn_session` handler will read a
+        // non-zero budget on an Ask-policy driver and silently take
+        // a silent-spawn path that the user never opted into.
+        let cfg = resolve_driver_config(true, None, Some(42), None).expect("driver mode");
+        assert_eq!(cfg.spawn_policy, SpawnPolicy::Ask);
+        assert_eq!(cfg.spawn_budget, 0);
+    }
+
+    #[test]
+    fn budget_is_zeroed_when_policy_is_trust() {
+        // Companion to the Ask case above: Trust-policy drivers also
+        // have no use for a spawn budget, so the counter must be 0
+        // regardless of what the user supplied.
+        let cfg = resolve_driver_config(true, Some(SpawnPolicyArg::Trust), Some(99), None)
+            .expect("driver mode");
+        assert_eq!(cfg.spawn_policy, SpawnPolicy::Trust);
+        assert_eq!(cfg.spawn_budget, 0);
     }
 
     #[test]

@@ -382,12 +382,14 @@ impl Session {
             reader_handle: Some(handle),
             // Phase 6 Task 1: every freshly spawned session is Solo
             // by default. Drivers are promoted after construction by
-            // `SessionManager::set_driver_role` (Task 2 / 3 plumbing),
-            // and children created via `spawn_session` have their
-            // `spawned_by` set by the same helper. Leaving the
-            // positional signature of `Session::spawn` untouched
-            // keeps every existing call site (including the 16
-            // `SpawnConfig { .. }` literals across tests) unchanged.
+            // `SessionManager::set_role` (wired up in Task 2 via
+            // `App::pending_driver_role` → `spawn_session_kind`), and
+            // children created via `spawn_session` will have their
+            // `spawned_by` set by the same MCP-side plumbing in
+            // Task 3. Leaving the positional signature of
+            // `Session::spawn` untouched keeps every existing call
+            // site (including the 16 `SpawnConfig { .. }` literals
+            // across tests) unchanged.
             role: SessionRole::Solo,
             spawned_by: None,
             hook_dir,
