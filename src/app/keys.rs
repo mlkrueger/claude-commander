@@ -48,6 +48,10 @@ impl App {
             AppMode::Setup => self.handle_setup_key(key),
             AppMode::QuitConfirm => self.handle_quit_confirm_key(key),
             AppMode::McpConfirm => self.handle_mcp_confirm_key(key),
+            AppMode::AttachDriverPicker { target_session_id } => {
+                let target = *target_session_id;
+                self.handle_attach_driver_picker_key(key, target);
+            }
         }
     }
 
@@ -392,6 +396,17 @@ impl App {
             KeyCode::Esc => {
                 self.mode = AppMode::SessionView(from_session_id);
             }
+            KeyCode::Char('a') => {
+                // Phase 6 Task 5: attach the highlighted session to a
+                // driver. Resolve the current selection into a session
+                // id before transitioning so the driver picker knows
+                // what to attach on Enter.
+                let picker_idx = self.picker_selected;
+                let target_id = self.sessions_lock().iter().nth(picker_idx).map(|s| s.id);
+                if let Some(target_id) = target_id {
+                    self.open_attach_driver_picker(target_id);
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 let len = self.sessions_lock().len();
                 if len > 0 {
@@ -424,6 +439,46 @@ impl App {
                 if let Some(id) = id {
                     self.mode = AppMode::SessionView(id);
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Phase 6 Task 5: driver sub-picker keys. Up/Down cycle through
+    /// live driver indices; Enter commits the attachment; Esc aborts
+    /// back to the main session picker the user came from.
+    fn handle_attach_driver_picker_key(&mut self, key: KeyEvent, target_session_id: usize) {
+        match key.code {
+            KeyCode::Esc => {
+                // Return to the session picker the user came from.
+                // The source session for the picker is the target
+                // being attached — same id either way in the common
+                // case, but falling back to Dashboard is safer if
+                // the target no longer exists.
+                self.mode = AppMode::SessionPicker(target_session_id);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let n = self.live_driver_count();
+                if n > 0 {
+                    self.picker_selected = (self.picker_selected + 1) % n;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let n = self.live_driver_count();
+                if n > 0 {
+                    self.picker_selected = self.picker_selected.checked_sub(1).unwrap_or(n - 1);
+                }
+            }
+            KeyCode::Enter => {
+                let picker_idx = self.picker_selected;
+                let chosen = self.nth_live_driver(picker_idx);
+                if let Some((driver_id, driver_label)) = chosen {
+                    self.attach_session_to_driver(driver_id, target_session_id);
+                    self.status_message = Some(format!(
+                        "Attached session {target_session_id} to driver {driver_label}"
+                    ));
+                }
+                self.mode = AppMode::SessionPicker(target_session_id);
             }
             _ => {}
         }

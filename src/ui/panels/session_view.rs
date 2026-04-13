@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Block, Borders, Widget};
 
-use crate::session::{Session, lock_parser};
+use crate::session::{Session, SessionRole, SpawnPolicy, lock_parser};
 use crate::ui::theme::{self, Theme};
 use crate::ui::widgets::terminal::TerminalWidget;
 
@@ -31,10 +31,26 @@ impl<'a> SessionViewPanel<'a> {
 
 impl Widget for SessionViewPanel<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // Phase 6 Task 7: append a `[driver · …]` suffix to the title
+        // bar when viewing a driver so the user always knows which
+        // role they're interacting with. Non-driver sessions get the
+        // original title unchanged.
+        let driver_suffix = match &self.session.role {
+            SessionRole::Driver {
+                spawn_budget,
+                spawn_policy,
+            } => match spawn_policy {
+                SpawnPolicy::Budget => format!(" [driver · budget {spawn_budget}]"),
+                SpawnPolicy::Ask => " [driver · ask]".to_string(),
+                SpawnPolicy::Trust => " [driver · trust]".to_string(),
+            },
+            SessionRole::Solo => String::new(),
+        };
         let title = format!(
-            " {} \u{2014} {} ",
+            " {} \u{2014} {}{} ",
             self.session.label,
-            self.session.working_dir.display()
+            self.session.working_dir.display(),
+            driver_suffix
         );
         let block = Block::default()
             .title(title)
