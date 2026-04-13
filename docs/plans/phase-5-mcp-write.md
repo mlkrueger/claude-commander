@@ -398,3 +398,54 @@ After both merge: Task 4 (TUI modal), Task 5 (integration tests) sequential. Tas
 - `cargo fmt --check` — clean
 - Integration tests in `tests/mcp_write.rs` pass
 - Manual Task 6 smoke test: send_prompt delivers, kill_session modal works for allow/deny/esc paths
+
+## Task 6 smoke test results (2026-04-12)
+
+Ran all six checkpoints from the protocol. All green:
+
+1. **`send_prompt` clean delivery** — session A called
+   `list_sessions` to find B's id, then `send_prompt` with plain
+   text. B received the prompt and responded. ✅
+
+2. **Confirmation modal UI** — `kill_session` from A triggered the
+   expected modal overlay on the dashboard with the correct tool
+   name and target label (`kill_session` → `session N (claude-2)`).
+   ✅
+
+3. **Allow / Deny paths** — `y` killed the target session and the
+   session disappeared from the list; `n` / `Esc` preserved the
+   target and returned a tool error containing `denied`. ✅
+
+4. **Input sanitization (caveat, not a bug)** — asking Claude A to
+   send text containing `\u001b` sequences resulted in the LLM
+   transmitting the literal backslash-u-0-0-1-b characters via its
+   tool-call JSON rather than a real 0x1b byte. Our sanitizer saw
+   plain ASCII and passed it through, which is correct. Claude A
+   then explained to the user that "had a real escape been sent,
+   it would have been stripped." This is an LLM instruction-
+   following quirk, not a ccom issue. The integration test
+   `send_prompt_strips_ansi_escapes_before_write` in
+   `tests/mcp_write.rs` constructs a real 0x1b byte at the Rust
+   level (`"\u{1b}[31m..."`), which serde_json emits as `\u001b`
+   on the wire and rmcp correctly deserializes back to 0x1b before
+   the tool body runs — that path is covered and passing.
+
+5. **No visual glitches** — no scroll artifacts, no redraw issues,
+   no log leakage into the TUI (the Phase 4 log-to-file redirect
+   continues to work). ✅
+
+6. **Logs clean** — no panics, no ERROR entries beyond the known
+   rmcp session-keep-alive lines (which are filtered to `warn`
+   level via the default `RUST_LOG` filter set up in `main.rs`).
+
+## Known limitations carried forward to Phase 6
+
+- rmcp 30-second session keep-alive — mitigated at the handler
+  level with a 25s `tokio::time::timeout` on the confirm wait,
+  which converts the stall into a clean tool error rather than
+  letting rmcp tear down the transport mid-modal.
+- `subscribe` (Phase 4) still cuts out after ~30s idle — Phase 6
+  or a later polish pass will add a periodic heartbeat
+  notification from the spawned task.
+- LLM-driven tool-call escape semantics — documented above as an
+  LLM-side quirk. Nothing actionable in ccom.
