@@ -1,3 +1,4 @@
+mod attach;
 mod keys;
 mod render;
 
@@ -34,6 +35,14 @@ pub enum AppMode {
     /// confirmation. The pending request lives in
     /// `App::pending_confirm`.
     McpConfirm,
+    /// Phase 6 Task 5: sub-picker overlay that lists live drivers so
+    /// the user can attach a target session to one of them. Entered
+    /// from `SessionPicker` via `a`; `target_session_id` is the
+    /// session that will be added to the chosen driver's
+    /// `attachment_map` entry.
+    AttachDriverPicker {
+        target_session_id: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +340,19 @@ impl App {
                 }
             }
             Event::SessionExited { session_id, code } => {
+                // Phase 6 Task 5: if the exited session was a driver,
+                // drop its attachment set so stale entries don't
+                // linger. Reads the role before mutating status so
+                // the check still sees `Driver` regardless of the
+                // exit order. Also scrubs the id from any OTHER
+                // driver's attachment set — an attached session
+                // going away should leave the attacher's list clean.
+                let was_driver = self
+                    .sessions_lock()
+                    .get(session_id)
+                    .map(|s| matches!(s.role, SessionRole::Driver { .. }))
+                    .unwrap_or(false);
+                self.scrub_attachments_for_exited(session_id, was_driver);
                 if let Some(session) = self.sessions_lock().get_mut(session_id) {
                     session.status = SessionStatus::Exited(code);
                 }
@@ -470,6 +492,76 @@ impl App {
         if let Some(session) = self.sessions_lock().selected_mut() {
             session.try_write(b"\x1b[B\x1b[B\r");
         }
+    }
+
+    // --- Phase 6 Task 5: driver attachment helpers ---
+
+    /// Returns the set of alive drivers in manager order as
+    /// `(id, label)` tuples. Used by the attach sub-picker for both
+    /// the overlay listing and the Enter-commits path.
+    pub(crate) fn live_drivers(&self) -> Vec<(usize, String)> {
+        self.sessions_lock()
+            .iter()
+            .filter(|s| {
+                matches!(s.role, SessionRole::Driver { .. })
+                    && !matches!(s.status, SessionStatus::Exited(_))
+            })
+            .map(|s| (s.id, s.label.clone()))
+            .collect()
+    }
+
+    pub(crate) fn live_driver_count(&self) -> usize {
+        self.live_drivers().len()
+    }
+
+    pub(crate) fn nth_live_driver(&self, n: usize) -> Option<(usize, String)> {
+        self.live_drivers().into_iter().nth(n)
+    }
+
+    /// Switch to the attach-driver sub-picker if any live drivers
+    /// exist. If not, surface a status message and stay put.
+    pub(crate) fn open_attach_driver_picker(&mut self, target_session_id: usize) {
+        if self.live_drivers().is_empty() {
+            self.status_message = Some("No active drivers — launch ccom with --driver".to_string());
+            return;
+        }
+        self.picker_selected = 0;
+        self.mode = AppMode::AttachDriverPicker { target_session_id };
+    }
+
+    /// Add `target` to `driver`'s attachment set. Idempotent. No-op
+    /// with a logged warning if `driver` doesn't point at a live
+    /// driver session.
+    pub(crate) fn attach_session_to_driver(&mut self, driver_id: usize, target: usize) {
+        let is_live_driver = self
+            .sessions_lock()
+            .get(driver_id)
+            .map(|s| {
+                matches!(s.role, SessionRole::Driver { .. })
+                    && !matches!(s.status, SessionStatus::Exited(_))
+            })
+            .unwrap_or(false);
+        if !is_live_driver {
+            log::warn!("attach_session_to_driver: {driver_id} is not a live driver");
+            return;
+        }
+        let mut map = self
+            .attachment_map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        attach::attach(&mut map, driver_id, target);
+    }
+
+    /// Invoked from the `SessionExited` handler. If the exited session
+    /// was a driver, drop its entry entirely; either way, scrub its
+    /// id from any OTHER driver's attachment set so references don't
+    /// linger after reaping.
+    pub(crate) fn scrub_attachments_for_exited(&mut self, id: usize, was_driver: bool) {
+        let mut map = self
+            .attachment_map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        attach::scrub_on_exit(&mut map, id, was_driver);
     }
 
     fn kill_selected(&mut self) {

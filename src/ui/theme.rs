@@ -204,6 +204,33 @@ impl Theme {
     pub fn is_rainbow(&self) -> bool {
         self.name == ThemeName::Rainbow
     }
+
+    // --- Phase 6 Task 7: driver/tree row glyphs ---
+    //
+    // Glyphs are theme-invariant so each accessor returns a static
+    // string literal. The colors reuse the existing `accent` (for
+    // the driver row) and `dim` (for the parent-label / budget
+    // suffix) so every theme picks up sensible values for free.
+
+    pub fn driver_icon(&self) -> &'static str {
+        "\u{25c6} " // `◆ `
+    }
+
+    pub fn child_icon(&self) -> &'static str {
+        "\u{2514}\u{2500} " // `└─ `
+    }
+
+    pub fn attached_icon(&self) -> &'static str {
+        "\u{21aa} " // `↪ `
+    }
+
+    pub fn driver_color(&self) -> Color {
+        self.accent
+    }
+
+    pub fn dim_color(&self) -> Color {
+        self.dim
+    }
 }
 
 // --- Rainbow border rendering ---

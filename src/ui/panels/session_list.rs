@@ -1,10 +1,13 @@
+use std::collections::{HashMap, HashSet};
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
-use ratatui::style::Style;
-use ratatui::text::Span;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, Widget};
 
-use crate::session::{Session, SessionStatus};
+use crate::session::{Session, SessionRole, SessionStatus, SpawnPolicy};
+use crate::ui::panels::session_tree::{TreeRow, build_session_tree};
 use crate::ui::theme::{self, Theme};
 
 pub struct SessionListPanel<'a> {
@@ -13,6 +16,7 @@ pub struct SessionListPanel<'a> {
     focused: bool,
     theme: &'a Theme,
     tick: u64,
+    attachments: HashMap<usize, HashSet<usize>>,
 }
 
 impl<'a> SessionListPanel<'a> {
@@ -29,7 +33,34 @@ impl<'a> SessionListPanel<'a> {
             focused,
             theme,
             tick,
+            attachments: HashMap::new(),
         }
+    }
+
+    /// Phase 6 Task 7: pass the driver-attachment snapshot so the
+    /// tree builder can group attached sessions under their driver.
+    /// Caller snapshots `App.attachment_map` under the mutex and
+    /// drops the lock before constructing the panel.
+    pub fn with_attachments(mut self, attachments: HashMap<usize, HashSet<usize>>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+}
+
+/// Phase 6 Task 7: render a driver session's budget/policy suffix
+/// (e.g. ` [driver · budget 3]`). Returns an empty string for non-
+/// driver roles so the caller can unconditionally append.
+fn driver_suffix(role: &SessionRole) -> String {
+    match role {
+        SessionRole::Solo => String::new(),
+        SessionRole::Driver {
+            spawn_budget,
+            spawn_policy,
+        } => match spawn_policy {
+            SpawnPolicy::Budget => format!(" [driver · budget {spawn_budget}]"),
+            SpawnPolicy::Ask => " [driver · ask]".to_string(),
+            SpawnPolicy::Trust => " [driver · trust]".to_string(),
+        },
     }
 }
 
@@ -51,11 +82,61 @@ impl Widget for SessionListPanel<'_> {
             .style(th.header())
             .bottom_margin(1);
 
-        let rows: Vec<Row> = self
-            .sessions
+        // Phase 6 Task 7: group sessions into driver-rooted subtrees
+        // once per render. The attachments snapshot was already
+        // cloned out from under the mutex by the caller.
+        let tree = build_session_tree(self.sessions, &self.attachments);
+
+        let rows: Vec<Row> = tree
             .iter()
-            .enumerate()
-            .map(|(i, session)| {
+            .map(|row| {
+                // Unpack per-row tree info into the underlying slice
+                // index + decoration decisions for the label cell.
+                let (i, label_line) = match *row {
+                    TreeRow::Driver { index } => {
+                        let session = &self.sessions[index];
+                        let suffix = driver_suffix(&session.role);
+                        let line = Line::from(vec![
+                            Span::styled(th.driver_icon(), Style::default().fg(th.driver_color())),
+                            Span::styled(
+                                session.label.clone(),
+                                Style::default()
+                                    .fg(th.driver_color())
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(suffix, Style::default().fg(th.dim_color())),
+                        ]);
+                        (index, line)
+                    }
+                    TreeRow::Child {
+                        parent_index,
+                        index,
+                        attached,
+                    } => {
+                        let session = &self.sessions[index];
+                        let parent = &self.sessions[parent_index];
+                        let icon = if attached {
+                            th.attached_icon()
+                        } else {
+                            th.child_icon()
+                        };
+                        let line = Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(icon, Style::default().fg(th.dim_color())),
+                            Span::raw(session.label.clone()),
+                            Span::styled(
+                                format!(" (parent: {})", parent.label),
+                                Style::default().fg(th.dim_color()),
+                            ),
+                        ]);
+                        (index, line)
+                    }
+                    TreeRow::Solo { index } => {
+                        let session = &self.sessions[index];
+                        (index, Line::raw(session.label.clone()))
+                    }
+                };
+                let session = &self.sessions[i];
                 let status_str = match &session.status {
                     SessionStatus::Running => "working".to_string(),
                     SessionStatus::WaitingForApproval(kind) => format!("\u{26a1} {kind}"),
@@ -106,7 +187,7 @@ impl Widget for SessionListPanel<'_> {
 
                 Row::new(vec![
                     Cell::from(format!("{}", session.id)),
-                    Cell::from(session.label.clone()),
+                    Cell::from(label_line),
                     Cell::from(dir),
                     Cell::from(Span::styled(status_str, status_style)),
                     Cell::from(Span::styled(context_str, context_style)),
