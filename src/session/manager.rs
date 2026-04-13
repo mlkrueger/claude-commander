@@ -2178,6 +2178,8 @@ mod test_support {
             next_turn_id: 0,
             response_store: crate::session::ResponseStore::new(),
             reader_handle: None,
+            role: crate::session::types::SessionRole::Solo,
+            spawned_by: None,
             hook_dir: None,
             hook_rx: None,
             hook_reader_handle: None,

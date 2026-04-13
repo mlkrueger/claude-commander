@@ -28,6 +28,75 @@ pub enum SessionStatus {
     Exited(i32),
 }
 
+/// Session role — Phase 6. `Solo` is every Phase 1–5 session (no
+/// spawning privileges, no scope restrictions). `Driver` is a session
+/// that may call `spawn_session` via MCP, gated by a [`SpawnPolicy`].
+///
+/// The `spawn_budget` on `Driver` is a remaining-silent-spawns counter
+/// used by `SpawnPolicy::Budget`: decremented on each silent spawn,
+/// falls back to [`SpawnPolicy::Ask`] once it hits zero. Irrelevant
+/// when the policy is `Ask` or `Trust`.
+///
+/// Nesting cap: v1 forbids drivers spawning drivers (`spawn_session`
+/// always creates `Solo` children). See `docs/plans/phase-6-driver-role.md`
+/// §Architecture for rationale.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+// `Driver` is only constructed by Task 2 (`driver_config`) onward,
+// so rustc's per-binary reachability check flags it as dead code in
+// the bin target until Task 2 lands. Same allow pattern used on
+// `SUBMIT_SEQUENCE` in `manager.rs` for the same reason.
+#[allow(dead_code)]
+pub enum SessionRole {
+    /// The default role — matches all Phase 1–5 behavior. Solo
+    /// sessions can be managed by the user from the TUI but cannot
+    /// call driver-only MCP tools (`spawn_session`).
+    #[default]
+    Solo,
+    /// A fleet-orchestrator session. Can spawn, prompt, read, and
+    /// kill its own children + explicitly attached sessions with no
+    /// confirmation fatigue (gated by `spawn_policy`).
+    Driver {
+        /// Remaining silent spawns allowed under
+        /// [`SpawnPolicy::Budget`]. Decrementing is the job of
+        /// `spawn_session`'s handler, holding the sessions mutex.
+        /// Meaningless for `Ask` / `Trust` — left at 0 in those cases
+        /// by convention.
+        spawn_budget: u32,
+        /// Policy lever controlling whether each spawn prompts the
+        /// user. See [`SpawnPolicy`] for the three modes.
+        spawn_policy: SpawnPolicy,
+    },
+}
+
+/// Driver spawn policy — Phase 6 §Architecture. Three modes from
+/// strictest to loosest:
+///
+/// - `Ask`: modal on every spawn. Safe for untrusted drivers.
+/// - `Budget`: pre-authorize N silent spawns, then fall back to `Ask`.
+///   Recommended default.
+/// - `Trust`: silent; opt-in per driver run.
+///
+/// These correspond 1:1 to the `--spawn-policy` CLI enum that Task 2
+/// wires up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// Same per-binary-reachability rationale as `SessionRole::Driver`:
+// `Budget` and `Trust` are only referenced once Task 2's config
+// surface lands.
+#[allow(dead_code)]
+pub enum SpawnPolicy {
+    /// Modal confirmation on every `spawn_session` call. The safe
+    /// default when no policy is specified.
+    #[default]
+    Ask,
+    /// Silent until the driver's `spawn_budget` hits zero, then
+    /// fall back to `Ask` behavior. The recommended default for
+    /// interactive fleet orchestration.
+    Budget,
+    /// Never prompt — always silent. Use only for trusted drivers
+    /// spun up in the current shell session.
+    Trust,
+}
+
 pub struct Session {
     pub id: usize,
     pub label: String,
@@ -66,6 +135,24 @@ pub struct Session {
     /// initialization in `make_dummy_session`.
     pub(super) response_store: ResponseStore,
     pub(super) reader_handle: Option<JoinHandle<()>>,
+    /// Phase 6 session role. [`SessionRole::Solo`] for every Phase
+    /// 1–5 session and for children spawned by drivers; only the
+    /// distinguished driver session (created via `--driver` on the
+    /// ccom CLI) carries `SessionRole::Driver { .. }`. Controls
+    /// access to `spawn_session` and the scope filter on every
+    /// other MCP tool.
+    ///
+    /// Mutable on the manager side because `SpawnPolicy::Budget`
+    /// decrements `spawn_budget` on each silent spawn — the handler
+    /// holds the sessions mutex across the check-and-decrement to
+    /// avoid double-charging concurrent tool calls (Phase 6 Risk #4).
+    pub role: SessionRole,
+    /// Id of the session that spawned this one via `spawn_session`,
+    /// if any. `None` for the top-level driver itself, for Solo
+    /// sessions created from the TUI, and for sessions that were
+    /// created before Phase 6. Used by the scope helper to build
+    /// a driver's implicit "own children" set.
+    pub spawned_by: Option<usize>,
     /// Per-session hook directory (Phase 3.5). `Some` for Claude
     /// sessions that have a Stop hook installed; `None` for Terminal
     /// sessions.
@@ -293,6 +380,16 @@ impl Session {
             next_turn_id: 0,
             response_store: ResponseStore::new(),
             reader_handle: Some(handle),
+            // Phase 6 Task 1: every freshly spawned session is Solo
+            // by default. Drivers are promoted after construction by
+            // `SessionManager::set_driver_role` (Task 2 / 3 plumbing),
+            // and children created via `spawn_session` have their
+            // `spawned_by` set by the same helper. Leaving the
+            // positional signature of `Session::spawn` untouched
+            // keeps every existing call site (including the 16
+            // `SpawnConfig { .. }` literals across tests) unchanged.
+            role: SessionRole::Solo,
+            spawned_by: None,
             hook_dir,
             hook_rx,
             hook_reader_handle,
@@ -565,10 +662,40 @@ impl Session {
             next_turn_id: 0,
             response_store: ResponseStore::new(),
             reader_handle: None,
+            role: SessionRole::Solo,
+            spawned_by: None,
             hook_dir: None,
             hook_rx: None,
             hook_reader_handle: None,
         }
+    }
+
+    /// Phase 6 test helper: promote a `dummy_exited` session to a
+    /// driver role in a single chained call. Returns `self` so
+    /// fixtures can write
+    /// `Session::dummy_exited(1, "orch").with_role(SessionRole::Driver { .. })`
+    /// without the five-line struct-update dance.
+    ///
+    /// Production code should NOT use this — drivers are created via
+    /// the Task 2/3 plumbing that routes through `SessionManager` so
+    /// the spawned-by bookkeeping stays consistent. This helper exists
+    /// purely so unit tests and integration fixtures can build
+    /// non-default-role sessions without a real PTY.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_role(mut self, role: SessionRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// Companion to [`Self::with_role`]: set the spawned-by pointer.
+    /// Same test-only rationale — production spawn paths go through
+    /// the manager.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_spawned_by(mut self, parent: usize) -> Self {
+        self.spawned_by = Some(parent);
+        self
     }
 }
 
@@ -703,6 +830,77 @@ mod tests {
             let id = s.allocate_turn_id();
             assert!(seen.insert(id), "TurnId {id:?} was reused");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 6 Task 1 — session role / spawned_by defaults.
+    //
+    // These pin the three invariants the Phase 6 plan calls out:
+    // 1. Every freshly constructed session defaults to Solo role.
+    // 2. Every freshly constructed session has spawned_by = None.
+    // 3. The with_role/with_spawned_by builders on dummy_exited produce
+    //    driver variants correctly for use as test fixtures downstream.
+    //
+    // If any of these break, the scope-resolution logic in Tasks 3/4/6
+    // will silently mis-classify sessions — a Driver-looking Solo or a
+    // Solo-looking Driver is exactly the kind of bug that only surfaces
+    // at the MCP boundary where we don't want it.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn session_role_defaults_to_solo() {
+        let s = Session::dummy_exited(1, "a");
+        assert_eq!(s.role, SessionRole::Solo);
+    }
+
+    #[test]
+    fn session_spawned_by_defaults_to_none() {
+        let s = Session::dummy_exited(1, "a");
+        assert_eq!(s.spawned_by, None);
+    }
+
+    #[test]
+    fn with_role_promotes_to_driver() {
+        let s = Session::dummy_exited(1, "orchestrator").with_role(SessionRole::Driver {
+            spawn_budget: 5,
+            spawn_policy: SpawnPolicy::Budget,
+        });
+        assert_eq!(
+            s.role,
+            SessionRole::Driver {
+                spawn_budget: 5,
+                spawn_policy: SpawnPolicy::Budget,
+            },
+        );
+        // Idempotence of the ADJACENT field: promoting the role must
+        // NOT touch spawned_by, because drivers themselves have no
+        // parent and Task 3's attachment flow builds the child-set
+        // from spawned_by — corrupting it here would make children
+        // invisible to their own driver.
+        assert_eq!(s.spawned_by, None);
+    }
+
+    #[test]
+    fn with_spawned_by_sets_parent_pointer() {
+        let child = Session::dummy_exited(2, "child").with_spawned_by(1);
+        assert_eq!(child.spawned_by, Some(1));
+        // spawned_by alone does NOT promote to Driver — children are
+        // always Solo under the v1 nesting cap.
+        assert_eq!(child.role, SessionRole::Solo);
+    }
+
+    #[test]
+    fn spawn_policy_defaults_to_ask() {
+        // The `SpawnPolicy::default()` implementation is a load-bearing
+        // safety property: if config loading falls back to the default
+        // (no CLI flag, no TOML), we get the strictest policy, not
+        // silent auto-spawning.
+        assert_eq!(SpawnPolicy::default(), SpawnPolicy::Ask);
+    }
+
+    #[test]
+    fn session_role_default_matches_solo() {
+        assert_eq!(SessionRole::default(), SessionRole::Solo);
     }
 
     #[test]
