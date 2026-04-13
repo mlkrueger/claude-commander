@@ -2,6 +2,7 @@ mod app;
 mod claude;
 mod event;
 mod fs;
+mod mcp;
 mod pty;
 mod session;
 mod setup;
@@ -41,7 +42,39 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    // TUI mode: env_logger writes to stderr by default, which
+    // interleaves with ratatui's alternate-screen draw output and
+    // visibly corrupts the TUI. Redirect all log output to a file
+    // in the system temp dir instead.
+    //
+    // Also bumps rmcp logs to `warn` so the routine
+    // "session keep alive timeout after 30000ms" / "Session service
+    // terminated" messages (which rmcp 1.4 emits at ERROR level on
+    // normal idle-teardown of an MCP session) don't spam the log
+    // file either. Upgrade to `info` or drop the filter entirely
+    // via `RUST_LOG` when actively debugging MCP.
+    let log_path = std::env::temp_dir().join(format!("ccom-{}.log", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            let _ = env_logger::Builder::from_env(
+                env_logger::Env::default().default_filter_or("info,rmcp=warn"),
+            )
+            .target(env_logger::Target::Pipe(Box::new(file)))
+            .try_init();
+        }
+        Err(_) => {
+            // Fall back to a no-op stderr logger if we can't open
+            // the file — better to lose logs than corrupt the TUI.
+            let _ =
+                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("off"))
+                    .try_init();
+        }
+    }
+    log::info!("ccom starting; log file: {}", log_path.display());
 
     let cli = Cli::parse();
     let working_dir = cli.dir.canonicalize().unwrap_or_else(|_| cli.dir.clone());
@@ -97,12 +130,24 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    for session in app.sessions.iter_mut() {
-        session.kill();
+    {
+        let mut mgr = app.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        for session in mgr.iter_mut() {
+            session.kill();
+        }
     }
     drop(events);
-    for session in app.sessions.iter_mut() {
-        session.join_reader(Duration::from_millis(500));
+    {
+        let mut mgr = app.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        for session in mgr.iter_mut() {
+            session.join_reader(Duration::from_millis(500));
+        }
+    }
+
+    // Stop the embedded MCP server before clearing the terminal so
+    // any log::error! on orphan thread teardown still reaches stderr.
+    if let Some(mcp) = app.mcp.take() {
+        mcp.stop();
     }
 
     disable_raw_mode()?;

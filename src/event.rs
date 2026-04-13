@@ -33,7 +33,28 @@ impl MonitoredSender {
 
     pub fn send(&self, event: Event) -> Result<(), mpsc::SendError<Event>> {
         self.inner.send(event)?;
-        let d = self.depth.fetch_add(1, Ordering::Relaxed) + 1;
+        // `fetch_add` wraps per atomic spec; the `saturating_add` on
+        // the returned old value prevents a debug-mode panic on the
+        // `old + 1` arithmetic in the (theoretically impossible but
+        // seen in the wild — see below) case where the counter has
+        // underflowed past 0 into `usize::MAX`.
+        //
+        // This counter is **observability only** (threshold warning);
+        // the channel itself is unbounded mpsc and doesn't rely on
+        // the count being correct. If the arithmetic goes sideways
+        // the worst case is a missed warning, not data loss.
+        //
+        // Root cause of the observed underflow is unclear —
+        // decrement sites (`next_timeout`, `try_next`) both gate
+        // on a successful `recv`, so they should match increment
+        // sites 1:1. Possibilities: (a) a cloned sender outlived
+        // the receiver, letting a late `send` increment after the
+        // receiver side already processed all events; (b) signed
+        // / unsigned confusion somewhere upstream. Since the
+        // counter is advisory, `saturating_add` + `saturating_sub`
+        // make the bug non-fatal while we investigate.
+        let old = self.depth.fetch_add(1, Ordering::Relaxed);
+        let d = old.saturating_add(1);
         if d == DEPTH_WARNING_THRESHOLD {
             log::warn!("event channel depth reached {d} — possible backpressure");
         }
@@ -108,13 +129,36 @@ impl EventCollector {
 
     pub fn next_timeout(&self, timeout: Duration) -> Option<Event> {
         let event = self.rx.recv_timeout(timeout).ok()?;
-        self.depth.fetch_sub(1, Ordering::Relaxed);
+        saturating_dec(&self.depth);
         Some(event)
     }
 
     pub fn try_next(&self) -> Option<Event> {
         let event = self.rx.try_recv().ok()?;
-        self.depth.fetch_sub(1, Ordering::Relaxed);
+        saturating_dec(&self.depth);
         Some(event)
+    }
+}
+
+/// Decrement the depth counter without wrapping past 0. Uses a
+/// compare-and-swap loop so concurrent senders and the single
+/// receiver can't race the counter into `usize::MAX`. This is
+/// advisory observability — we care about keeping it in a sensible
+/// range, not strict accuracy.
+fn saturating_dec(counter: &AtomicUsize) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == 0 {
+            return;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
     }
 }

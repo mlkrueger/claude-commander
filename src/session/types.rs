@@ -90,6 +90,7 @@ impl Session {
         cols: u16,
         rows: u16,
         install_hook: bool,
+        mcp_port: Option<u16>,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pty_size = PtySize {
@@ -101,20 +102,33 @@ impl Session {
 
         let pair = pty_system.openpty(pty_size)?;
 
-        let mut cmd = CommandBuilder::new(command);
-        cmd.args(args);
-        cmd.cwd(&working_dir);
-
-        // Phase 3.5: install the per-session Stop hook for Claude
-        // sessions. Creates a temp dir with `.claude/settings.json`
-        // and a FIFO, spawns a sidecar reader thread, and points
-        // Claude Code at the temp dir via `CLAUDE_CONFIG_DIR`.
+        // Phase 3.5/4: set up the per-session hook directory BEFORE
+        // building the command, so we can inject `--settings` and
+        // `--mcp-config` flags pointing at files in the hook dir.
+        //
+        // Design history (the hard-won part):
+        //
+        // - The original Phase 3.5 approach set `CLAUDE_CONFIG_DIR`
+        //   to a symlinked temp dir. This worked in the spike but
+        //   broke in production because Claude Code stores
+        //   credentials in the macOS Keychain bound to the config
+        //   dir path — changing `CLAUDE_CONFIG_DIR` invalidates the
+        //   Keychain binding and forces a fresh OAuth flow every
+        //   session. Symlinking everything except `settings.json`
+        //   didn't help because the Keychain ACL is path-based, not
+        //   file-system-based.
+        //
+        // - The fix: use Claude Code's `--settings <file>` and
+        //   `--mcp-config <file>` CLI flags, which load additional
+        //   config from explicit paths WITHOUT moving
+        //   `CLAUDE_CONFIG_DIR`. The user's real `~/.claude/` stays
+        //   the source of truth for auth and everything else; our
+        //   hook + MCP config merge on top via the CLI-flag-loaded
+        //   files.
         //
         // M7: hook-based boundary detection is Unix-only (relies on
-        // mkfifo + blocking open semantics). Gate the entire branch
-        // behind `cfg(unix)` so non-Unix builds fail early with a
-        // clear error instead of deep inside `create_stop_fifo`.
-        let (hook_dir, hook_rx, hook_reader_handle) = if install_hook {
+        // mkfifo + blocking open semantics).
+        let (hook_dir, hook_rx, hook_reader_handle, extra_args) = if install_hook {
             #[cfg(unix)]
             {
                 let hook_dir = hook::create_hook_dir(id)?;
@@ -130,9 +144,36 @@ impl Session {
                         return Err(e.into());
                     }
                 };
-                cmd.env("CLAUDE_CONFIG_DIR", hook_dir.join(".claude"));
-                cmd.env("CCOM_SESSION_ID", id.to_string());
-                (Some(hook_dir), Some(rx), Some(handle))
+
+                // Collect extra CLI flags to pass to the Claude
+                // command. `--settings` points at the hook
+                // settings.json; `--mcp-config` points at the
+                // .mcp.json if the MCP server is running.
+                let mut flags: Vec<String> = Vec::new();
+                let settings_path = hook_dir.join("settings.json");
+                flags.push("--settings".to_string());
+                flags.push(settings_path.display().to_string());
+
+                // Phase 4 Task 6: if the MCP server is running, write
+                // a `.mcp.json` in the hook dir and pass it via
+                // `--mcp-config`. Best-effort — failure logs a
+                // warning but does not fail the spawn.
+                if let Some(port) = mcp_port {
+                    match hook::write_mcp_config(&hook_dir, port) {
+                        Ok(()) => {
+                            let mcp_config_path = hook_dir.join(".mcp.json");
+                            flags.push("--mcp-config".to_string());
+                            flags.push(mcp_config_path.display().to_string());
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "session {id} failed to write .mcp.json: {e} (MCP tools will be unavailable to this session)"
+                            );
+                        }
+                    }
+                }
+
+                (Some(hook_dir), Some(rx), Some(handle), flags)
             }
             #[cfg(not(unix))]
             {
@@ -141,8 +182,22 @@ impl Session {
                 ));
             }
         } else {
-            (None, None, None)
+            (None, None, None, Vec::<String>::new())
         };
+
+        let mut cmd = CommandBuilder::new(command);
+        // Append the hook-related flags after the caller-supplied
+        // args so they can be overridden if the caller already
+        // passed `--settings` or `--mcp-config` (unlikely, but
+        // don't silently stomp).
+        cmd.args(args);
+        for flag in &extra_args {
+            cmd.arg(flag);
+        }
+        cmd.cwd(&working_dir);
+        if install_hook {
+            cmd.env("CCOM_SESSION_ID", id.to_string());
+        }
 
         let child = match pair.slave.spawn_command(cmd) {
             Ok(child) => child,
@@ -479,8 +534,9 @@ impl Session {
     /// `writer`, and `child` fields are stub objects that panic if anything
     /// tries to drive them — tests that exercise lifecycle bookkeeping only
     /// (id/label/status/selection) should never touch them.
-    #[cfg(test)]
-    pub(crate) fn dummy_exited(id: usize, label: &str) -> Self {
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn dummy_exited(id: usize, label: &str) -> Self {
         use portable_pty::PtySize;
         use test_helpers::{DummyChild, DummyPty, DummyWriter};
 
@@ -516,8 +572,9 @@ impl Session {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_helpers {
+#[doc(hidden)]
+#[allow(dead_code)]
+pub mod test_helpers {
     use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
     use std::io::{Result as IoResult, Write};
 

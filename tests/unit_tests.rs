@@ -284,6 +284,7 @@ mod session_bus_integration {
                 cols: 80,
                 rows: 24,
                 install_hook: false,
+                mcp_port: None,
             })
             .expect("real spawn should succeed");
 
@@ -327,6 +328,7 @@ mod session_bus_integration {
                 cols: 80,
                 rows: 24,
                 install_hook: false,
+                mcp_port: None,
             })
             .expect("real spawn should succeed");
 
@@ -370,6 +372,7 @@ mod session_bus_integration {
                 cols: 80,
                 rows: 24,
                 install_hook: false,
+                mcp_port: None,
             })
             .expect("real spawn should succeed");
 
@@ -492,6 +495,7 @@ mod session_bus_integration {
                 cols: 80,
                 rows: 24,
                 install_hook: false,
+                mcp_port: None,
             })
             .expect("real spawn should succeed");
 
@@ -544,6 +548,7 @@ mod session_bus_integration {
                 cols: 80,
                 rows: 24,
                 install_hook: false,
+                mcp_port: None,
             })
             .expect("spawn a");
 
@@ -557,6 +562,7 @@ mod session_bus_integration {
                 cols: 80,
                 rows: 24,
                 install_hook: false,
+                mcp_port: None,
             })
             .expect("spawn b");
 
@@ -621,6 +627,7 @@ mod session_lifecycle {
                 cols: 80,
                 rows: 24,
                 install_hook: false,
+                mcp_port: None,
             })
             .expect("spawn should succeed");
 
@@ -671,6 +678,7 @@ mod session_lifecycle {
                 cols: 80,
                 rows: 24,
                 install_hook: false,
+                mcp_port: None,
             })
             .expect("spawn should succeed");
 
@@ -771,6 +779,7 @@ mod session_hook_integration {
             cols: 80,
             rows: 24,
             install_hook: true,
+            mcp_port: None,
         });
         if let Ok(id) = result {
             // Platform deferred the exec error. Kill the session so
@@ -848,6 +857,7 @@ mod session_hook_integration {
                 cols: 80,
                 rows: 24,
                 install_hook: true,
+                mcp_port: None,
             })
             .expect("spawn a");
         let id_b = manager
@@ -860,6 +870,7 @@ mod session_hook_integration {
                 cols: 80,
                 rows: 24,
                 install_hook: true,
+                mcp_port: None,
             })
             .expect("spawn b");
 
@@ -957,6 +968,7 @@ mod session_hook_integration {
                 cols: 80,
                 rows: 24,
                 install_hook: true,
+                mcp_port: None,
             })
             .expect("spawn");
 

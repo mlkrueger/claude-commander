@@ -4,7 +4,7 @@ mod render;
 use crate::event::MonitoredSender;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::claude::launcher;
@@ -90,9 +90,14 @@ pub enum PanelFocus {
 }
 
 pub struct App {
-    pub(crate) sessions: SessionManager,
+    pub(crate) sessions: Arc<Mutex<SessionManager>>,
     #[allow(dead_code)]
     pub(crate) event_bus: Arc<EventBus>,
+    /// Embedded MCP server running on loopback. `None` if startup
+    /// failed — the TUI still works without it, just without the
+    /// read-only tools. `take()`n in `main.rs` on shutdown so
+    /// `McpServer::stop` can consume it.
+    pub mcp: Option<crate::mcp::McpServer>,
     pub mode: AppMode,
     pub focus: PanelFocus,
     pub file_tree: FileTree,
@@ -132,6 +137,15 @@ const PTY_COL_OVERHEAD: u16 = 34;
 const PTY_ROW_OVERHEAD: u16 = 3;
 
 impl App {
+    /// Lock the shared `SessionManager`, recovering transparently if a
+    /// previous holder panicked (matches the `Arc<Mutex<EventBus>>`
+    /// poison-recovery pattern in `src/session/events.rs`). App is
+    /// single-threaded, so lock contention is impossible in practice —
+    /// the mutex exists solely so the MCP thread can snapshot state.
+    pub(crate) fn sessions_lock(&self) -> MutexGuard<'_, SessionManager> {
+        self.sessions.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     pub fn new(event_tx: MonitoredSender, working_dir: PathBuf) -> Self {
         let file_tree = FileTree::new(working_dir.clone());
         let git_status = git::get_git_status(&working_dir);
@@ -144,9 +158,31 @@ impl App {
             AppMode::Dashboard
         };
         let event_bus = Arc::new(EventBus::new());
+        let sessions = Arc::new(Mutex::new(SessionManager::with_bus(Arc::clone(&event_bus))));
+
+        // Start the embedded MCP server. Failure is non-fatal — the
+        // TUI remains functional, just without the read-only tools.
+        let mcp = {
+            let ctx = Arc::new(crate::mcp::ReadOnlyCtx {
+                sessions: Arc::clone(&sessions),
+                bus: Arc::clone(&event_bus),
+            });
+            match crate::mcp::McpServer::start(ctx) {
+                Ok(server) => {
+                    log::info!("ccom-mcp server listening on 127.0.0.1:{}", server.port());
+                    Some(server)
+                }
+                Err(e) => {
+                    log::error!("ccom-mcp server failed to start: {e}");
+                    None
+                }
+            }
+        };
+
         Self {
-            sessions: SessionManager::with_bus(Arc::clone(&event_bus)),
+            sessions,
             event_bus,
+            mcp,
             mode: initial_mode,
             focus: PanelFocus::SessionList,
             file_tree,
@@ -185,10 +221,13 @@ impl App {
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::PtyOutput { session_id, data } => {
-                if let Some(session) = self.sessions.get_mut(session_id) {
-                    session.last_activity = Instant::now();
+                {
+                    let mut mgr = self.sessions_lock();
+                    if let Some(session) = mgr.get_mut(session_id) {
+                        session.last_activity = Instant::now();
+                    }
+                    mgr.feed_pty_data(session_id, &data);
                 }
-                self.sessions.feed_pty_data(session_id, &data);
                 if let AppMode::SessionView(id) = self.mode
                     && id == session_id
                     && !self.user_scrolled
@@ -205,17 +244,17 @@ impl App {
                 if self.last_git_refresh.elapsed() > GIT_REFRESH_INTERVAL {
                     self.git_status = git::get_git_status(&self.file_tree.root.path);
                     self.last_git_refresh = Instant::now();
-                    self.sessions.refresh_contexts();
+                    self.sessions_lock().refresh_contexts();
                 }
                 if self.last_usage_refresh.elapsed() > USAGE_REFRESH_INTERVAL {
                     self.rate_limit = rate_limit::get_rate_limit_info()
                         .or_else(rate_limit::get_rate_limit_from_telemetry);
                     self.last_usage_refresh = Instant::now();
                 }
-                self.sessions.reap_exited();
+                self.sessions_lock().reap_exited();
             }
             Event::SessionExited { session_id, code } => {
-                if let Some(session) = self.sessions.get_mut(session_id) {
+                if let Some(session) = self.sessions_lock().get_mut(session_id) {
                     session.status = SessionStatus::Exited(code);
                 }
                 if self.mode == AppMode::SessionView(session_id) {
@@ -225,12 +264,13 @@ impl App {
             Event::Resize(cols, rows) => {
                 self.terminal_cols = cols;
                 self.terminal_rows = rows;
-                if let AppMode::SessionView(id) = self.mode
-                    && let Some(session) = self.sessions.get_mut(id)
-                {
-                    let inner_rows = rows.saturating_sub(PTY_ROW_OVERHEAD);
-                    let inner_cols = cols.saturating_sub(2);
-                    session.try_resize(inner_cols, inner_rows);
+                if let AppMode::SessionView(id) = self.mode {
+                    let mut mgr = self.sessions_lock();
+                    if let Some(session) = mgr.get_mut(id) {
+                        let inner_rows = rows.saturating_sub(PTY_ROW_OVERHEAD);
+                        let inner_cols = cols.saturating_sub(2);
+                        session.try_resize(inner_cols, inner_rows);
+                    }
                 }
             }
         }
@@ -256,7 +296,7 @@ impl App {
         extra_args: Vec<String>,
         initial_prompt: Option<String>,
     ) {
-        let next_id = self.sessions.peek_next_id();
+        let next_id = self.sessions_lock().peek_next_id();
         let (cmd_owned, args, label): (String, Vec<String>, String) = match kind {
             SessionKind::Claude => {
                 let mut a: Vec<String> = launcher::claude_args()
@@ -284,6 +324,14 @@ impl App {
         let rows = self.terminal_rows.saturating_sub(PTY_ROW_OVERHEAD).max(10);
 
         let install_hook = matches!(kind, SessionKind::Claude);
+        // Only Claude sessions get a `.mcp.json` — Terminal sessions
+        // don't know what to do with MCP. Mirrors the `install_hook`
+        // gating.
+        let mcp_port = if install_hook {
+            self.mcp.as_ref().map(|s| s.port())
+        } else {
+            None
+        };
         let config = SpawnConfig {
             label,
             working_dir,
@@ -293,9 +341,11 @@ impl App {
             cols,
             rows,
             install_hook,
+            mcp_port,
         };
 
-        match self.sessions.spawn(config) {
+        let spawn_res = self.sessions_lock().spawn(config);
+        match spawn_res {
             Ok(_id) => {
                 self.update_file_tree_for_selected();
             }
@@ -307,34 +357,43 @@ impl App {
     }
 
     fn approve_selected(&mut self) {
-        if let Some(session) = self.sessions.selected_mut() {
+        if let Some(session) = self.sessions_lock().selected_mut() {
             session.try_write(b"\r");
         }
     }
 
     fn deny_selected(&mut self) {
-        if let Some(session) = self.sessions.selected_mut() {
+        if let Some(session) = self.sessions_lock().selected_mut() {
             session.try_write(b"\x1b[B\x1b[B\r");
         }
     }
 
     fn kill_selected(&mut self) {
-        let id = self.sessions.selected().map(|s| s.id);
+        let mut mgr = self.sessions_lock();
+        let id = mgr.selected().map(|s| s.id);
         if let Some(id) = id {
-            self.sessions.kill(id);
+            mgr.kill(id);
         }
     }
 
     fn send_commit_prompt(&mut self) {
-        if let Some(session) = self.sessions.selected_mut() {
-            session.try_write(b"/commit\n");
-            let label = session.label.clone();
+        let label = {
+            let mut mgr = self.sessions_lock();
+            match mgr.selected_mut() {
+                Some(session) => {
+                    session.try_write(b"/commit\n");
+                    Some(session.label.clone())
+                }
+                None => None,
+            }
+        };
+        if let Some(label) = label {
             self.status_message = Some(format!("Sent /commit to {label}"));
         }
     }
 
     fn clear_dead_sessions(&mut self) {
-        self.sessions.retain_alive();
+        self.sessions_lock().retain_alive();
     }
 
     fn open_editor(&mut self, path: PathBuf) {
@@ -352,15 +411,22 @@ impl App {
     fn send_file_to_session(&mut self, idx: usize) {
         let file_path = self.editor.as_ref().map(|e| e.file_path.clone());
         if let Some(path) = file_path {
-            let session_id = self.sessions.iter().nth(idx).map(|s| s.id);
-            if let Some(id) = session_id {
-                if let Some(session) = self.sessions.get_mut(id) {
-                    let msg = format!("Read the file at {}\n", path.display());
-                    session.try_write(msg.as_bytes());
-                    let label = session.label.clone();
-                    if let Some(editor) = &mut self.editor {
-                        editor.message = Some(format!("Sent to session {label}"));
-                    }
+            // Returns Some(label) if the write went through, None if the
+            // idx didn't resolve to a live session.
+            let sent_label: Option<String> = {
+                let mut mgr = self.sessions_lock();
+                let session_id = mgr.iter().nth(idx).map(|s| s.id);
+                session_id.and_then(|id| {
+                    mgr.get_mut(id).map(|session| {
+                        let msg = format!("Read the file at {}\n", path.display());
+                        session.try_write(msg.as_bytes());
+                        session.label.clone()
+                    })
+                })
+            };
+            if let Some(label) = sent_label {
+                if let Some(editor) = &mut self.editor {
+                    editor.message = Some(format!("Sent to session {label}"));
                 }
             } else if let Some(editor) = &mut self.editor {
                 editor.message = Some(format!("No session at index {idx}"));
@@ -479,7 +545,7 @@ impl App {
         let home = dirs::home_dir().unwrap_or_else(|| self.working_dir.clone());
         self.spawn_session_with_prompt(home, vec![], Some(prompt));
 
-        let session_id = self.sessions.selected().map(|s| s.id);
+        let session_id = self.sessions_lock().selected().map(|s| s.id);
 
         if let Some(id) = session_id {
             setup::mark_initialized();
@@ -491,20 +557,24 @@ impl App {
     }
 
     fn check_all_attention(&mut self) {
-        self.sessions.check_attention(&self.detector);
-        self.sessions.check_hook_signals();
-        self.sessions.check_response_boundaries();
+        let mut mgr = self.sessions_lock();
+        mgr.check_attention(&self.detector);
+        mgr.check_hook_signals();
+        mgr.check_response_boundaries();
     }
 
     fn update_file_tree_for_selected(&mut self) {
-        if let Some(session) = self.sessions.selected() {
-            let dir = session.working_dir.clone();
-            if dir != self.file_tree.root.path {
-                self.file_tree.set_root(dir.clone());
-                self.file_tree_scroll = 0;
-                self.git_status = git::get_git_status(&dir);
-                self.last_git_refresh = Instant::now();
-            }
+        let dir = self
+            .sessions_lock()
+            .selected()
+            .map(|session| session.working_dir.clone());
+        if let Some(dir) = dir
+            && dir != self.file_tree.root.path
+        {
+            self.file_tree.set_root(dir.clone());
+            self.file_tree_scroll = 0;
+            self.git_status = git::get_git_status(&dir);
+            self.last_git_refresh = Instant::now();
         }
     }
 
@@ -518,15 +588,11 @@ impl App {
     }
 
     fn session_dirs(&self) -> Vec<PathBuf> {
-        self.sessions
+        self.sessions_lock()
             .iter()
             .filter(|s| !matches!(s.status, SessionStatus::Exited(_)))
             .map(|s| s.working_dir.clone())
             .collect()
-    }
-
-    fn sel_idx_or_zero(&self) -> usize {
-        self.sessions.selected_index().unwrap_or(0)
     }
 }
 
