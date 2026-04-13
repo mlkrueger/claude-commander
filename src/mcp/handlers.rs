@@ -608,6 +608,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(mgr)),
             bus,
             confirm: None,
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -622,6 +623,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(mgr)),
             bus,
             confirm: None,
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -704,6 +706,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(mgr)),
             bus: Arc::clone(&bus),
             confirm: None,
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
         });
 
         // Before the turn is pushed, ctx.get_response returns None —

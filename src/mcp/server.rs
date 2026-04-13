@@ -106,6 +106,7 @@ impl McpServer {
             sessions,
             bus,
             confirm: None,
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }))
     }
 
@@ -132,6 +133,7 @@ impl McpServer {
             sessions,
             bus,
             confirm: Some(bridge),
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
         });
         let server = Self::start(ctx)?;
         Ok((server, rx))
@@ -261,6 +263,7 @@ mod tests {
             sessions,
             bus,
             confirm: None,
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 

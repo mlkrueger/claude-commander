@@ -3,6 +3,7 @@ mod render;
 
 use crate::event::MonitoredSender;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -147,6 +148,27 @@ pub struct App {
     /// `--driver` is passed. `take()`n on first use so subsequent
     /// spawns stay `Solo`.
     pub pending_driver_role: Option<SessionRole>,
+    /// Phase 6 prelude: explicit driver-to-attached-session mapping.
+    /// Keyed by driver session id → set of session ids the user
+    /// has manually attached to that driver via the TUI's attach-to
+    /// -driver action (Task 5). Separate from parent/child spawning:
+    /// attachments are user-initiated and visible to the driver's
+    /// MCP scope filter in addition to its own `spawned_by` children.
+    ///
+    /// Stored as `Arc<Mutex<..>>` rather than plain `HashMap` because
+    /// the MCP server thread needs read access for `McpCtx::caller_scope`,
+    /// and the TUI thread needs write access for attach/detach +
+    /// on-driver-exit cleanup. The shared-pointer contract is
+    /// load-bearing: App owns the only write path, the MCP thread
+    /// observes snapshots. Same memory — no divergence possible.
+    ///
+    /// `#[allow(dead_code)]` until Task 5's attach-to-driver key
+    /// handler lands — at that point the field becomes the TUI's
+    /// write path. The `Arc` clone in `App::new` hands it to
+    /// `McpCtx::attachments`, which already exists but is also
+    /// unread until Task 4's `caller_scope` body replaces the stub.
+    #[allow(dead_code)]
+    pub(crate) attachment_map: Arc<Mutex<HashMap<usize, HashSet<usize>>>>,
 }
 
 const ATTENTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -179,6 +201,14 @@ impl App {
         let event_bus = Arc::new(EventBus::new());
         let sessions = Arc::new(Mutex::new(SessionManager::with_bus(Arc::clone(&event_bus))));
 
+        // Phase 6 prelude: shared driver-attachment map. App is the
+        // only writer (attach/detach + on-driver-exit cleanup); the
+        // `ccom-mcp` thread reads through `McpCtx::caller_scope` when
+        // resolving a driver caller's visible session set. Same
+        // `Arc<Mutex<_>>` on both sides, so there's no divergence.
+        let attachment_map: Arc<Mutex<HashMap<usize, HashSet<usize>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         // Phase 5: cross-thread confirmation bridge for write tools.
         // The bridge's receiver is drained each tick by `handle_event`;
         // the sender side lives on `McpCtx` so tool handlers on the
@@ -192,6 +222,7 @@ impl App {
                 sessions: Arc::clone(&sessions),
                 bus: Arc::clone(&event_bus),
                 confirm: Some(Arc::clone(&confirm_bridge)),
+                attachments: Arc::clone(&attachment_map),
             });
             match crate::mcp::McpServer::start(ctx) {
                 Ok(server) => {
@@ -242,6 +273,7 @@ impl App {
             tick_count: 0,
             picker_selected: 0,
             pending_driver_role: None,
+            attachment_map,
         }
     }
 
@@ -385,20 +417,36 @@ impl App {
             mcp_port,
         };
 
-        let spawn_res = self.sessions_lock().spawn(config);
+        // Phase 6 prelude (pr-review-pr18 §Issue 1): route through
+        // `SessionManager::spawn_with_role`, which performs the
+        // session creation + role promotion as a single atomic
+        // operation under one sessions-mutex acquisition. Fixes the
+        // TOCTOU window where an MCP-thread observer could otherwise
+        // snapshot the new session with `role = Solo` between a
+        // `spawn()` and a subsequent `set_role()`.
+        //
+        // `pending_driver_role` is `take()`n BEFORE acquiring the
+        // lock because `self.sessions_lock()` borrows `&self` for
+        // the guard's lifetime. On spawn failure the role is put
+        // back so a subsequent retry can still consume it.
+        let pending_role = if matches!(kind, SessionKind::Claude) {
+            self.pending_driver_role.take()
+        } else {
+            None
+        };
+        if let Some(role) = pending_role.as_ref() {
+            log::info!("promoting next Claude spawn to driver role: {role:?}");
+        }
+        let spawn_res = self
+            .sessions_lock()
+            .spawn_with_role(config, pending_role.clone(), None);
+        if spawn_res.is_err()
+            && let Some(role) = pending_role
+        {
+            self.pending_driver_role = Some(role);
+        }
         match spawn_res {
-            Ok(id) => {
-                // Phase 6 Task 2: if a pending driver role is
-                // queued and this is a Claude session, promote it
-                // in-place. `take()` ensures only the first Claude
-                // spawn is promoted — subsequent spawns (including
-                // any further `--spawn N` startup spawns) stay Solo.
-                if matches!(kind, SessionKind::Claude)
-                    && let Some(role) = self.pending_driver_role.take()
-                {
-                    log::info!("promoting session {id} to driver role: {role:?}");
-                    self.sessions_lock().set_role(id, role);
-                }
+            Ok(_id) => {
                 self.update_file_tree_for_selected();
             }
             Err(e) => {

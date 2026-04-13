@@ -11,10 +11,15 @@
 //! `SessionSummary` / `StoredTurn` values, release the lock, then
 //! return.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use super::confirm::ConfirmBridge;
-use crate::session::{EventBus, SessionManager, StoredTurn, TurnId};
+// `SessionRole` will be consumed by Task 4 when `caller_scope` gains
+// the real body; kept on the import line + suppressed so the MCP
+// subagent doesn't have to add it back.
+#[allow(unused_imports)]
+use crate::session::{EventBus, SessionManager, SessionRole, StoredTurn, TurnId};
 
 /// Shared context handed to each MCP tool handler instance.
 ///
@@ -40,6 +45,56 @@ pub struct McpCtx {
     pub sessions: Arc<Mutex<SessionManager>>,
     pub bus: Arc<EventBus>,
     pub confirm: Option<Arc<ConfirmBridge>>,
+    /// Phase 6 prelude: shared driver-attachment map. Keyed by
+    /// driver session id → set of session ids the user has manually
+    /// attached to that driver via the TUI (Task 5). Read by
+    /// `caller_scope` when resolving a driver caller's visible set;
+    /// written only by the main TUI thread. Same `Arc<Mutex<_>>` as
+    /// `App::attachment_map` — the shared-pointer contract is
+    /// load-bearing.
+    ///
+    /// `#[allow(dead_code)]` because the bin-target reachability
+    /// graph doesn't see the real reader until Task 4's
+    /// `caller_scope` body lands. Test constructors and tests in
+    /// `state.rs` already reference it, but those don't satisfy
+    /// the bin lint on their own.
+    #[allow(dead_code)]
+    pub attachments: Arc<Mutex<HashMap<usize, HashSet<usize>>>>,
+}
+
+/// Phase 6 prelude: MCP caller scope — the set of session ids a
+/// tool call is allowed to see and touch.
+///
+/// Resolved by [`McpCtx::caller_scope`]. Currently returns
+/// [`Scope::Full`] for every caller (the full-fledged role-based
+/// logic lands in Task 4, which reads `Session::role`, unions in
+/// `spawned_by` children, and adds explicit attachments). Stubbed
+/// now so the type surface is in place for the MCP-side subagent
+/// to consume without the TUI-side subagent needing coordinated
+/// edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Scope {
+    /// Solo caller — may observe and mutate every session in the
+    /// manager (the Phase 1–5 default, and currently the only
+    /// path the stub returns).
+    Full,
+    /// Driver caller — restricted to the explicit set of session
+    /// ids this driver owns (via `spawned_by`) or has attached
+    /// (via the shared attachment map).
+    Restricted(HashSet<usize>),
+}
+
+#[allow(dead_code)]
+impl Scope {
+    /// Convenience: does this scope permit access to `session_id`?
+    /// `Full` always permits; `Restricted` checks membership.
+    pub fn permits(&self, session_id: usize) -> bool {
+        match self {
+            Self::Full => true,
+            Self::Restricted(set) => set.contains(&session_id),
+        }
+    }
 }
 
 /// Snapshot of a single session for `list_sessions` MCP tool.
@@ -110,6 +165,30 @@ impl McpCtx {
         mgr.send_prompt(session_id, text)
             .map_err(|_| SendPromptRejection::NotFound)
     }
+
+    /// Phase 6 prelude — STUB. Resolve a caller ccom session id to
+    /// the `Scope` of sessions it may see and touch.
+    ///
+    /// Current behavior: returns [`Scope::Full`] for every caller.
+    /// This is the type-surface placeholder — Task 4's subagent will
+    /// replace the body with the real role-based logic:
+    ///
+    /// - Solo caller (or caller not found in the manager) → `Full`
+    /// - Driver caller → `Restricted(own_children ∪ attachments)`
+    ///
+    /// Keeping the stub in place now lets the MCP-side subagent's
+    /// scope-filter work (gated on this return value) compile and
+    /// pass tests before the real logic lands — tests that need
+    /// actual filtering will construct `Scope::Restricted(..)`
+    /// directly in fixtures and bypass this helper.
+    ///
+    /// `caller_id` is currently ignored; `_` to silence the lint.
+    #[allow(dead_code)]
+    pub fn caller_scope(&self, _caller_id: usize) -> Scope {
+        // Task 4: read caller's `SessionRole`, branch on
+        // Solo → Full, Driver → Restricted(..); for now, punt.
+        Scope::Full
+    }
 }
 
 /// Reasons the `send_prompt` MCP tool may refuse to deliver a prompt.
@@ -138,6 +217,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(mgr)),
             bus,
             confirm: None,
+            attachments: Arc::new(Mutex::new(HashMap::new())),
         };
         assert!(ctx.list_sessions().is_empty());
     }
@@ -155,6 +235,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(mgr)),
             bus,
             confirm: None,
+            attachments: Arc::new(Mutex::new(HashMap::new())),
         };
         let summaries = ctx.list_sessions();
         assert_eq!(summaries.len(), 2);
