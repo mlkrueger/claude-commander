@@ -57,6 +57,11 @@ pub enum ConfirmTool {
     /// that policy reverses.
     SendPrompt,
     KillSession,
+    /// Phase 6 Task 3: a driver called `spawn_session` and its
+    /// `SpawnPolicy` requires user confirmation (either `Ask`, or
+    /// `Budget` after the budget was exhausted). The modal should
+    /// show the proposed child label and working dir.
+    SpawnSession,
 }
 
 /// Response from the user after seeing the modal.

@@ -15,10 +15,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use super::confirm::ConfirmBridge;
-// `SessionRole` will be consumed by Task 4 when `caller_scope` gains
-// the real body; kept on the import line + suppressed so the MCP
-// subagent doesn't have to add it back.
-#[allow(unused_imports)]
 use crate::session::{EventBus, SessionManager, SessionRole, StoredTurn, TurnId};
 
 /// Shared context handed to each MCP tool handler instance.
@@ -60,6 +56,13 @@ pub struct McpCtx {
     /// the bin lint on their own.
     #[allow(dead_code)]
     pub attachments: Arc<Mutex<HashMap<usize, HashSet<usize>>>>,
+    /// Phase 6 Task 3: event channel the `spawn_session` handler
+    /// hands to newly-spawned sessions via their `SpawnConfig`. Same
+    /// sender App uses for its own spawns — so PTY output from
+    /// MCP-created sessions reaches the main TUI event loop. `None`
+    /// in test contexts that never exercise `spawn_session`.
+    #[allow(dead_code)]
+    pub event_tx: Option<crate::event::MonitoredSender>,
 }
 
 /// Phase 6 prelude: MCP caller scope — the set of session ids a
@@ -182,12 +185,49 @@ impl McpCtx {
     /// actual filtering will construct `Scope::Restricted(..)`
     /// directly in fixtures and bypass this helper.
     ///
-    /// `caller_id` is currently ignored; `_` to silence the lint.
-    #[allow(dead_code)]
-    pub fn caller_scope(&self, _caller_id: usize) -> Scope {
-        // Task 4: read caller's `SessionRole`, branch on
-        // Solo → Full, Driver → Restricted(..); for now, punt.
-        Scope::Full
+    /// Resolve a caller ccom session id to its [`Scope`].
+    ///
+    /// - Solo caller → [`Scope::Full`] (the Phase 1–5 default).
+    /// - Driver caller → [`Scope::Restricted`] containing the driver
+    ///   itself, every session with `spawned_by == Some(caller_id)`,
+    ///   and every id in the shared attachment map under the
+    ///   driver's entry (populated by the TUI in Task 5).
+    /// - Unknown caller id → [`Scope::Full`]. This is the legacy
+    ///   pre-Phase-6 path for MCP clients that don't set the
+    ///   `X-Ccom-Caller` header (direct HTTP clients, unit tests) —
+    ///   they continue to see every session as before.
+    pub fn caller_scope(&self, caller_id: usize) -> Scope {
+        let mgr = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(caller) = mgr.get(caller_id) else {
+            return Scope::Full;
+        };
+        match &caller.role {
+            SessionRole::Solo => Scope::Full,
+            SessionRole::Driver { .. } => {
+                // Driver owns every session it spawned plus itself.
+                // Spawned-by is the ground-truth parent pointer set
+                // atomically in `SessionManager::spawn_with_role`.
+                let mut scope: HashSet<usize> = mgr
+                    .iter()
+                    .filter(|s| s.spawned_by == Some(caller_id))
+                    .map(|s| s.id)
+                    .collect();
+                scope.insert(caller_id);
+                // Merge in any explicit attachments from the TUI side
+                // (Task 5). The attachment map is the shared
+                // `Arc<Mutex<_>>` owned by `App` — writes happen only
+                // on the main thread; we just read a snapshot here.
+                if let Some(attached) = self
+                    .attachments
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&caller_id)
+                {
+                    scope.extend(attached.iter().copied());
+                }
+                Scope::Restricted(scope)
+            }
+        }
     }
 }
 
@@ -207,7 +247,18 @@ pub enum SendPromptRejection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Session, SessionManager};
+    use crate::session::{Session, SessionManager, SpawnPolicy};
+
+    fn driver_ctx_with(sessions: SessionManager) -> Arc<McpCtx> {
+        let bus = Arc::new(EventBus::new());
+        Arc::new(McpCtx {
+            sessions: Arc::new(Mutex::new(sessions)),
+            bus,
+            confirm: None,
+            attachments: Arc::new(Mutex::new(HashMap::new())),
+            event_tx: None,
+        })
+    }
 
     #[test]
     fn list_sessions_empty_returns_empty_vec() {
@@ -218,6 +269,7 @@ mod tests {
             bus,
             confirm: None,
             attachments: Arc::new(Mutex::new(HashMap::new())),
+            event_tx: None,
         };
         assert!(ctx.list_sessions().is_empty());
     }
@@ -236,6 +288,7 @@ mod tests {
             bus,
             confirm: None,
             attachments: Arc::new(Mutex::new(HashMap::new())),
+            event_tx: None,
         };
         let summaries = ctx.list_sessions();
         assert_eq!(summaries.len(), 2);
@@ -246,5 +299,106 @@ mod tests {
         // `Session::dummy_exited` starts in Exited(0), which the
         // summary renders via the `Debug` impl of `SessionStatus`.
         assert!(summaries[0].status.contains("Exited"));
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 6 Task 4 — `caller_scope` unit tests.
+    //
+    // Every test pushes sessions via `push_for_test` (which bumps
+    // `next_id` past the pushed id) and then consults `caller_scope`
+    // directly. The attachment map is reached through `McpCtx`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn caller_scope_returns_full_for_solo_caller() {
+        let mut mgr = SessionManager::new();
+        mgr.push_for_test(Session::dummy_exited(1, "solo"));
+        let ctx = driver_ctx_with(mgr);
+        assert_eq!(ctx.caller_scope(1), Scope::Full);
+    }
+
+    #[test]
+    fn caller_scope_returns_full_for_unknown_caller_id() {
+        // Legacy path: no header, or an id the manager doesn't know.
+        let ctx = driver_ctx_with(SessionManager::new());
+        assert_eq!(ctx.caller_scope(999), Scope::Full);
+    }
+
+    #[test]
+    fn caller_scope_returns_restricted_for_driver_caller() {
+        let mut mgr = SessionManager::new();
+        mgr.push_for_test(
+            Session::dummy_exited(1, "orch").with_role(SessionRole::Driver {
+                spawn_budget: 2,
+                spawn_policy: SpawnPolicy::Budget,
+            }),
+        );
+        let ctx = driver_ctx_with(mgr);
+        match ctx.caller_scope(1) {
+            Scope::Restricted(set) => assert!(set.contains(&1)),
+            other => panic!("expected Restricted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caller_scope_includes_driver_itself() {
+        let mut mgr = SessionManager::new();
+        mgr.push_for_test(
+            Session::dummy_exited(7, "orch").with_role(SessionRole::Driver {
+                spawn_budget: 0,
+                spawn_policy: SpawnPolicy::Ask,
+            }),
+        );
+        let ctx = driver_ctx_with(mgr);
+        let scope = ctx.caller_scope(7);
+        assert!(
+            scope.permits(7),
+            "driver must be in its own scope: {scope:?}"
+        );
+    }
+
+    #[test]
+    fn caller_scope_includes_spawned_by_children() {
+        let mut mgr = SessionManager::new();
+        mgr.push_for_test(
+            Session::dummy_exited(1, "orch").with_role(SessionRole::Driver {
+                spawn_budget: 5,
+                spawn_policy: SpawnPolicy::Trust,
+            }),
+        );
+        mgr.push_for_test(Session::dummy_exited(2, "child-a").with_spawned_by(1));
+        mgr.push_for_test(Session::dummy_exited(3, "child-b").with_spawned_by(1));
+        // Unrelated peer, NOT spawned by the driver.
+        mgr.push_for_test(Session::dummy_exited(4, "stranger"));
+
+        let ctx = driver_ctx_with(mgr);
+        let scope = ctx.caller_scope(1);
+        assert!(scope.permits(1));
+        assert!(scope.permits(2));
+        assert!(scope.permits(3));
+        assert!(
+            !scope.permits(4),
+            "stranger must not be in scope: {scope:?}"
+        );
+    }
+
+    #[test]
+    fn caller_scope_includes_attachments() {
+        let mut mgr = SessionManager::new();
+        mgr.push_for_test(
+            Session::dummy_exited(1, "orch").with_role(SessionRole::Driver {
+                spawn_budget: 0,
+                spawn_policy: SpawnPolicy::Ask,
+            }),
+        );
+        mgr.push_for_test(Session::dummy_exited(9, "attached-peer"));
+        let ctx = driver_ctx_with(mgr);
+        // Simulate the TUI attaching session 9 to driver 1.
+        {
+            let mut map = ctx.attachments.lock().unwrap();
+            map.entry(1).or_default().insert(9);
+        }
+        let scope = ctx.caller_scope(1);
+        assert!(scope.permits(9));
     }
 }

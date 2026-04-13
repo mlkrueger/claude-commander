@@ -266,20 +266,16 @@ pub fn create_hook_dir(_session_id: usize) -> std::io::Result<PathBuf> {
 /// File is written mode 0600 via `create_new` to avoid overwriting
 /// anything pre-existing.
 #[cfg(unix)]
-pub fn write_mcp_config(hook_dir: &Path, port: u16) -> std::io::Result<()> {
+pub fn write_mcp_config(
+    hook_dir: &Path,
+    port: u16,
+    caller_id: Option<usize>,
+) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
     let path = hook_dir.join(".mcp.json");
-    let contents = serde_json::json!({
-        "mcpServers": {
-            "ccom": {
-                "type": "http",
-                "url": format!("http://127.0.0.1:{port}/mcp"),
-            }
-        }
-    })
-    .to_string();
+    let contents = build_mcp_config_json(port, caller_id);
 
     let mut f = fs::OpenOptions::new()
         .create_new(true)
@@ -290,8 +286,45 @@ pub fn write_mcp_config(hook_dir: &Path, port: u16) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Phase 6 Task 3: build the `.mcp.json` body string. Split out
+/// from the Unix-gated file writer so the JSON shape (especially
+/// the optional `headers.X-Ccom-Caller` injection) can be unit
+/// tested without touching the filesystem.
+///
+/// When `caller_id` is `Some`, a `"headers": { "X-Ccom-Caller": "<id>" }`
+/// block is added to the `ccom` server entry. Claude Code propagates
+/// the header on every tool-call POST, which lets the in-process
+/// MCP server identify which ccom session is calling it — the
+/// load-bearing mechanism behind driver-role scoping.
+pub(crate) fn build_mcp_config_json(port: u16, caller_id: Option<usize>) -> String {
+    let mut server = serde_json::Map::new();
+    server.insert("type".to_string(), serde_json::json!("http"));
+    server.insert(
+        "url".to_string(),
+        serde_json::json!(format!("http://127.0.0.1:{port}/mcp")),
+    );
+    if let Some(id) = caller_id {
+        let mut headers = serde_json::Map::new();
+        headers.insert(
+            "X-Ccom-Caller".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
+        server.insert("headers".to_string(), serde_json::Value::Object(headers));
+    }
+    serde_json::json!({
+        "mcpServers": {
+            "ccom": serde_json::Value::Object(server),
+        }
+    })
+    .to_string()
+}
+
 #[cfg(not(unix))]
-pub fn write_mcp_config(_hook_dir: &Path, _port: u16) -> std::io::Result<()> {
+pub fn write_mcp_config(
+    _hook_dir: &Path,
+    _port: u16,
+    _caller_id: Option<usize>,
+) -> std::io::Result<()> {
     Err(std::io::Error::other(
         ".mcp.json injection is only supported on Unix",
     ))
@@ -879,5 +912,31 @@ mod tests {
         assert_eq!(signal.last_assistant_message, "recovered");
 
         cleanup_hook_dir(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 6 Task 3 — `.mcp.json` JSON shape for the caller-id header.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn mcp_config_without_caller_id_has_no_headers_block() {
+        let json = build_mcp_config_json(1234, None);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let server = &parsed["mcpServers"]["ccom"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "http://127.0.0.1:1234/mcp");
+        assert!(
+            server.get("headers").is_none(),
+            "headers block must be absent when caller_id is None: {json}"
+        );
+    }
+
+    #[test]
+    fn mcp_config_with_caller_id_injects_header() {
+        let json = build_mcp_config_json(4321, Some(42));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let server = &parsed["mcpServers"]["ccom"];
+        assert_eq!(server["url"], "http://127.0.0.1:4321/mcp");
+        assert_eq!(server["headers"]["X-Ccom-Caller"], "42");
     }
 }
