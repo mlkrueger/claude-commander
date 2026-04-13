@@ -18,6 +18,11 @@ mod server;
 mod state;
 
 pub use server::McpServer;
+// `ReadOnlyCtx` is constructed in `src/app/mod.rs` via
+// `crate::mcp::ReadOnlyCtx { .. }`. Rustc's unused-imports lint
+// flags the `pub(crate) use` below even though removing it
+// breaks the build — this is a known false positive for
+// re-exports of items in private child modules. The `#[allow]`
+// is targeted and small.
 #[allow(unused_imports)]
-// used via full path `crate::mcp::ReadOnlyCtx` in app; retained for ergonomic imports in Task 5
 pub(crate) use state::ReadOnlyCtx;

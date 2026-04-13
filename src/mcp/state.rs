@@ -22,7 +22,6 @@ use crate::session::{EventBus, SessionManager, StoredTurn, TurnId};
 /// and the `ccom-mcp` thread. The `bus` is already `Arc<EventBus>`
 /// from Phase 1 — no extra wrapping.
 #[derive(Clone)]
-#[allow(dead_code)] // `sessions` / `bus` are read by Task 5 tool handlers
 pub struct ReadOnlyCtx {
     pub sessions: Arc<Mutex<SessionManager>>,
     pub bus: Arc<EventBus>,
@@ -34,7 +33,6 @@ pub struct ReadOnlyCtx {
 /// [`SessionManager::iter`] under a short critical section so the
 /// tool handler returns after releasing the session lock.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
-#[allow(dead_code)] // constructed in Task 5a `list_sessions` handler
 pub struct SessionSummary {
     pub id: usize,
     pub label: String,
@@ -44,7 +42,6 @@ pub struct SessionSummary {
     pub context_percent: Option<f64>,
 }
 
-#[allow(dead_code)] // first production caller is Task 5a/5b MCP tool handlers
 impl ReadOnlyCtx {
     /// Snapshot every live session into a `Vec<SessionSummary>`.
     /// Called by the `list_sessions` MCP tool. The lock is held only

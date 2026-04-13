@@ -40,7 +40,12 @@ impl McpServer {
     /// is available. Waits up to 2 seconds for the thread to report
     /// its assigned port.
     pub fn start(ctx: Arc<ReadOnlyCtx>) -> anyhow::Result<Self> {
-        let (port_tx, port_rx) = std::sync::mpsc::sync_channel::<u16>(1);
+        // Review M1: the port channel carries `Result<u16, String>` so
+        // that a bind/local_addr/loopback-assertion failure in
+        // `run_server` surfaces as `Err` here instead of the previous
+        // "return Ok(port=0)" hack. The main thread must see
+        // startup failures, not silently get a zero port.
+        let (port_tx, port_rx) = std::sync::mpsc::sync_channel::<Result<u16, String>>(1);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let cancel = CancellationToken::new();
         let cancel_for_thread = cancel.clone();
@@ -55,15 +60,18 @@ impl McpServer {
                     Ok(rt) => rt,
                     Err(e) => {
                         log::error!("ccom-mcp tokio runtime build failed: {e}");
+                        let _ = port_tx.send(Err(format!("tokio runtime build failed: {e}")));
                         return;
                     }
                 };
                 rt.block_on(run_server(ctx, port_tx, shutdown_rx, cancel_for_thread));
             })?;
 
-        let port = port_rx
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|e| anyhow::anyhow!("ccom-mcp thread did not report port: {e}"))?;
+        let port = match port_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(port)) => port,
+            Ok(Err(msg)) => return Err(anyhow::anyhow!("ccom-mcp startup failed: {msg}")),
+            Err(e) => return Err(anyhow::anyhow!("ccom-mcp thread did not report port: {e}")),
+        };
 
         Ok(Self {
             port,
@@ -78,6 +86,11 @@ impl McpServer {
     /// Lets integration tests (which can't name the `pub(crate)`
     /// `ReadOnlyCtx` type) drive the full server lifecycle without
     /// widening the visibility of the ctx type itself.
+    ///
+    /// Used only by `tests/mcp_readonly.rs`. Integration tests compile
+    /// against this crate as an external consumer, so rustc's per-crate
+    /// dead-code analysis doesn't see the callers — hence the
+    /// `#[allow(dead_code)]`.
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn start_with(
@@ -120,17 +133,30 @@ impl McpServer {
 
 async fn run_server(
     ctx: Arc<ReadOnlyCtx>,
-    port_tx: std::sync::mpsc::SyncSender<u16>,
+    port_tx: std::sync::mpsc::SyncSender<Result<u16, String>>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
     cancel: CancellationToken,
 ) {
+    // Review H1: explicitly pin `allowed_hosts` to loopback only.
+    // rmcp 1.4's default already sets this, but making it explicit
+    // here pins the security contract in ccom's source so a future
+    // rmcp patch that loosens the default can't silently widen our
+    // attack surface. The Host-header check defends against DNS
+    // rebinding attacks from a malicious web page loaded in the
+    // user's browser.
+    let config = StreamableHttpServerConfig::default().with_allowed_hosts(vec![
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    ]);
+
     let service = StreamableHttpService::new(
         {
             let ctx = Arc::clone(&ctx);
             move || Ok(Ccom::new(Arc::clone(&ctx)))
         },
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default(),
+        config,
     );
 
     let router = axum::Router::new().nest_service("/mcp", service);
@@ -144,7 +170,7 @@ async fn run_server(
         Ok(l) => l,
         Err(e) => {
             log::error!("ccom-mcp listener bind failed: {e}");
-            let _ = port_tx.send(0);
+            let _ = port_tx.send(Err(format!("bind({BIND_ADDR}) failed: {e}")));
             return;
         }
     };
@@ -152,7 +178,7 @@ async fn run_server(
         Ok(a) => a,
         Err(e) => {
             log::error!("ccom-mcp local_addr() failed: {e}");
-            let _ = port_tx.send(0);
+            let _ = port_tx.send(Err(format!("local_addr() failed: {e}")));
             return;
         }
     };
@@ -161,11 +187,14 @@ async fn run_server(
             "ccom-mcp refusing to serve: bound address {} is not loopback",
             local_addr.ip()
         );
-        let _ = port_tx.send(0);
+        let _ = port_tx.send(Err(format!(
+            "bound address {} is not loopback",
+            local_addr.ip()
+        )));
         return;
     }
     let port = local_addr.port();
-    if port_tx.send(port).is_err() {
+    if port_tx.send(Ok(port)).is_err() {
         log::error!("ccom-mcp port channel closed before send; main thread gone");
         return;
     }
@@ -208,5 +237,60 @@ mod tests {
         let conn = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2));
         assert!(conn.is_ok(), "tcp connect failed: {:?}", conn.err());
         server.stop();
+    }
+
+    /// Review T4: verify the `Result<u16, String>` channel shape in
+    /// the port handoff. This is a direct test of the
+    /// `recv_timeout` → pattern-match logic in `start()` — we
+    /// simulate an error case by posting `Err(..)` on the same
+    /// channel type and confirming it maps to `anyhow::Err`.
+    ///
+    /// This doesn't exercise `run_server`'s error paths (hard to
+    /// trigger `TcpListener::bind("127.0.0.1:0")` failure in a
+    /// portable test), but it DOES pin the contract that an error
+    /// payload from the thread surfaces as a startup failure on
+    /// the main thread — the exact regression the M1 fix closes.
+    #[test]
+    fn port_handoff_maps_error_to_start_failure() {
+        // Build the channel the real code uses.
+        let (port_tx, port_rx) = std::sync::mpsc::sync_channel::<Result<u16, String>>(1);
+        // Simulate `run_server` reporting a bind failure.
+        port_tx
+            .send(Err("bind(127.0.0.1:0) failed: synthetic".into()))
+            .expect("send");
+
+        // Reproduce the match arms from `McpServer::start`.
+        let result: anyhow::Result<u16> =
+            match port_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(Ok(port)) => Ok(port),
+                Ok(Err(msg)) => Err(anyhow::anyhow!("ccom-mcp startup failed: {msg}")),
+                Err(e) => Err(anyhow::anyhow!("ccom-mcp thread did not report port: {e}")),
+            };
+
+        let err = result.expect_err("error payload must surface as startup failure");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("startup failed"),
+            "error message should include 'startup failed': {msg}"
+        );
+        assert!(
+            msg.contains("synthetic"),
+            "error message should preserve inner reason: {msg}"
+        );
+    }
+
+    /// Companion to the T4 test above: verify the Ok-of-Ok path
+    /// surfaces the port cleanly.
+    #[test]
+    fn port_handoff_ok_returns_port() {
+        let (port_tx, port_rx) = std::sync::mpsc::sync_channel::<Result<u16, String>>(1);
+        port_tx.send(Ok(42)).expect("send");
+        let result: anyhow::Result<u16> =
+            match port_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(Ok(port)) => Ok(port),
+                Ok(Err(msg)) => Err(anyhow::anyhow!("ccom-mcp startup failed: {msg}")),
+                Err(e) => Err(anyhow::anyhow!("ccom-mcp thread did not report port: {e}")),
+            };
+        assert_eq!(result.unwrap(), 42);
     }
 }

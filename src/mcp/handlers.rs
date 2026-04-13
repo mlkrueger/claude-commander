@@ -259,15 +259,18 @@ impl Ccom {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        Err(McpError::internal_error(
-            format!(
-                "read_response timeout after {}s waiting for session {} turn {:?}",
-                timeout.as_secs(),
-                args.session_id,
-                args.turn_id,
-            ),
-            None,
-        ))
+        // Review H2: timeout is an expected outcome, not an internal
+        // bug. Surface it as a tool-level error result
+        // (`CallToolResult { is_error: true }`) so clients can
+        // distinguish "no response yet" from "server misbehaved".
+        // The payload is plain text explaining the timeout — no
+        // internal state leaked.
+        Ok(CallToolResult::error(vec![Content::text(format!(
+            "timeout after {}s waiting for session {} turn {:?}",
+            timeout.as_secs(),
+            args.session_id,
+            args.turn_id,
+        ))]))
     }
 
     #[tool(description = "Subscribe to session events. The tool call returns \
@@ -467,6 +470,107 @@ mod tests {
         let ctx = test_ctx_with_sessions();
         let result = ctx.get_response(1, Some(crate::session::TurnId::new(0)));
         assert!(result.is_none());
+    }
+
+    /// Review T2: exercise the `read_response` long-poll **success**
+    /// path. The fast path is covered by the populated-manager test
+    /// above, and the timeout path is covered by the integration test
+    /// in `tests/mcp_readonly.rs`. This test plugs the hole in the
+    /// middle — when a turn arrives on the bus mid-wait, the ctx
+    /// recheck returns the stored body.
+    ///
+    /// We can't directly invoke the `#[tool]`-wrapped `read_response`
+    /// method (the rmcp macros route through the router), so this
+    /// test reproduces the handler's subscribe → recheck sequence
+    /// against a real `SessionManager` driven by the synthetic
+    /// boundary detector.
+    #[tokio::test]
+    async fn read_response_long_poll_success_via_bus_wakeup() {
+        use crate::pty::response_boundary::ResponseBoundaryDetector;
+        use regex::Regex;
+
+        let bus = Arc::new(EventBus::new());
+        let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
+        mgr.set_boundary_detector_for_test(ResponseBoundaryDetector::new(
+            Regex::new(r"## DONE").unwrap(),
+        ));
+
+        // Spawn a real PTY-less stand-in and send a prompt to
+        // allocate a turn. `/bin/cat` echoes stdin so the detector
+        // will see the marker when we feed it.
+        let (raw_tx, _rx) = std::sync::mpsc::channel();
+        let event_tx = crate::event::MonitoredSender::wrap(raw_tx);
+        let id = mgr
+            .spawn(crate::session::SpawnConfig {
+                label: "t2".to_string(),
+                working_dir: std::path::PathBuf::from("/tmp"),
+                command: "/bin/cat",
+                args: vec![],
+                event_tx,
+                cols: 80,
+                rows: 24,
+                install_hook: false,
+                mcp_port: None,
+            })
+            .expect("spawn");
+        let turn_id = mgr.send_prompt(id, "ping").expect("send_prompt");
+
+        let ctx = Arc::new(ReadOnlyCtx {
+            sessions: Arc::new(Mutex::new(mgr)),
+            bus: Arc::clone(&bus),
+        });
+
+        // Before the turn is pushed, ctx.get_response returns None —
+        // the handler would fall into the long-poll branch.
+        assert!(ctx.get_response(id, Some(turn_id)).is_none());
+
+        // Subscribe first (mirrors the handler's TOCTOU-safe
+        // ordering).
+        let rx = ctx.bus.subscribe();
+
+        // Feed bytes containing the synthetic marker. The detector
+        // pushes the `StoredTurn` into the session's response store
+        // BEFORE publishing `ResponseComplete` on the bus.
+        {
+            let mut mgr = ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            mgr.feed_pty_data(id, b"hi there\n## DONE\n");
+            mgr.check_response_boundaries();
+        }
+
+        // Drain the bus and find the ResponseComplete for our turn.
+        let mut saw_complete = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::session::SessionEvent::ResponseComplete {
+                session_id,
+                turn_id: tid,
+            } = ev
+                && session_id == id
+                && tid == turn_id
+            {
+                saw_complete = true;
+                break;
+            }
+        }
+        assert!(saw_complete, "expected ResponseComplete on bus");
+
+        // The stored turn must be visible — this is the exact recheck
+        // the handler does after observing the event.
+        let stored = ctx
+            .get_response(id, Some(turn_id))
+            .expect("turn must be stored after ResponseComplete fires");
+        assert!(stored.completed_at.is_some());
+        let wire = StoredTurnWire::from(&stored);
+        assert_eq!(wire.turn_id, turn_id.0);
+        assert!(wire.completed);
+        assert!(
+            wire.body.contains("hi there"),
+            "body should contain the prompt echo, got: {:?}",
+            wire.body
+        );
+
+        // Clean up the real session.
+        let mut mgr = ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        mgr.kill(id);
     }
 
     #[test]
