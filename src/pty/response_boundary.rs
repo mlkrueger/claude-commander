@@ -237,7 +237,7 @@ impl ResponseBoundaryDetector {
 /// Not a full terminal emulator — just enough to make a response body
 /// human-readable for bus subscribers. The real TUI still parses
 /// through `vt100` for display purposes.
-fn ansi_strip(input: &str) -> String {
+pub(crate) fn ansi_strip(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

@@ -5,7 +5,7 @@
 //! on the `Ccom` handler struct. Each MCP session gets its own
 //! `Ccom` instance via the factory closure in
 //! [`super::server::run_server`]; the instance holds an
-//! `Arc<ReadOnlyCtx>` for shared state.
+//! `Arc<McpCtx>` for shared state.
 
 use std::sync::Arc;
 
@@ -18,17 +18,19 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 
-use super::state::ReadOnlyCtx;
+use super::confirm::{ConfirmResponse, ConfirmTool};
+use super::sanitize::sanitize_prompt_text;
+use super::state::{McpCtx, SendPromptRejection};
 
 /// Per-MCP-session tool handler. Constructed by the factory closure
 /// in [`super::server::run_server`] on every new MCP session, so
 /// instance-level state here is per-session (not shared across
-/// sessions). Cross-session state lives in [`ReadOnlyCtx`].
+/// sessions). Cross-session state lives in [`McpCtx`].
 #[derive(Clone)]
 pub struct Ccom {
     /// Shared ctx used by all tool handlers. `Arc<>` so the clone
     /// inside the factory closure is cheap.
-    pub(super) ctx: Arc<ReadOnlyCtx>,
+    pub(super) ctx: Arc<McpCtx>,
     /// Generated tool-router field required by the rmcp
     /// `#[tool_router]` macro. The field name is load-bearing — the
     /// macro reads it by name. Triggers a dead_code warning because
@@ -79,6 +81,33 @@ impl From<&crate::session::StoredTurn> for StoredTurnWire {
             completed: t.completed_at.is_some(),
         }
     }
+}
+
+/// Arguments for the `send_prompt` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SendPromptArgs {
+    /// The ccom session id to send the prompt to.
+    pub session_id: usize,
+    /// Prompt text. Sanitized before delivery: control chars stripped
+    /// (except `\n`/`\t`), ANSI escape sequences stripped, CR/CRLF
+    /// normalized to LF, max 16 KB.
+    pub text: String,
+}
+
+/// Wire-format reply for `send_prompt`. The domain [`crate::session::TurnId`]
+/// wraps a `pub(crate) u64`; this struct is the externally-visible
+/// projection.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct SendPromptWire {
+    pub turn_id: u64,
+}
+
+/// Arguments for the `kill_session` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct KillSessionArgs {
+    /// The ccom session id to kill. Scope-restricted: must be a
+    /// session currently owned by the TUI.
+    pub session_id: usize,
 }
 
 /// Arguments for the `subscribe` tool.
@@ -176,7 +205,7 @@ impl From<&crate::session::SessionEvent> for SessionEventWire {
 
 #[tool_router]
 impl Ccom {
-    pub(super) fn new(ctx: Arc<ReadOnlyCtx>) -> Self {
+    pub(super) fn new(ctx: Arc<McpCtx>) -> Self {
         Self {
             ctx,
             tool_router: Self::tool_router(),
@@ -271,6 +300,127 @@ impl Ccom {
             args.session_id,
             args.turn_id,
         ))]))
+    }
+
+    #[tool(description = "Send a prompt to a session. Returns the \
+                       allocated turn_id as JSON. Scope-restricted: \
+                       session_id must exist in the TUI. Text is \
+                       sanitized before delivery — ANSI escape \
+                       sequences stripped, control chars stripped \
+                       (except \\n/\\t), CR/CRLF normalized to LF, \
+                       max 16 KB.")]
+    async fn send_prompt(
+        &self,
+        Parameters(args): Parameters<SendPromptArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // 1. Sanitize the caller-supplied text. Policy violations
+        //    (empty, oversized, all-control) come back as plain
+        //    strings suitable for a tool-level error.
+        let sanitized = match sanitize_prompt_text(&args.text) {
+            Ok(t) => t,
+            Err(reason) => {
+                return Ok(CallToolResult::error(vec![Content::text(reason)]));
+            }
+        };
+
+        // 2. Scope-check against the TUI's SessionManager and dispatch.
+        match self.ctx.send_prompt(args.session_id, &sanitized) {
+            Ok(turn_id) => {
+                // `TurnId`'s inner `u64` is `pub(crate)` — same idiom
+                // as `StoredTurnWire::from`.
+                let wire = SendPromptWire { turn_id: turn_id.0 };
+                let json = serde_json::to_string(&wire).map_err(|e| {
+                    McpError::internal_error(format!("send_prompt serialize: {e}"), None)
+                })?;
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            Err(SendPromptRejection::NotFound) => Ok(CallToolResult::error(vec![Content::text(
+                format!("session {} not found", args.session_id),
+            )])),
+        }
+    }
+
+    #[tool(description = "Kill a session. Triggers a TUI confirmation \
+                       modal — the caller blocks until the user presses \
+                       y/n or Esc. Scope-restricted: session_id must \
+                       exist in the TUI's SessionManager. Returns a \
+                       success message after kill or a tool error on \
+                       denial / unknown session. The TUI modal has a \
+                       25-second window before auto-denying (prevents \
+                       rmcp's 30-second idle session timeout from \
+                       tearing the transport down mid-wait).")]
+    async fn kill_session(
+        &self,
+        Parameters(args): Parameters<KillSessionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // 1. Scope check: unknown session → NotFound without any
+        //    side effects and without raising a confirmation modal.
+        {
+            let mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if mgr.get(args.session_id).is_none() {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "session {} not found",
+                    args.session_id
+                ))]));
+            }
+        }
+
+        // 2. Request confirmation. If no bridge is wired (test-only
+        //    McpCtx construction) we auto-deny — safer than
+        //    auto-allowing destructive operations.
+        let Some(bridge) = self.ctx.confirm.as_ref() else {
+            log::warn!(
+                "kill_session({}): no confirm bridge on McpCtx, auto-denying",
+                args.session_id
+            );
+            return Ok(CallToolResult::error(vec![Content::text(
+                "kill_session denied: no confirm bridge wired",
+            )]));
+        };
+
+        // 3. Bound the wait so rmcp's 30s session keep-alive can't
+        //    tear the transport down mid-modal. 25s leaves headroom.
+        let request_fut = bridge.request(ConfirmTool::KillSession, args.session_id);
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(25), request_fut).await
+        {
+            Ok(resp) => resp,
+            Err(_elapsed) => {
+                log::warn!(
+                    "kill_session({}): confirm wait exceeded 25s, auto-denying",
+                    args.session_id
+                );
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "kill_session({}) timed out waiting for user confirmation",
+                    args.session_id
+                ))]));
+            }
+        };
+
+        // 4. Act on the user's answer.
+        match resp {
+            ConfirmResponse::Allow => {
+                let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                // Re-check the session — the user may have killed it
+                // manually in the TUI between the initial scope check
+                // and the confirmation arriving.
+                if mgr.get(args.session_id).is_some() {
+                    mgr.kill(args.session_id);
+                    Ok(CallToolResult::success(vec![Content::text(format!(
+                        "session {} killed",
+                        args.session_id
+                    ))]))
+                } else {
+                    Ok(CallToolResult::error(vec![Content::text(format!(
+                        "session {} was already gone by the time confirmation arrived",
+                        args.session_id
+                    ))]))
+                }
+            }
+            ConfirmResponse::Deny => Ok(CallToolResult::error(vec![Content::text(format!(
+                "kill_session({}) denied by user",
+                args.session_id
+            ))])),
+        }
     }
 
     #[tool(description = "Subscribe to session events. The tool call returns \
@@ -418,25 +568,27 @@ mod tests {
     use crate::session::{EventBus, Session, SessionManager};
     use std::sync::Mutex;
 
-    fn test_ctx() -> Arc<ReadOnlyCtx> {
+    fn test_ctx() -> Arc<McpCtx> {
         let bus = Arc::new(EventBus::new());
         let mgr = SessionManager::with_bus(Arc::clone(&bus));
-        Arc::new(ReadOnlyCtx {
+        Arc::new(McpCtx {
             sessions: Arc::new(Mutex::new(mgr)),
             bus,
+            confirm: None,
         })
     }
 
-    fn test_ctx_with_sessions() -> Arc<ReadOnlyCtx> {
+    fn test_ctx_with_sessions() -> Arc<McpCtx> {
         let bus = Arc::new(EventBus::new());
         let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
         let id_a = mgr.peek_next_id();
         mgr.push_for_test(Session::dummy_exited(id_a, "alpha"));
         let id_b = mgr.peek_next_id();
         mgr.push_for_test(Session::dummy_exited(id_b, "beta"));
-        Arc::new(ReadOnlyCtx {
+        Arc::new(McpCtx {
             sessions: Arc::new(Mutex::new(mgr)),
             bus,
+            confirm: None,
         })
     }
 
@@ -515,9 +667,10 @@ mod tests {
             .expect("spawn");
         let turn_id = mgr.send_prompt(id, "ping").expect("send_prompt");
 
-        let ctx = Arc::new(ReadOnlyCtx {
+        let ctx = Arc::new(McpCtx {
             sessions: Arc::new(Mutex::new(mgr)),
             bus: Arc::clone(&bus),
+            confirm: None,
         });
 
         // Before the turn is pushed, ctx.get_response returns None —
@@ -647,6 +800,27 @@ mod tests {
         assert!(json.contains("\"type\":\"response_complete\""));
         assert!(json.contains("\"session_id\":42"));
         assert!(json.contains("\"turn_id\":7"));
+    }
+
+    #[test]
+    fn send_prompt_returns_not_found_for_unknown_session() {
+        // Ctx-level scope check — the handler body short-circuits on
+        // this and never touches the PTY.
+        let ctx = test_ctx();
+        match ctx.send_prompt(999, "hi") {
+            Err(SendPromptRejection::NotFound) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_prompt_sanitizer_rejects_empty_before_dispatch() {
+        // The handler calls sanitize_prompt_text first; if it
+        // rejects, ctx.send_prompt is never invoked. Verify the
+        // sanitizer layer directly since the #[tool]-wrapped method
+        // isn't directly callable.
+        assert!(sanitize_prompt_text("").is_err());
+        assert!(sanitize_prompt_text("\x01\x02").is_err());
     }
 
     #[test]

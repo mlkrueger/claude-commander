@@ -29,6 +29,10 @@ pub enum AppMode {
     SendFilePrompt,
     Setup,
     QuitConfirm,
+    /// Phase 5: a write-tool MCP handler is blocked on user
+    /// confirmation. The pending request lives in
+    /// `App::pending_confirm`.
+    McpConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +102,15 @@ pub struct App {
     /// read-only tools. `take()`n in `main.rs` on shutdown so
     /// `McpServer::stop` can consume it.
     pub mcp: Option<crate::mcp::McpServer>,
+    /// Receiver side of the `ConfirmBridge`. The MCP server sends
+    /// `ConfirmRequest`s on this channel; we drain them on every
+    /// `Event::Tick` and push into `pending_confirm` to switch the
+    /// UI into `AppMode::McpConfirm`.
+    pub(crate) confirm_rx: std::sync::mpsc::Receiver<crate::mcp::ConfirmRequest>,
+    /// The currently-displayed confirmation request, if any. Holds
+    /// the `oneshot::Sender` that will be resolved when the user
+    /// answers `y`/`n`/`Esc`.
+    pub(crate) pending_confirm: Option<crate::mcp::ConfirmRequest>,
     pub mode: AppMode,
     pub focus: PanelFocus,
     pub file_tree: FileTree,
@@ -160,12 +173,19 @@ impl App {
         let event_bus = Arc::new(EventBus::new());
         let sessions = Arc::new(Mutex::new(SessionManager::with_bus(Arc::clone(&event_bus))));
 
+        // Phase 5: cross-thread confirmation bridge for write tools.
+        // The bridge's receiver is drained each tick by `handle_event`;
+        // the sender side lives on `McpCtx` so tool handlers on the
+        // `ccom-mcp` thread can request user confirmation.
+        let (confirm_bridge, confirm_rx) = crate::mcp::ConfirmBridge::new();
+
         // Start the embedded MCP server. Failure is non-fatal — the
         // TUI remains functional, just without the read-only tools.
         let mcp = {
-            let ctx = Arc::new(crate::mcp::ReadOnlyCtx {
+            let ctx = Arc::new(crate::mcp::McpCtx {
                 sessions: Arc::clone(&sessions),
                 bus: Arc::clone(&event_bus),
+                confirm: Some(Arc::clone(&confirm_bridge)),
             });
             match crate::mcp::McpServer::start(ctx) {
                 Ok(server) => {
@@ -183,6 +203,8 @@ impl App {
             sessions,
             event_bus,
             mcp,
+            confirm_rx,
+            pending_confirm: None,
             mode: initial_mode,
             focus: PanelFocus::SessionList,
             file_tree,
@@ -252,6 +274,18 @@ impl App {
                     self.last_usage_refresh = Instant::now();
                 }
                 self.sessions_lock().reap_exited();
+                // Phase 5: drain any pending MCP confirmation requests.
+                // If one arrives while another is already pending we
+                // immediately Deny the new one — the modal is strictly
+                // one-at-a-time.
+                while let Ok(req) = self.confirm_rx.try_recv() {
+                    if self.pending_confirm.is_none() {
+                        self.pending_confirm = Some(req);
+                        self.mode = AppMode::McpConfirm;
+                    } else {
+                        let _ = req.resp_tx.send(crate::mcp::ConfirmResponse::Deny);
+                    }
+                }
             }
             Event::SessionExited { session_id, code } => {
                 if let Some(session) = self.sessions_lock().get_mut(session_id) {

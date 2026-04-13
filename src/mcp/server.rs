@@ -23,7 +23,7 @@ use rmcp::transport::streamable_http_server::{
 use tokio_util::sync::CancellationToken;
 
 use super::handlers::Ccom;
-use super::state::ReadOnlyCtx;
+use super::state::McpCtx;
 
 /// Handle to the running MCP server. `start` spawns the `ccom-mcp`
 /// thread; `stop` consumes the handle and joins cleanly.
@@ -39,7 +39,7 @@ impl McpServer {
     /// `127.0.0.1:0`, and return a handle once the assigned port
     /// is available. Waits up to 2 seconds for the thread to report
     /// its assigned port.
-    pub fn start(ctx: Arc<ReadOnlyCtx>) -> anyhow::Result<Self> {
+    pub fn start(ctx: Arc<McpCtx>) -> anyhow::Result<Self> {
         // Review M1: the port channel carries `Result<u16, String>` so
         // that a bind/local_addr/loopback-assertion failure in
         // `run_server` surfaces as `Err` here instead of the previous
@@ -81,10 +81,10 @@ impl McpServer {
         })
     }
 
-    /// Test/integration helper: construct a [`ReadOnlyCtx`] internally
+    /// Test/integration helper: construct a [`McpCtx`] internally
     /// from the provided `sessions` and `bus` and start the server.
     /// Lets integration tests (which can't name the `pub(crate)`
-    /// `ReadOnlyCtx` type) drive the full server lifecycle without
+    /// `McpCtx` type) drive the full server lifecycle without
     /// widening the visibility of the ctx type itself.
     ///
     /// Used only by `tests/mcp_readonly.rs`. Integration tests compile
@@ -97,7 +97,44 @@ impl McpServer {
         sessions: Arc<Mutex<crate::session::SessionManager>>,
         bus: Arc<crate::session::EventBus>,
     ) -> anyhow::Result<Self> {
-        Self::start(Arc::new(ReadOnlyCtx { sessions, bus }))
+        // Integration tests that don't need the confirmation bridge —
+        // `kill_session` auto-denies when `confirm` is `None`, which
+        // is fine for tests that don't exercise the modal path
+        // (`tests/mcp_readonly.rs`, `tests/mcp_write.rs::send_*`).
+        // Tests that DO need it use `start_with_confirm` below.
+        Self::start(Arc::new(McpCtx {
+            sessions,
+            bus,
+            confirm: None,
+        }))
+    }
+
+    /// Phase 5 test seam: start the MCP server with a real
+    /// `ConfirmBridge` wired in. Returns the server handle plus the
+    /// receiver side of the bridge so the test can simulate the
+    /// main-thread modal-drain loop and answer each incoming
+    /// `ConfirmRequest` with `Allow`/`Deny`.
+    ///
+    /// Same `#[allow(dead_code)]` rationale as `start_with` — only
+    /// called from `tests/mcp_write.rs` which rustc's per-crate
+    /// dead-code analysis doesn't observe.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn start_with_confirm(
+        sessions: Arc<Mutex<crate::session::SessionManager>>,
+        bus: Arc<crate::session::EventBus>,
+    ) -> anyhow::Result<(
+        Self,
+        std::sync::mpsc::Receiver<super::confirm::ConfirmRequest>,
+    )> {
+        let (bridge, rx) = super::confirm::ConfirmBridge::new();
+        let ctx = Arc::new(McpCtx {
+            sessions,
+            bus,
+            confirm: Some(bridge),
+        });
+        let server = Self::start(ctx)?;
+        Ok((server, rx))
     }
 
     /// Assigned loopback port.
@@ -132,7 +169,7 @@ impl McpServer {
 }
 
 async fn run_server(
-    ctx: Arc<ReadOnlyCtx>,
+    ctx: Arc<McpCtx>,
     port_tx: std::sync::mpsc::SyncSender<Result<u16, String>>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
     cancel: CancellationToken,
@@ -217,10 +254,14 @@ mod tests {
     use crate::session::{EventBus, SessionManager};
     use std::sync::Mutex;
 
-    fn test_ctx() -> Arc<ReadOnlyCtx> {
+    fn test_ctx() -> Arc<McpCtx> {
         let bus = Arc::new(EventBus::new());
         let sessions = Arc::new(Mutex::new(SessionManager::with_bus(Arc::clone(&bus))));
-        Arc::new(ReadOnlyCtx { sessions, bus })
+        Arc::new(McpCtx {
+            sessions,
+            bus,
+            confirm: None,
+        })
     }
 
     #[test]
