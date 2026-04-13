@@ -13,16 +13,25 @@
 //! for the full design and `docs/plans/notes/rmcp-spike.md` for the
 //! empirical rmcp 1.4.0 findings this module was built against.
 
+pub(crate) mod confirm;
 mod handlers;
+mod sanitize;
 mod server;
 mod state;
 
+// `ConfirmBridge` / `ConfirmRequest` / `ConfirmResponse` / `ConfirmTool`
+// are re-exported as `pub` (not `pub(crate)`) so `tests/mcp_write.rs`
+// can name them when simulating the main-thread modal drain in
+// `kill_session` tests. The types are documented `#[doc(hidden)]` —
+// this is a test-only surface, not part of ccom's public API.
+#[allow(unused_imports)]
+pub use confirm::{ConfirmBridge, ConfirmRequest, ConfirmResponse, ConfirmTool};
 pub use server::McpServer;
-// `ReadOnlyCtx` is constructed in `src/app/mod.rs` via
-// `crate::mcp::ReadOnlyCtx { .. }`. Rustc's unused-imports lint
+// `McpCtx` is constructed in `src/app/mod.rs` via
+// `crate::mcp::McpCtx { .. }`. Rustc's unused-imports lint
 // flags the `pub(crate) use` below even though removing it
 // breaks the build — this is a known false positive for
 // re-exports of items in private child modules. The `#[allow]`
 // is targeted and small.
 #[allow(unused_imports)]
-pub(crate) use state::ReadOnlyCtx;
+pub(crate) use state::McpCtx;

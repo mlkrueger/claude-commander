@@ -47,7 +47,31 @@ impl App {
             AppMode::SendFilePrompt => self.handle_send_file_key(key),
             AppMode::Setup => self.handle_setup_key(key),
             AppMode::QuitConfirm => self.handle_quit_confirm_key(key),
+            AppMode::McpConfirm => self.handle_mcp_confirm_key(key),
         }
+    }
+
+    /// Phase 5: handle `y`/`n`/`Esc` while the MCP confirmation
+    /// modal is open. Resolves the pending `ConfirmRequest`'s
+    /// oneshot with the user's answer, clears the pending slot,
+    /// and returns to the dashboard. Non-matching keys are ignored
+    /// so the user can't accidentally bypass the modal.
+    fn handle_mcp_confirm_key(&mut self, key: KeyEvent) {
+        use crate::mcp::ConfirmResponse;
+        let resp = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(ConfirmResponse::Allow),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(ConfirmResponse::Deny),
+            _ => None,
+        };
+        let Some(resp) = resp else { return };
+        if let Some(req) = self.pending_confirm.take() {
+            // `send` fails if the MCP handler's oneshot receiver has
+            // already been dropped (e.g. the handler's 25s timeout
+            // fired first). Nothing to do about it here — we still
+            // clear the modal so the UI doesn't wedge.
+            let _ = req.resp_tx.send(resp);
+        }
+        self.mode = AppMode::Dashboard;
     }
 
     fn handle_dashboard_key(&mut self, key: KeyEvent) {

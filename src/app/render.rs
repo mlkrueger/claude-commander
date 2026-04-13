@@ -33,6 +33,13 @@ impl App {
             AppMode::Setup => {
                 self.draw_setup_mode(frame, th, tick);
             }
+            AppMode::McpConfirm => {
+                // Render the dashboard underneath so the user has
+                // context for what's being confirmed, then overlay
+                // the confirmation modal.
+                self.draw_dashboard_mode(frame, th, tick);
+                self.draw_mcp_confirm(frame);
+            }
         }
     }
 
@@ -482,6 +489,82 @@ impl App {
             Span::styled(" No", th.shortcut_desc()),
         ]);
         frame.render_widget(help, Rect::new(inner.x, inner.y + 3, inner.width, 1));
+    }
+
+    /// Phase 5: render the MCP write-tool confirmation modal. Shows
+    /// the tool name and target session id so the user can make an
+    /// informed allow/deny decision.
+    fn draw_mcp_confirm(&self, frame: &mut Frame) {
+        use crate::mcp::ConfirmTool;
+        use ratatui::style::Style;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear};
+        let th = &self.theme;
+
+        let Some(req) = self.pending_confirm.as_ref() else {
+            return;
+        };
+
+        let tool_name = match req.tool {
+            ConfirmTool::SendPrompt => "send_prompt",
+            ConfirmTool::KillSession => "kill_session",
+        };
+
+        // Look up the session label so the prompt is human-readable.
+        let session_label = {
+            let mgr = self.sessions_lock();
+            mgr.get(req.session_id)
+                .map(|s| s.label.clone())
+                .unwrap_or_else(|| format!("id={}", req.session_id))
+        };
+
+        let area = frame.area();
+        let width = 60u16.min(area.width.saturating_sub(4));
+        let height = 9u16.min(area.height.saturating_sub(2));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let modal_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, modal_area);
+
+        let block = Block::default()
+            .title(" MCP Confirmation ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(th.status_warn));
+        let inner = block.inner(modal_area);
+        frame.render_widget(block, modal_area);
+        if th.is_rainbow() {
+            crate::ui::theme::paint_rainbow_border(frame.buffer_mut(), modal_area, self.tick_count);
+        }
+
+        let header = Line::styled(
+            "  An MCP tool is requesting your permission:",
+            Style::default().fg(th.text),
+        );
+        frame.render_widget(header, Rect::new(inner.x, inner.y, inner.width, 1));
+
+        let action = Line::from(vec![
+            Span::styled("  Tool: ", Style::default().fg(th.dim)),
+            Span::styled(tool_name.to_string(), Style::default().fg(th.status_warn)),
+        ]);
+        frame.render_widget(action, Rect::new(inner.x, inner.y + 2, inner.width, 1));
+
+        let target = Line::from(vec![
+            Span::styled("  Target: ", Style::default().fg(th.dim)),
+            Span::styled(
+                format!("session {} ({})", req.session_id, session_label),
+                Style::default().fg(th.text),
+            ),
+        ]);
+        frame.render_widget(target, Rect::new(inner.x, inner.y + 3, inner.width, 1));
+
+        let help = Line::from(vec![
+            Span::styled("  [y]", Style::default().fg(th.status_warn)),
+            Span::styled(" Allow  ", th.shortcut_desc()),
+            Span::styled("[n/Esc]", th.shortcut_key()),
+            Span::styled(" Deny", th.shortcut_desc()),
+        ]);
+        frame.render_widget(help, Rect::new(inner.x, inner.y + 5, inner.width, 1));
     }
 
     fn draw_help_modal(&self, frame: &mut Frame) {
