@@ -286,6 +286,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "env_logger",
+ "http",
  "libc",
  "log",
  "portable-pty",

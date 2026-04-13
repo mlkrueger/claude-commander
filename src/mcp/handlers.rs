@@ -212,6 +212,39 @@ impl Ccom {
         }
     }
 
+    /// Phase 6 caller-id spike: return the value of the
+    /// `X-Ccom-Caller` HTTP header on the incoming tool-call request.
+    ///
+    /// This proves that rmcp 1.4's `StreamableHttpService` surfaces
+    /// custom request headers via `ctx.extensions.get::<http::request::Parts>()`
+    /// inside a `#[tool]` handler, which is the mechanism Phase 6's
+    /// `spawn_session` / scope-filtering will use to identify the
+    /// caller ccom session. If the spike passes, Task 3's caller
+    /// identification is validated and we can delete this probe (or
+    /// keep it as a diagnostic — it leaks no sensitive state).
+    ///
+    /// Returns `"<missing>"` if no header is present, the header
+    /// value verbatim otherwise.
+    #[tool(
+        description = "Spike/diagnostic: return the X-Ccom-Caller request header value. \
+                       Returns the literal string \"<missing>\" if the header is absent. \
+                       Used to validate Phase 6 caller identification — safe to remove \
+                       once spawn_session is in place."
+    )]
+    async fn _caller_probe(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = ctx
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.headers.get("x-ccom-caller"))
+            .and_then(|hv| hv.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "<missing>".to_string());
+        Ok(CallToolResult::success(vec![Content::text(value)]))
+    }
+
     #[tool(description = "List all sessions ccom is currently managing. \
                        Returns a JSON array of SessionSummary objects \
                        with id, label, working_dir, status, last_activity_secs, \
