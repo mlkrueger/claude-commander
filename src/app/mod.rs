@@ -388,26 +388,12 @@ impl App {
                 }
                 // Phase 7 Task 8: drain approval bus events to keep the
                 // per-driver pending-count map up to date.
-                while let Ok(ev) = self.approval_event_rx.try_recv() {
-                    match ev {
-                        SessionEvent::ToolApprovalRequested { driver_id, .. } => {
-                            *self
-                                .pending_approvals_per_driver
-                                .entry(driver_id)
-                                .or_insert(0) += 1;
-                        }
-                        SessionEvent::ToolApprovalResolved { driver_id, .. } => {
-                            let cnt = self
-                                .pending_approvals_per_driver
-                                .entry(driver_id)
-                                .or_insert(0);
-                            *cnt = cnt.saturating_sub(1);
-                        }
-                        _ => {}
-                    }
-                }
+                self.drain_approval_events();
             }
             Event::SessionExited { session_id, code } => {
+                // Drain any queued approval events before removing the driver
+                // entry so we don't re-insert a ghost entry on the next Tick.
+                self.drain_approval_events();
                 // Phase 6 Task 5: if the exited session was a driver,
                 // drop its attachment set so stale entries don't
                 // linger. Reads the role before mutating status so
@@ -445,6 +431,33 @@ impl App {
                         session.try_resize(inner_cols, inner_rows);
                     }
                 }
+            }
+        }
+    }
+
+    /// Drain all queued [`SessionEvent`]s from `approval_event_rx` and update
+    /// `pending_approvals_per_driver` accordingly.  Called both on every
+    /// `Event::Tick` and at the *start* of `Event::SessionExited` (before the
+    /// map entry is removed) so that a `ToolApprovalRequested` event that
+    /// arrived between the last tick and the exit cannot re-insert a ghost
+    /// entry on the following tick.
+    fn drain_approval_events(&mut self) {
+        while let Ok(ev) = self.approval_event_rx.try_recv() {
+            match ev {
+                SessionEvent::ToolApprovalRequested { driver_id, .. } => {
+                    *self
+                        .pending_approvals_per_driver
+                        .entry(driver_id)
+                        .or_insert(0) += 1;
+                }
+                SessionEvent::ToolApprovalResolved { driver_id, .. } => {
+                    let cnt = self
+                        .pending_approvals_per_driver
+                        .entry(driver_id)
+                        .or_insert(0);
+                    *cnt = cnt.saturating_sub(1);
+                }
+                _ => {}
             }
         }
     }
