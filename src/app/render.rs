@@ -43,9 +43,8 @@ impl App {
                 // captured when the picker opened — no session lock
                 // needed on the render path.
                 let target = *target_session_id;
-                let drivers = drivers.clone();
                 self.draw_session_view_mode(frame, th, tick, target);
-                self.draw_attach_driver_picker(frame, target, &drivers);
+                self.draw_attach_driver_picker(frame, target, drivers);
             }
             AppMode::Setup => {
                 self.draw_setup_mode(frame, th, tick);
