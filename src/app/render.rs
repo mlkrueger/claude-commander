@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use super::{App, AppMode, PanelFocus, SessionKind};
-use crate::session::SessionStatus;
+use crate::session::{SessionRole, SessionStatus};
 use crate::ui::layout::AppLayout;
 use crate::ui::panels::command_bar::{self, CommandBar, CommandBarMode};
 use crate::ui::panels::editor::EditorPanel;
@@ -120,7 +120,8 @@ impl App {
                 th,
                 tick,
             )
-            .with_attachments(attachments);
+            .with_attachments(attachments)
+            .with_pending_approvals(self.pending_approvals_per_driver.clone());
             frame.render_widget(session_list, layout.main);
         }
 
@@ -193,13 +194,16 @@ impl App {
         let (main_area, cmd_area) = AppLayout::session_view(frame.area());
 
         let mgr = self.sessions_lock();
-        let context_pct = if let Some(session) = mgr.get(id) {
+        let (context_pct, is_driver) = if let Some(session) = mgr.get(id) {
             let view =
                 SessionViewPanel::new(session, th, tick).with_scroll(self.session_view_scroll);
             frame.render_widget(view, main_area);
-            session.context_percent
+            (
+                session.context_percent,
+                matches!(session.role, SessionRole::Driver { .. }),
+            )
         } else {
-            None
+            (None, false)
         };
 
         if matches!(self.mode, AppMode::SessionPicker(_)) {
@@ -216,7 +220,15 @@ impl App {
                 session_pct: self.rate_limit.as_ref().and_then(|r| r.session_pct),
                 weekly_pct: self.rate_limit.as_ref().and_then(|r| r.weekly_pct),
             };
-            let command_bar = CommandBar::new(CommandBarMode::SessionView, th).with_usage(usage);
+            // Phase 7 Task 8: show pending-approval hint for driver sessions.
+            let pending = if is_driver {
+                self.pending_approval_count(id)
+            } else {
+                0
+            };
+            let command_bar = CommandBar::new(CommandBarMode::SessionView, th)
+                .with_usage(usage)
+                .with_pending_approvals(pending);
             frame.render_widget(command_bar, cmd_area);
         }
     }

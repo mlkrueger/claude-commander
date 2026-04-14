@@ -18,6 +18,10 @@ pub struct SessionListPanel<'a> {
     theme: &'a Theme,
     tick: u64,
     attachments: HashMap<usize, HashSet<usize>>,
+    /// Phase 7 Task 8: per-driver pending-approval counts, keyed by
+    /// session id. Rows whose id appears here with a non-zero count
+    /// receive a `▲` marker next to the label.
+    pending_approvals: HashMap<usize, u32>,
 }
 
 impl<'a> SessionListPanel<'a> {
@@ -35,6 +39,7 @@ impl<'a> SessionListPanel<'a> {
             theme,
             tick,
             attachments: HashMap::new(),
+            pending_approvals: HashMap::new(),
         }
     }
 
@@ -44,6 +49,13 @@ impl<'a> SessionListPanel<'a> {
     /// drops the lock before constructing the panel.
     pub fn with_attachments(mut self, attachments: HashMap<usize, HashSet<usize>>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    /// Phase 7 Task 8: pass the per-driver pending-approval counts so
+    /// driver rows with open approvals can render a `▲` marker.
+    pub fn with_pending_approvals(mut self, pending_approvals: HashMap<usize, u32>) -> Self {
+        self.pending_approvals = pending_approvals;
         self
     }
 }
@@ -80,7 +92,12 @@ impl Widget for SessionListPanel<'_> {
                     TreeRow::Driver { index } => {
                         let session = &self.sessions[index];
                         let suffix = driver_role_suffix(&session.role);
-                        let line = Line::from(vec![
+                        let pending = self
+                            .pending_approvals
+                            .get(&session.id)
+                            .copied()
+                            .unwrap_or(0);
+                        let mut spans = vec![
                             Span::styled(th.driver_icon(), Style::default().fg(th.driver_color())),
                             Span::styled(
                                 session.label.clone(),
@@ -89,7 +106,16 @@ impl Widget for SessionListPanel<'_> {
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(suffix, Style::default().fg(th.dim_color())),
-                        ]);
+                        ];
+                        if pending > 0 {
+                            spans.push(Span::styled(
+                                format!(" \u{25b2}{pending}"),
+                                Style::default()
+                                    .fg(th.driver_color())
+                                    .add_modifier(Modifier::DIM),
+                            ));
+                        }
+                        let line = Line::from(spans);
                         (index, line)
                     }
                     TreeRow::Child {
