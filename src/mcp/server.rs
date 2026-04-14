@@ -108,6 +108,7 @@ impl McpServer {
             confirm: None,
             attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
             event_tx: None,
+            approvals: None,
         }))
     }
 
@@ -136,6 +137,7 @@ impl McpServer {
             confirm: Some(bridge),
             attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
             event_tx: None,
+            approvals: None,
         });
         let server = Self::start(ctx)?;
         Ok((server, rx))
@@ -162,6 +164,7 @@ impl McpServer {
             confirm: Some(bridge),
             attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
             event_tx: Some(event_tx),
+            approvals: None,
         });
         let server = Self::start(ctx)?;
         Ok((server, rx))
@@ -192,6 +195,7 @@ impl McpServer {
             confirm: Some(bridge),
             attachments,
             event_tx: Some(event_tx),
+            approvals: None,
         });
         let server = Self::start(ctx)?;
         Ok((server, rx))
@@ -326,6 +330,7 @@ mod tests {
             confirm: None,
             attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
             event_tx: None,
+            approvals: None,
         })
     }
 

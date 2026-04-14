@@ -257,6 +257,18 @@ impl From<&crate::session::SessionEvent> for SessionEventWire {
                 session_id: *session_id,
                 status: format!("{status:?}"),
             },
+            // Phase 7 events: not exposed over the MCP event stream
+            // yet (no SessionEventWire variants for them). Emit a
+            // generic StatusChanged so subscribers stay up-to-date
+            // without requiring a wire-format change.
+            SessionEvent::ToolApprovalRequested { session_id, .. } => Self::StatusChanged {
+                session_id: *session_id,
+                status: "ToolApprovalPending".to_string(),
+            },
+            SessionEvent::ToolApprovalResolved { session_id, .. } => Self::StatusChanged {
+                session_id: *session_id,
+                status: "ToolApprovalResolved".to_string(),
+            },
         }
     }
 }
@@ -1045,6 +1057,7 @@ mod tests {
             confirm: None,
             attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
             event_tx: None,
+            approvals: None,
         })
     }
 
@@ -1061,6 +1074,7 @@ mod tests {
             confirm: None,
             attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
             event_tx: None,
+            approvals: None,
         })
     }
 
@@ -1145,6 +1159,7 @@ mod tests {
             confirm: None,
             attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
             event_tx: None,
+            approvals: None,
         });
 
         // Before the turn is pushed, ctx.get_response returns None —

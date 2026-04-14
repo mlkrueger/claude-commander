@@ -6,6 +6,14 @@ license = "Apache-2.0"
 description = "Terminal dashboard for managing multiple Claude Code sessions"
 repository = "https://github.com/mlkrueger/claude-commander"
 
+[[bin]]
+name = "ccom"
+path = "src/main.rs"
+
+[[bin]]
+name = "ccom-hook-pretooluse"
+path = "src/bin/ccom-hook-pretooluse.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 axum = "0.7"
@@ -28,6 +36,7 @@ rmcp = { version = "=1.4.0", features = [
 schemars = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha2 = "0.10"
 shellexpand = "3.1.2"
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "io-util"] }
 tokio-util = "0.7"

@@ -613,6 +613,64 @@ fn read_line_bounded<R: BufRead>(
     }
 }
 
+/// Write a `pretooluse_settings.json` into `hook_dir` that installs the
+/// `ccom-hook-pretooluse` binary as a PreToolUse hook for every tool.
+///
+/// The file is loaded by passing an additional `--settings pretooluse_settings.json`
+/// flag on the Claude command line. Claude Code supports multiple `--settings`
+/// flags; each one is layered on top of the previous.
+///
+/// The `cmd` argument is the full command string for the hook binary (normally
+/// the absolute path to `ccom-hook-pretooluse`, but can be overridden in tests
+/// via `CCOM_TEST_PRETOOLUSE_HOOK_CMD`).
+///
+/// File is written mode 0600 via `create_new` to match the security properties
+/// of the main `settings.json`.
+#[cfg(unix)]
+pub fn write_pretooluse_settings(hook_dir: &Path, cmd: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = hook_dir.join("pretooluse_settings.json");
+    let contents = build_pretooluse_settings_json(cmd);
+
+    let mut f = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    f.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn write_pretooluse_settings(_hook_dir: &Path, _cmd: &str) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "pretooluse hook is only supported on Unix",
+    ))
+}
+
+/// Build the `pretooluse_settings.json` body. Split from the file writer
+/// so it can be unit tested without filesystem access.
+pub(crate) fn build_pretooluse_settings_json(cmd: &str) -> String {
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": cmd,
+                            "timeout": 600
+                        }
+                    ]
+                }
+            ]
+        }
+    })
+    .to_string()
+}
+
 /// Recursively remove the hook directory. Best-effort; logs on
 /// failure. Called from `Session::kill` / `reap_exited`.
 ///
@@ -641,6 +699,23 @@ pub fn cleanup_hook_dir(hook_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pretooluse_settings_has_correct_shape() {
+        let json = build_pretooluse_settings_json("/usr/local/bin/ccom-hook-pretooluse");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        // Must have hooks.PreToolUse array
+        let hooks_arr = &parsed["hooks"]["PreToolUse"];
+        assert!(hooks_arr.is_array(), "PreToolUse must be an array");
+        let hook_entry = &hooks_arr[0]["hooks"][0];
+        assert_eq!(hook_entry["type"].as_str().unwrap(), "command");
+        assert_eq!(
+            hook_entry["command"].as_str().unwrap(),
+            "/usr/local/bin/ccom-hook-pretooluse"
+        );
+        assert_eq!(hook_entry["timeout"].as_u64().unwrap(), 600);
+    }
 
     #[test]
     fn parse_stdin_extracts_fields() {

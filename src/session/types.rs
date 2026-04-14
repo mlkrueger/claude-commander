@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::approvals::{ApprovalHookRequest, ApprovalHookResponse};
 use crate::claude::context;
 use crate::event::{Event, MonitoredSender};
 use crate::pty::detector::PromptDetector;
@@ -167,6 +168,23 @@ pub struct Session {
     /// Handle for the sidecar FIFO reader thread. `Some` iff
     /// `hook_dir` is `Some`.
     pub(super) hook_reader_handle: Option<SidecarHandle>,
+    /// Sender end of the inbound approval-request channel. The socket
+    /// listener task sends an `ApprovalHookRequest` value here for each
+    /// incoming hook connection. Stored on `Session` as a handle to the
+    /// channel; the approval coordinator (Task 2) accesses the paired
+    /// `Receiver` via `Session::take_approval_rx`.
+    ///
+    /// `None` when there is no socket listener (Terminal sessions, or
+    /// when the socket listener failed to start).
+    pub approval_socket_tx: Option<tokio::sync::mpsc::Sender<ApprovalHookRequest>>,
+    /// Receiver end of the inbound approval-request channel. Held by
+    /// `Session` until the approval coordinator takes it (via
+    /// `take_approval_rx`) in Task 2. After it is taken, this is
+    /// `None`.
+    pub(super) approval_socket_rx: Option<tokio::sync::mpsc::Receiver<ApprovalHookRequest>>,
+    /// JoinHandle for the tokio task that listens on the approval
+    /// Unix socket. Aborted during `kill` / `cleanup_hook_artifacts`.
+    pub(super) approval_socket_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Session {
@@ -219,7 +237,15 @@ impl Session {
         //
         // M7: hook-based boundary detection is Unix-only (relies on
         // mkfifo + blocking open semantics).
-        let (hook_dir, hook_rx, hook_reader_handle, extra_args) = if install_hook {
+        let (
+            hook_dir,
+            hook_rx,
+            hook_reader_handle,
+            extra_args,
+            approval_socket_tx,
+            approval_socket_rx,
+            approval_socket_task,
+        ) = if install_hook {
             #[cfg(unix)]
             {
                 let hook_dir = hook::create_hook_dir(id)?;
@@ -245,6 +271,36 @@ impl Session {
                 flags.push("--settings".to_string());
                 flags.push(settings_path.display().to_string());
 
+                // Phase 7 Task 1: write pretooluse_settings.json and
+                // pass it via a second --settings flag. The hook binary
+                // path comes from CCOM_TEST_PRETOOLUSE_HOOK_CMD (tests)
+                // or a sibling binary next to the current executable.
+                let pretooluse_cmd = std::env::var("CCOM_TEST_PRETOOLUSE_HOOK_CMD")
+                    .ok()
+                    .unwrap_or_else(|| {
+                        // Resolve sibling binary next to current exe.
+                        std::env::current_exe()
+                            .ok()
+                            .and_then(|p| {
+                                p.parent().map(|dir| {
+                                    dir.join("ccom-hook-pretooluse").display().to_string()
+                                })
+                            })
+                            .unwrap_or_else(|| "ccom-hook-pretooluse".to_string())
+                    });
+                match hook::write_pretooluse_settings(&hook_dir, &pretooluse_cmd) {
+                    Ok(()) => {
+                        let pretooluse_settings_path = hook_dir.join("pretooluse_settings.json");
+                        flags.push("--settings".to_string());
+                        flags.push(pretooluse_settings_path.display().to_string());
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "session {id} failed to write pretooluse_settings.json: {e} (tool approval routing will be unavailable)"
+                        );
+                    }
+                }
+
                 // Phase 4 Task 6: if the MCP server is running, write
                 // a `.mcp.json` in the hook dir and pass it via
                 // `--mcp-config`. Best-effort — failure logs a
@@ -267,7 +323,52 @@ impl Session {
                     }
                 }
 
-                (Some(hook_dir), Some(rx), Some(handle), flags)
+                // Phase 7 Task 1: start the Unix socket listener for
+                // approval routing. The socket receives
+                // ApprovalHookRequest JSON from ccom-hook-pretooluse.
+                //
+                // Session::spawn is synchronous, but we need a Tokio
+                // task. Use Handle::current() to get the runtime handle
+                // and spawn from sync context. If there is no active
+                // Tokio runtime (e.g. in unit tests that don't use
+                // tokio::test), we skip the socket listener gracefully.
+                //
+                // Channel design:
+                //   - socket listener task holds the Sender (tx)
+                //   - Session stores a Sender clone (approval_socket_tx)
+                //     so consumers can determine the channel is active
+                //   - The Receiver lives inside the listener task
+                //   - The listener forwards requests to its internal
+                //     channel; in Task 2 the coordinator drains this
+                //     by receiving the Sender from the Session and
+                //     creating a rendezvous.
+                let (approval_tx, approval_rx, approval_socket_task) =
+                    match tokio::runtime::Handle::try_current() {
+                        Ok(runtime_handle) => {
+                            let socket_path = hook_dir.join("approval.sock");
+                            // tx: socket listener sends incoming requests on this
+                            // rx: coordinator (Task 2) reads from this
+                            let (tx, rx) = tokio::sync::mpsc::channel::<ApprovalHookRequest>(32);
+                            let task = runtime_handle
+                                .spawn(run_approval_socket_listener(socket_path, tx.clone()));
+                            (Some(tx), Some(rx), Some(task))
+                        }
+                        Err(_) => {
+                            // No runtime active (sync test context) — skip.
+                            log::debug!("session {id}: no tokio runtime, skipping approval socket");
+                            (None, None, None)
+                        }
+                    };
+
+                (
+                    Some(hook_dir),
+                    Some(rx),
+                    Some(handle),
+                    flags,
+                    approval_tx,
+                    approval_rx,
+                    approval_socket_task,
+                )
             }
             #[cfg(not(unix))]
             {
@@ -276,7 +377,7 @@ impl Session {
                 ));
             }
         } else {
-            (None, None, None, Vec::<String>::new())
+            (None, None, None, Vec::<String>::new(), None, None, None)
         };
 
         let mut cmd = CommandBuilder::new(command);
@@ -402,6 +503,9 @@ impl Session {
             hook_dir,
             hook_rx,
             hook_reader_handle,
+            approval_socket_tx,
+            approval_socket_rx,
+            approval_socket_task,
         })
     }
 
@@ -601,6 +705,13 @@ impl Session {
             hook::cleanup_hook_dir(&dir);
         }
 
+        // 8. Abort and drop the approval socket listener task.
+        if let Some(task) = self.approval_socket_task.take() {
+            task.abort();
+        }
+        self.approval_socket_tx = None;
+        self.approval_socket_rx = None;
+
         drained
     }
 
@@ -676,6 +787,9 @@ impl Session {
             hook_dir: None,
             hook_rx: None,
             hook_reader_handle: None,
+            approval_socket_tx: None,
+            approval_socket_rx: None,
+            approval_socket_task: None,
         }
     }
 
@@ -706,6 +820,145 @@ impl Session {
         self.spawned_by = Some(parent);
         self
     }
+
+    /// Phase 7 Task 1: return the hook directory path if one was created.
+    /// Exposed as `pub` so integration tests can verify that hook artifacts
+    /// (socket file, settings files) exist in the expected location.
+    #[allow(dead_code)]
+    pub fn hook_dir(&self) -> Option<&std::path::Path> {
+        self.hook_dir.as_deref()
+    }
+
+    /// Phase 7 Task 2: take the approval socket receiver out of the
+    /// session so the coordinator can poll it. After this call, the
+    /// session's `approval_socket_rx` is `None`.
+    ///
+    /// This is a one-time move — the coordinator takes ownership of the
+    /// receiver and is responsible for draining it.
+    #[allow(dead_code)]
+    pub fn take_approval_rx(&mut self) -> Option<tokio::sync::mpsc::Receiver<ApprovalHookRequest>> {
+        self.approval_socket_rx.take()
+    }
+}
+
+/// Async task that binds a Unix socket at `socket_path` and listens for
+/// incoming approval requests from the ccom-hook-pretooluse binary.
+///
+/// For each accepted connection:
+/// 1. Reads a single JSON line (the `ApprovalHookRequest` from the hook binary)
+/// 2. Creates a `oneshot` channel for the response
+/// 3. Sends the `ApprovalHookRequest` (with `response_tx`) on `tx`
+/// 4. Awaits the `oneshot::rx` response from the coordinator
+/// 5. Writes the response JSON back to the socket (so the hook binary unblocks)
+///
+/// The task exits when `tx` is dropped (i.e. all receivers have gone away).
+/// Abort this task via the stored `JoinHandle` on session cleanup.
+#[cfg(unix)]
+async fn run_approval_socket_listener(
+    socket_path: std::path::PathBuf,
+    tx: tokio::sync::mpsc::Sender<ApprovalHookRequest>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+
+    // Create the socket with restricted permissions (0600).
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!(
+                "approval socket: failed to bind {}: {e}",
+                socket_path.display()
+            );
+            return;
+        }
+    };
+    // Set permissions to 0600.
+    if let Err(e) = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)) {
+        log::warn!(
+            "approval socket: failed to chmod {}: {e}",
+            socket_path.display()
+        );
+    }
+
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                log::warn!("approval socket: accept error: {e}");
+                continue;
+            }
+        };
+
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            handle_approval_connection(stream, tx).await;
+        });
+    }
+}
+
+#[cfg(not(unix))]
+async fn run_approval_socket_listener(
+    _socket_path: std::path::PathBuf,
+    _tx: tokio::sync::mpsc::Sender<ApprovalHookRequest>,
+) {
+    // No-op on non-Unix platforms.
+}
+
+/// Handle a single approval socket connection. Reads the request JSON,
+/// sends it to the coordinator via `tx`, awaits the response, and writes
+/// the response JSON back to the socket.
+#[cfg(unix)]
+async fn handle_approval_connection(
+    stream: tokio::net::UnixStream,
+    tx: tokio::sync::mpsc::Sender<ApprovalHookRequest>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+
+    if reader.read_line(&mut line).await.is_err() || line.is_empty() {
+        return;
+    }
+
+    // Parse the hook request JSON (without response_tx — we'll attach it below).
+    let mut request: ApprovalHookRequest = match serde_json::from_str(line.trim()) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("approval socket: malformed request JSON: {e}");
+            // Reply passthrough so the hook binary doesn't hang.
+            let _ = write_half
+                .write_all(b"{\"decision\":\"passthrough\"}\n")
+                .await;
+            return;
+        }
+    };
+
+    // Create a oneshot channel for the coordinator to reply on.
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<ApprovalHookResponse>();
+    request.response_tx = Some(resp_tx);
+
+    // Send to the coordinator. If the coordinator is not listening
+    // (tx closed), reply passthrough immediately.
+    let send_result: Result<(), tokio::sync::mpsc::error::SendError<ApprovalHookRequest>> =
+        tx.send(request).await;
+    if send_result.is_err() {
+        let _ = write_half
+            .write_all(b"{\"decision\":\"passthrough\"}\n")
+            .await;
+        return;
+    }
+
+    // Await the coordinator's decision (590s matches the hook binary timeout).
+    let decision = match tokio::time::timeout(std::time::Duration::from_secs(590), resp_rx).await {
+        Ok(Ok(ApprovalHookResponse::Allow)) => "allow",
+        Ok(Ok(ApprovalHookResponse::Deny)) => "deny",
+        Ok(Ok(ApprovalHookResponse::Passthrough)) | Ok(Err(_)) | Err(_) => "passthrough",
+    };
+
+    let response_json = format!("{{\"decision\":\"{decision}\"}}\n");
+    let _ = write_half.write_all(response_json.as_bytes()).await;
 }
 
 #[doc(hidden)]
