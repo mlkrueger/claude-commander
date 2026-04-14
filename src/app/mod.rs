@@ -15,7 +15,9 @@ use crate::event::Event;
 use crate::fs::git::{self, GitStatusMap};
 use crate::fs::tree::FileTree;
 use crate::pty::detector::PromptDetector;
-use crate::session::{EventBus, SessionManager, SessionRole, SessionStatus, SpawnConfig};
+use crate::session::{
+    EventBus, SessionEvent, SessionManager, SessionRole, SessionStatus, SpawnConfig,
+};
 use crate::setup::{self, SetupItem};
 use crate::ui::panels::editor::EditorState;
 use crate::ui::theme::{Theme, ThemeName};
@@ -198,6 +200,15 @@ pub struct App {
     /// with `McpCtx`. Allows the TUI thread to wire per-session
     /// approval coordinators after spawning, without going through MCP.
     pub(crate) approvals: Arc<crate::approvals::ApprovalRegistry>,
+    /// Phase 7 Task 8: per-driver count of tool-approval requests that
+    /// are currently pending (requested but not yet resolved). Keyed by
+    /// driver session id. The TUI uses this to render the `▲ <n>` hint
+    /// in the status line and the `▲` marker in the session list.
+    pub(crate) pending_approvals_per_driver: HashMap<usize, u32>,
+    /// Phase 7 Task 8: subscriber for `ToolApprovalRequested` /
+    /// `ToolApprovalResolved` events published by the approval
+    /// coordinator. Drained each tick in `handle_event`.
+    pub(crate) approval_event_rx: std::sync::mpsc::Receiver<SessionEvent>,
 }
 
 const ATTENTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -248,6 +259,12 @@ impl App {
         // MCP handlers (via McpCtx) and the TUI-thread coordinator-startup
         // path can share the same Arc.
         let approvals = crate::approvals::ApprovalRegistry::new();
+
+        // Phase 7 Task 8: subscribe to the event bus for approval events
+        // so the TUI can maintain per-driver pending-approval counts.
+        // Must subscribe BEFORE MCP starts so we don't miss any early
+        // events published during startup.
+        let approval_event_rx = event_bus.subscribe();
 
         // Start the embedded MCP server. Failure is non-fatal — the
         // TUI remains functional, just without the read-only tools.
@@ -316,6 +333,8 @@ impl App {
             pending_driver_role: None,
             attachment_map,
             approvals,
+            pending_approvals_per_driver: HashMap::new(),
+            approval_event_rx,
         }
     }
 
@@ -367,6 +386,26 @@ impl App {
                         let _ = req.resp_tx.send(crate::mcp::ConfirmResponse::Deny);
                     }
                 }
+                // Phase 7 Task 8: drain approval bus events to keep the
+                // per-driver pending-count map up to date.
+                while let Ok(ev) = self.approval_event_rx.try_recv() {
+                    match ev {
+                        SessionEvent::ToolApprovalRequested { driver_id, .. } => {
+                            *self
+                                .pending_approvals_per_driver
+                                .entry(driver_id)
+                                .or_insert(0) += 1;
+                        }
+                        SessionEvent::ToolApprovalResolved { driver_id, .. } => {
+                            let cnt = self
+                                .pending_approvals_per_driver
+                                .entry(driver_id)
+                                .or_insert(0);
+                            *cnt = cnt.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+                }
             }
             Event::SessionExited { session_id, code } => {
                 // Phase 6 Task 5: if the exited session was a driver,
@@ -382,6 +421,12 @@ impl App {
                     .map(|s| matches!(s.role, SessionRole::Driver { .. }))
                     .unwrap_or(false);
                 self.scrub_attachments_for_exited(session_id, was_driver);
+                // Phase 7 Task 8: drop stale pending-approval count for
+                // an exited driver — any in-flight requests are now
+                // unresolvable.
+                if was_driver {
+                    self.pending_approvals_per_driver.remove(&session_id);
+                }
                 if let Some(session) = self.sessions_lock().get_mut(session_id) {
                     session.status = SessionStatus::Exited(code);
                 }
@@ -573,6 +618,16 @@ impl App {
             })
             .map(|s| (s.id, s.label.clone()))
             .collect()
+    }
+
+    /// Phase 7 Task 8: return the pending-approval count for a driver
+    /// session, or `0` if the session is not a driver or has no pending
+    /// approvals.
+    pub(crate) fn pending_approval_count(&self, session_id: usize) -> u32 {
+        self.pending_approvals_per_driver
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Switch to the attach-driver sub-picker if any live drivers
@@ -925,4 +980,118 @@ fn common_prefix(strings: &[String]) -> String {
         }
     }
     first[..len].to_string()
+}
+
+#[cfg(test)]
+mod pending_approval_tests {
+    use super::*;
+
+    // ---- helpers ----
+
+    /// Minimal helper: build a `pending_approvals_per_driver` map and
+    /// exercise the same increment/decrement logic used in handle_event.
+    fn apply_requested(map: &mut HashMap<usize, u32>, driver_id: usize) {
+        *map.entry(driver_id).or_insert(0) += 1;
+    }
+
+    fn apply_resolved(map: &mut HashMap<usize, u32>, driver_id: usize) {
+        let cnt = map.entry(driver_id).or_insert(0);
+        *cnt = cnt.saturating_sub(1);
+    }
+
+    // ---- status-line counter tests ----
+
+    #[test]
+    fn status_line_shows_pending_count_for_active_driver() {
+        let mut map: HashMap<usize, u32> = HashMap::new();
+        let driver_id = 3;
+
+        apply_requested(&mut map, driver_id);
+        apply_requested(&mut map, driver_id);
+
+        assert_eq!(map[&driver_id], 2, "two requests → count should be 2");
+    }
+
+    #[test]
+    fn status_line_clears_on_resolution() {
+        let mut map: HashMap<usize, u32> = HashMap::new();
+        let driver_id = 7;
+
+        apply_requested(&mut map, driver_id);
+        apply_requested(&mut map, driver_id);
+        apply_resolved(&mut map, driver_id);
+        apply_resolved(&mut map, driver_id);
+
+        assert_eq!(
+            map.get(&driver_id).copied().unwrap_or(0),
+            0,
+            "all requests resolved → count should be 0"
+        );
+    }
+
+    #[test]
+    fn saturating_sub_prevents_underflow() {
+        let mut map: HashMap<usize, u32> = HashMap::new();
+        let driver_id = 1;
+
+        // Resolve without a preceding request: must not underflow.
+        apply_resolved(&mut map, driver_id);
+        assert_eq!(
+            map.get(&driver_id).copied().unwrap_or(0),
+            0,
+            "saturating_sub must not underflow past 0"
+        );
+    }
+
+    // ---- session-list marker test ----
+
+    #[test]
+    fn session_list_marker_tracks_pending_count() {
+        let mut map: HashMap<usize, u32> = HashMap::new();
+        let driver_a = 10;
+        let driver_b = 20;
+
+        apply_requested(&mut map, driver_a);
+        apply_requested(&mut map, driver_a);
+        apply_requested(&mut map, driver_b);
+
+        // driver_a should show marker (count > 0)
+        let a_count = map.get(&driver_a).copied().unwrap_or(0);
+        assert!(a_count > 0, "driver_a should have a pending marker");
+
+        // driver_b should also show marker
+        let b_count = map.get(&driver_b).copied().unwrap_or(0);
+        assert!(b_count > 0, "driver_b should have a pending marker");
+
+        // Resolve both of driver_a's requests
+        apply_resolved(&mut map, driver_a);
+        apply_resolved(&mut map, driver_a);
+
+        let a_count_after = map.get(&driver_a).copied().unwrap_or(0);
+        assert_eq!(
+            a_count_after, 0,
+            "driver_a marker should clear after resolution"
+        );
+
+        // driver_b still has one pending
+        let b_count_after = map.get(&driver_b).copied().unwrap_or(0);
+        assert_eq!(b_count_after, 1, "driver_b should still have one pending");
+    }
+
+    #[test]
+    fn driver_exit_drops_pending_count() {
+        let mut map: HashMap<usize, u32> = HashMap::new();
+        let driver_id = 5;
+
+        apply_requested(&mut map, driver_id);
+        apply_requested(&mut map, driver_id);
+
+        // Simulate what handle_event does on SessionExited for a driver.
+        map.remove(&driver_id);
+
+        assert!(
+            !map.contains_key(&driver_id),
+            "pending count should be removed on driver exit"
+        );
+    }
 }

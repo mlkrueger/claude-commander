@@ -26,6 +26,10 @@ pub struct CommandBar<'a> {
     mode: CommandBarMode,
     usage: Option<UsageStats>,
     theme: &'a Theme,
+    /// Phase 7 Task 8: when the session currently shown is a driver
+    /// with pending approvals, this holds the count so the status
+    /// line can render `" ▲ <n> pending approval(s)"`.
+    pending_approvals: Option<u32>,
 }
 
 impl<'a> CommandBar<'a> {
@@ -34,11 +38,21 @@ impl<'a> CommandBar<'a> {
             mode,
             usage: None,
             theme,
+            pending_approvals: None,
         }
     }
 
     pub fn with_usage(mut self, usage: UsageStats) -> Self {
         self.usage = Some(usage);
+        self
+    }
+
+    /// Phase 7 Task 8: attach a pending-approval count to the bar.
+    /// Only rendered when count > 0.
+    pub fn with_pending_approvals(mut self, count: u32) -> Self {
+        if count > 0 {
+            self.pending_approvals = Some(count);
+        }
         self
     }
 }
@@ -96,20 +110,35 @@ impl Widget for CommandBar<'_> {
             }
         };
 
-        let spans: Vec<Span> = shortcuts
-            .iter()
-            .enumerate()
-            .flat_map(|(i, (key, desc))| {
-                let mut s = vec![
-                    Span::styled(format!("[{key}]"), th.shortcut_key()),
-                    Span::styled(format!(" {desc}"), th.shortcut_desc()),
-                ];
-                if i < shortcuts.len() - 1 {
-                    s.push(Span::raw("  "));
-                }
-                s
-            })
-            .collect();
+        // Phase 7 Task 8: prefix the hint when this is a driver view
+        // with pending approvals.
+        let mut spans: Vec<Span> = if let Some(count) = self.pending_approvals {
+            let n = count;
+            let label = if n == 1 {
+                " \u{25b2} 1 pending approval  ".to_string()
+            } else {
+                format!(" \u{25b2} {n} pending approvals  ")
+            };
+            vec![Span::styled(
+                label,
+                ratatui::style::Style::default()
+                    .fg(th.driver_color())
+                    .add_modifier(ratatui::style::Modifier::DIM),
+            )]
+        } else {
+            Vec::new()
+        };
+
+        spans.extend(shortcuts.iter().enumerate().flat_map(|(i, (key, desc))| {
+            let mut s = vec![
+                Span::styled(format!("[{key}]"), th.shortcut_key()),
+                Span::styled(format!(" {desc}"), th.shortcut_desc()),
+            ];
+            if i < shortcuts.len() - 1 {
+                s.push(Span::raw("  "));
+            }
+            s
+        }));
 
         let line = Line::from(spans);
         buf.set_line(area.x, area.y, &line, area.width);
