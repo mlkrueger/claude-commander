@@ -40,8 +40,17 @@ pub enum AppMode {
     /// from `SessionPicker` via `a`; `target_session_id` is the
     /// session that will be added to the chosen driver's
     /// `attachment_map` entry.
+    ///
+    /// `drivers` is snapshotted at mode entry time
+    /// (`open_attach_driver_picker`) so the key handler and render
+    /// function don't each acquire `sessions_lock()` per interaction
+    /// — a driver that exits while the picker is open still renders
+    /// in the list until the user dismisses the overlay, but the
+    /// `attach_session_to_driver` call will re-check liveness before
+    /// committing. See pr-review-phase-6-tasks-3-to-7.md §D2.
     AttachDriverPicker {
         target_session_id: usize,
+        drivers: Vec<(usize, String)>,
     },
 }
 
@@ -510,23 +519,22 @@ impl App {
             .collect()
     }
 
-    pub(crate) fn live_driver_count(&self) -> usize {
-        self.live_drivers().len()
-    }
-
-    pub(crate) fn nth_live_driver(&self, n: usize) -> Option<(usize, String)> {
-        self.live_drivers().into_iter().nth(n)
-    }
-
     /// Switch to the attach-driver sub-picker if any live drivers
-    /// exist. If not, surface a status message and stay put.
+    /// exist. If not, surface a status message and stay put. The
+    /// driver list is snapshotted here and cached on the mode
+    /// variant so subsequent key events and render frames don't
+    /// re-lock `sessions`. See pr-review-phase-6-tasks-3-to-7.md §D2.
     pub(crate) fn open_attach_driver_picker(&mut self, target_session_id: usize) {
-        if self.live_drivers().is_empty() {
+        let drivers = self.live_drivers();
+        if drivers.is_empty() {
             self.status_message = Some("No active drivers — launch ccom with --driver".to_string());
             return;
         }
         self.picker_selected = 0;
-        self.mode = AppMode::AttachDriverPicker { target_session_id };
+        self.mode = AppMode::AttachDriverPicker {
+            target_session_id,
+            drivers,
+        };
     }
 
     /// Add `target` to `driver`'s attachment set. Idempotent. No-op

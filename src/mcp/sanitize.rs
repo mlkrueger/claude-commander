@@ -46,8 +46,14 @@ pub(crate) fn sanitize_label(input: &str) -> Result<String, String> {
     let stripped = crate::pty::response_boundary::ansi_strip(input);
 
     let mut out = String::with_capacity(stripped.len().min(MAX_LABEL_CHARS));
+    // Track kept-char count explicitly instead of calling
+    // `out.chars().count()` on every loop iteration — the old shape
+    // was O(n²) over the input. Not a practical perf concern at the
+    // 64-char limit but misleading as an idiom (pr-review
+    // -phase-6-tasks-3-to-7.md §D1).
+    let mut char_count: usize = 0;
     for ch in stripped.chars() {
-        if out.chars().count() >= MAX_LABEL_CHARS {
+        if char_count >= MAX_LABEL_CHARS {
             break;
         }
         // Drop ASCII control (C0 and DEL).
@@ -58,6 +64,7 @@ pub(crate) fn sanitize_label(input: &str) -> Result<String, String> {
             ch.is_ascii_alphanumeric() || ch == ' ' || matches!(ch, '-' | '_' | '.' | '/' | ':');
         if allowed {
             out.push(ch);
+            char_count += 1;
         }
         // Non-whitelisted chars (emoji, non-ASCII letters, punctuation
         // outside the allowed set) are silently dropped rather than

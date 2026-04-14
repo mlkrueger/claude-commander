@@ -30,6 +30,16 @@ use super::state::{McpCtx, Scope, SendPromptRejection};
 /// to parse as a `usize`. Callers default to `Scope::Full` on
 /// `None` — the legacy path — so an unparseable header silently
 /// degrades to "unknown caller" rather than hard-failing the tool.
+///
+/// **No authentication is performed.** Any local process that can
+/// reach the loopback port can claim any caller id; there is no
+/// cryptographic identity check. The server is loopback-only
+/// (pinned via `StreamableHttpServerConfig::with_allowed_hosts` in
+/// `src/mcp/server.rs`), which bounds the threat surface to local
+/// processes on the same host. If the server ever grows a
+/// non-loopback binding, this header mechanism becomes insufficient
+/// and needs replacing with a real auth layer — see
+/// `docs/plans/phase-6-driver-role.md` §Risks.
 fn caller_id_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<usize> {
     ctx.extensions
         .get::<http::request::Parts>()
@@ -788,7 +798,11 @@ impl Ccom {
             Silent,
             NeedsConfirm,
         }
-        let (decision, default_cwd, cols, rows) = {
+        // `budget_decremented` carries (policy, pre-decrement-value) so
+        // step 6 can restore the budget if `spawn_with_role` fails.
+        // Otherwise a failing PTY spawn would silently consume a budget
+        // credit — see pr-review-phase-6-tasks-3-to-7.md §A1 (S4).
+        let (decision, default_cwd, cols, rows, budget_decremented) = {
             let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
             let Some(caller) = mgr.get(caller_id) else {
                 return Ok(CallToolResult::error(vec![Content::text(
@@ -810,6 +824,7 @@ impl Ccom {
             let cols = caller.pty_size.cols;
             let rows = caller.pty_size.rows;
 
+            let mut budget_decremented: Option<(crate::session::SpawnPolicy, u32)> = None;
             let decision = match policy {
                 crate::session::SpawnPolicy::Trust => Decision::Silent,
                 crate::session::SpawnPolicy::Budget => {
@@ -824,6 +839,7 @@ impl Ccom {
                                 spawn_policy: policy,
                             },
                         );
+                        budget_decremented = Some((policy, budget));
                         Decision::Silent
                     } else {
                         Decision::NeedsConfirm
@@ -831,7 +847,7 @@ impl Ccom {
                 }
                 crate::session::SpawnPolicy::Ask => Decision::NeedsConfirm,
             };
-            (decision, default_cwd, cols, rows)
+            (decision, default_cwd, cols, rows, budget_decremented)
         };
 
         // 4. If confirmation is needed, go through the same bridge
@@ -921,11 +937,35 @@ impl Ccom {
         //    the child without its first turn queued. `spawn_with_role`
         //    leaves the child Solo with `spawned_by = Some(driver_id)` —
         //    v1 nesting cap: drivers never spawn drivers.
+        //
+        //    Two-phase note (pr-review-phase-6-tasks-3-to-7.md §B2):
+        //    step 3 above holds the sessions mutex across the budget
+        //    check-and-decrement, then releases. This lock is a FRESH
+        //    acquisition — deliberate, not a TOCTOU slip. Holding the
+        //    mutex across the intervening `bridge.request().await` and
+        //    the `Session::spawn` PTY call would serialize every
+        //    MCP reader behind a potentially multi-second blocking
+        //    operation. Budget consistency is preserved by the restore
+        //    path below (A1 fix).
         let new_id = {
             let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
             let id = match mgr.spawn_with_role(spawn_cfg, None, Some(caller_id)) {
                 Ok(id) => id,
                 Err(e) => {
+                    // Restore the budget if we decremented it in step 3.
+                    // Without this, a PTY-spawn failure permanently
+                    // consumes a silent spawn credit — the driver ends
+                    // up with fewer silent spawns than it should.
+                    // pr-review-phase-6-tasks-3-to-7.md §A1 (S4).
+                    if let Some((policy, original_budget)) = budget_decremented {
+                        mgr.set_role(
+                            caller_id,
+                            crate::session::SessionRole::Driver {
+                                spawn_budget: original_budget,
+                                spawn_policy: policy,
+                            },
+                        );
+                    }
                     return Ok(CallToolResult::error(vec![Content::text(format!(
                         "spawn_session: spawn failed: {e}"
                     ))]));

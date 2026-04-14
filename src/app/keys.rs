@@ -48,9 +48,14 @@ impl App {
             AppMode::Setup => self.handle_setup_key(key),
             AppMode::QuitConfirm => self.handle_quit_confirm_key(key),
             AppMode::McpConfirm => self.handle_mcp_confirm_key(key),
-            AppMode::AttachDriverPicker { target_session_id } => {
+            AppMode::AttachDriverPicker {
+                target_session_id,
+                drivers,
+            } => {
                 let target = *target_session_id;
-                self.handle_attach_driver_picker_key(key, target);
+                let driver_count = drivers.len();
+                let selected_driver = drivers.get(self.picker_selected).cloned();
+                self.handle_attach_driver_picker_key(key, target, driver_count, selected_driver);
             }
         }
     }
@@ -447,7 +452,13 @@ impl App {
     /// Phase 6 Task 5: driver sub-picker keys. Up/Down cycle through
     /// live driver indices; Enter commits the attachment; Esc aborts
     /// back to the main session picker the user came from.
-    fn handle_attach_driver_picker_key(&mut self, key: KeyEvent, target_session_id: usize) {
+    fn handle_attach_driver_picker_key(
+        &mut self,
+        key: KeyEvent,
+        target_session_id: usize,
+        driver_count: usize,
+        selected_driver: Option<(usize, String)>,
+    ) {
         match key.code {
             KeyCode::Esc => {
                 // Return to the session picker the user came from.
@@ -458,21 +469,24 @@ impl App {
                 self.mode = AppMode::SessionPicker(target_session_id);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let n = self.live_driver_count();
-                if n > 0 {
-                    self.picker_selected = (self.picker_selected + 1) % n;
+                if driver_count > 0 {
+                    self.picker_selected = (self.picker_selected + 1) % driver_count;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                let n = self.live_driver_count();
-                if n > 0 {
-                    self.picker_selected = self.picker_selected.checked_sub(1).unwrap_or(n - 1);
+                if driver_count > 0 {
+                    self.picker_selected = self
+                        .picker_selected
+                        .checked_sub(1)
+                        .unwrap_or(driver_count - 1);
                 }
             }
             KeyCode::Enter => {
-                let picker_idx = self.picker_selected;
-                let chosen = self.nth_live_driver(picker_idx);
-                if let Some((driver_id, driver_label)) = chosen {
+                if let Some((driver_id, driver_label)) = selected_driver {
+                    // `attach_session_to_driver` re-checks that the
+                    // driver is still live at commit time; if it
+                    // exited while the picker was open, the call
+                    // logs a warning and no-ops.
                     self.attach_session_to_driver(driver_id, target_session_id);
                     self.status_message = Some(format!(
                         "Attached session {target_session_id} to driver {driver_label}"

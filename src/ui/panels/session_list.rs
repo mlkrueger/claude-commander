@@ -6,7 +6,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, Widget};
 
-use crate::session::{Session, SessionRole, SessionStatus, SpawnPolicy};
+use crate::session::{Session, SessionStatus};
+use crate::ui::panels::driver_role_suffix;
 use crate::ui::panels::session_tree::{TreeRow, build_session_tree};
 use crate::ui::theme::{self, Theme};
 
@@ -47,23 +48,6 @@ impl<'a> SessionListPanel<'a> {
     }
 }
 
-/// Phase 6 Task 7: render a driver session's budget/policy suffix
-/// (e.g. ` [driver · budget 3]`). Returns an empty string for non-
-/// driver roles so the caller can unconditionally append.
-fn driver_suffix(role: &SessionRole) -> String {
-    match role {
-        SessionRole::Solo => String::new(),
-        SessionRole::Driver {
-            spawn_budget,
-            spawn_policy,
-        } => match spawn_policy {
-            SpawnPolicy::Budget => format!(" [driver · budget {spawn_budget}]"),
-            SpawnPolicy::Ask => " [driver · ask]".to_string(),
-            SpawnPolicy::Trust => " [driver · trust]".to_string(),
-        },
-    }
-}
-
 impl Widget for SessionListPanel<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let th = self.theme;
@@ -95,7 +79,7 @@ impl Widget for SessionListPanel<'_> {
                 let (i, label_line) = match *row {
                     TreeRow::Driver { index } => {
                         let session = &self.sessions[index];
-                        let suffix = driver_suffix(&session.role);
+                        let suffix = driver_role_suffix(&session.role);
                         let line = Line::from(vec![
                             Span::styled(th.driver_icon(), Style::default().fg(th.driver_color())),
                             Span::styled(

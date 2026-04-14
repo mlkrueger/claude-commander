@@ -169,23 +169,8 @@ impl McpCtx {
             .map_err(|_| SendPromptRejection::NotFound)
     }
 
-    /// Phase 6 prelude — STUB. Resolve a caller ccom session id to
-    /// the `Scope` of sessions it may see and touch.
-    ///
-    /// Current behavior: returns [`Scope::Full`] for every caller.
-    /// This is the type-surface placeholder — Task 4's subagent will
-    /// replace the body with the real role-based logic:
-    ///
-    /// - Solo caller (or caller not found in the manager) → `Full`
-    /// - Driver caller → `Restricted(own_children ∪ attachments)`
-    ///
-    /// Keeping the stub in place now lets the MCP-side subagent's
-    /// scope-filter work (gated on this return value) compile and
-    /// pass tests before the real logic lands — tests that need
-    /// actual filtering will construct `Scope::Restricted(..)`
-    /// directly in fixtures and bypass this helper.
-    ///
-    /// Resolve a caller ccom session id to its [`Scope`].
+    /// Resolve a caller ccom session id to its [`Scope`] — the set
+    /// of sessions this caller is allowed to observe and mutate.
     ///
     /// - Solo caller → [`Scope::Full`] (the Phase 1–5 default).
     /// - Driver caller → [`Scope::Restricted`] containing the driver

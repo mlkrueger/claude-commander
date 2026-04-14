@@ -30,12 +30,19 @@ impl App {
             AppMode::SessionView(id) | AppMode::SessionPicker(id) => {
                 self.draw_session_view_mode(frame, th, tick, *id);
             }
-            AppMode::AttachDriverPicker { target_session_id } => {
+            AppMode::AttachDriverPicker {
+                target_session_id,
+                drivers,
+            } => {
                 // Render the originating session view underneath so
                 // the user still sees context, then overlay the
-                // driver sub-picker.
-                self.draw_session_view_mode(frame, th, tick, *target_session_id);
-                self.draw_attach_driver_picker(frame, *target_session_id);
+                // driver sub-picker. `drivers` is the snapshot
+                // captured when the picker opened — no session lock
+                // needed on the render path.
+                let target = *target_session_id;
+                let drivers = drivers.clone();
+                self.draw_session_view_mode(frame, th, tick, target);
+                self.draw_attach_driver_picker(frame, target, &drivers);
             }
             AppMode::Setup => {
                 self.draw_setup_mode(frame, th, tick);
@@ -589,13 +596,21 @@ impl App {
     /// selected row is drawn in the theme's selected style; all
     /// driver rows carry the `◆ ` prefix so the user knows they're
     /// picking a driver and not an arbitrary session.
-    fn draw_attach_driver_picker(&self, frame: &mut Frame, target_session_id: usize) {
+    ///
+    /// The `drivers` list is the snapshot captured when the picker
+    /// opened (`open_attach_driver_picker`) and stored on the
+    /// `AppMode::AttachDriverPicker` variant — this function takes
+    /// no session lock (pr-review-phase-6-tasks-3-to-7.md §D2).
+    fn draw_attach_driver_picker(
+        &self,
+        frame: &mut Frame,
+        target_session_id: usize,
+        drivers: &[(usize, String)],
+    ) {
         use ratatui::style::Style;
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Clear, Paragraph};
         let th = &self.theme;
-
-        let drivers = self.live_drivers();
 
         let area = frame.area();
         let width = 50u16.min(area.width.saturating_sub(4));
