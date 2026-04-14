@@ -467,6 +467,63 @@ fn spawn_session_empty_label_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// initial_prompt handling.
+// ---------------------------------------------------------------------------
+
+/// `spawn_session` with an `initial_prompt` must still return a valid
+/// session_id. In test mode (CCOM_TEST_SPAWN_CMD=/bin/cat) the Idle-wait
+/// is skipped and the prompt is not sent to the PTY (cat doesn't accept
+/// Claude's submit sequence), but the spawn itself must succeed and the
+/// returned session_id must be a live child of the driver.
+///
+/// The primary goal is to pin the no-panic contract — the pre-fix code
+/// would call send_prompt immediately (racing Claude's startup); the new
+/// code skips the wait for test commands. A real end-to-end test of the
+/// idle-wait path requires a live Claude binary and is covered by the
+/// manual smoke test (phase-6-task-10-smoke-test.md).
+#[test]
+fn spawn_session_with_initial_prompt_returns_valid_id() {
+    ensure_test_spawn_cmd();
+    let mut fixture = DriverFixture::build(SpawnPolicy::Trust, 0);
+    let _confirm_rx = fixture.confirm_rx.take();
+    let client = McpClient::initialize(fixture.port(), Some(&fixture.driver_id.to_string()));
+
+    let resp = client.call_tool(
+        75,
+        "spawn_session",
+        json!({
+            "label": "prompt-worker",
+            "working_dir": "/tmp",
+            "initial_prompt": "ls src/ and reply with a JSON array"
+        }),
+    );
+    assert!(
+        !tool_is_error(&resp),
+        "spawn with initial_prompt failed: {resp}"
+    );
+    let text = tool_result_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let child_id = parsed["session_id"].as_u64().expect("session_id missing") as usize;
+
+    // Verify the child is registered and linked to the driver.
+    {
+        let mgr = fixture.sessions.lock().unwrap();
+        let child = mgr.get(child_id).expect("child session not found");
+        assert_eq!(
+            child.spawned_by,
+            Some(fixture.driver_id),
+            "child should be spawned_by the driver"
+        );
+    }
+
+    {
+        let mut mgr = fixture.sessions.lock().unwrap();
+        mgr.kill(child_id);
+    }
+    fixture.stop();
+}
+
+// ---------------------------------------------------------------------------
 // Task 6 — driver-kill policy tests.
 // ---------------------------------------------------------------------------
 

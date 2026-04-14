@@ -932,11 +932,30 @@ impl Ccom {
             },
         };
 
-        // 6. Spawn + (optionally) send the initial prompt under a
-        //    single lock acquisition so an observer can't snapshot
-        //    the child without its first turn queued. `spawn_with_role`
-        //    leaves the child Solo with `spawned_by = Some(driver_id)` —
-        //    v1 nesting cap: drivers never spawn drivers.
+        // 6. Sanitize the initial_prompt before subscribing/spawning so
+        //    we can bail early without side-effects. Subscribe to the
+        //    bus *before* spawning to close the TOCTOU window between
+        //    spawn and subscribe — the session could become Idle in that
+        //    gap and we'd miss the event.
+        let clean_prompt: Option<String> = match args.initial_prompt.as_deref() {
+            Some(prompt) => match sanitize_prompt_text(prompt) {
+                Ok(clean) => Some(clean),
+                Err(reason) => {
+                    log::warn!("spawn_session: initial_prompt rejected by sanitizer: {reason}");
+                    None
+                }
+            },
+            None => None,
+        };
+        // Only subscribe for the Idle wait when running against a real
+        // Claude binary. The test command override (`/bin/cat`) never
+        // produces PTY output that would trigger the Idle transition, so
+        // waiting would always time out and slow every test by 30s.
+        let prompt_rx =
+            (clean_prompt.is_some() && !use_test_command).then(|| self.ctx.bus.subscribe());
+
+        // 7. Spawn under a single lock acquisition.
+        //    `send_prompt` is NOT called here — see step 8 below.
         //
         //    Two-phase note (pr-review-phase-6-tasks-3-to-7.md §B2):
         //    step 3 above holds the sessions mutex across the budget
@@ -949,7 +968,7 @@ impl Ccom {
         //    path below (A1 fix).
         let new_id = {
             let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            let id = match mgr.spawn_with_role(spawn_cfg, None, Some(caller_id)) {
+            match mgr.spawn_with_role(spawn_cfg, None, Some(caller_id)) {
                 Ok(id) => id,
                 Err(e) => {
                     // Restore the budget if we decremented it in step 3.
@@ -970,23 +989,50 @@ impl Ccom {
                         "spawn_session: spawn failed: {e}"
                     ))]));
                 }
-            };
-            if let Some(prompt) = args.initial_prompt.as_deref() {
-                match sanitize_prompt_text(prompt) {
-                    Ok(clean) => {
-                        if let Err(e) = mgr.send_prompt(id, &clean) {
-                            log::warn!("spawn_session({id}): initial prompt send failed: {e}");
-                        }
-                    }
-                    Err(reason) => {
-                        log::warn!(
-                            "spawn_session({id}): initial prompt rejected by sanitizer: {reason}"
-                        );
+            }
+        };
+
+        // 8. Wait for the new session to reach Idle before sending the
+        //    initial_prompt. Without this wait the submit sequence (\r)
+        //    races Claude's startup — the text lands in the PTY buffer
+        //    before Claude has rendered its input prompt and is ignored.
+        //    `Idle` is emitted by `update_statuses` once the session has
+        //    had no PTY activity for >5s, which is exactly when Claude
+        //    is sitting at its input prompt ready for input.
+        //    (Smoke test finding: workers 1+2 showed prompt in input box
+        //    but unsubmitted; only the last worker — already past the
+        //    race window — submitted correctly.)
+        if let Some((rx, clean)) = prompt_rx.zip(clean_prompt) {
+            const IDLE_WAIT_SECS: u64 = 30;
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(IDLE_WAIT_SECS);
+            let mut became_idle = false;
+            'wait: while std::time::Instant::now() < deadline {
+                while let Ok(ev) = rx.try_recv() {
+                    if matches!(
+                        &ev,
+                        crate::session::SessionEvent::StatusChanged {
+                            session_id,
+                            status: crate::session::SessionStatus::Idle,
+                        } if *session_id == new_id
+                    ) {
+                        became_idle = true;
+                        break 'wait;
                     }
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            id
-        };
+            if !became_idle {
+                log::warn!(
+                    "spawn_session({new_id}): did not become Idle within {IDLE_WAIT_SECS}s, \
+                     sending initial_prompt anyway"
+                );
+            }
+            let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = mgr.send_prompt(new_id, &clean) {
+                log::warn!("spawn_session({new_id}): initial_prompt send failed: {e}");
+            }
+        }
 
         let wire = SpawnSessionWire {
             session_id: new_id,
