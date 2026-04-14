@@ -100,7 +100,11 @@ pub enum SpawnPolicy {
 pub struct Session {
     pub id: usize,
     pub label: String,
-    #[allow(dead_code)]
+    /// Populated from the Stop hook JSON on the first signal we
+    /// receive for this session. Stable for the Claude session's
+    /// lifetime; we never overwrite a `Some` value. Consumed by
+    /// future phases (Phase 7 Option F restart-with-resume, Phase 8
+    /// session group restoration).
     pub claude_session_id: Option<String>,
     pub working_dir: PathBuf,
     pub status: SessionStatus,
