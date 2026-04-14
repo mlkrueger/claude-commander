@@ -264,8 +264,13 @@ fn main() {
         nonce,
     };
 
-    // 6. Send request and read response (590s timeout — just under Claude's 600s default)
-    let timeout = Duration::from_secs(590);
+    // 6. Send request and read response (590s timeout — just under Claude's 600s default).
+    // CCOM_APPROVAL_TIMEOUT_SECS overrides the timeout (useful in tests).
+    let timeout_secs: u64 = std::env::var("CCOM_APPROVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(590);
+    let timeout = Duration::from_secs(timeout_secs);
     match ask_via_socket(&socket_path, &request, timeout) {
         Some(decision) if decision == "allow" => {
             print_allow();
