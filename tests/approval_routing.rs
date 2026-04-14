@@ -1,4 +1,4 @@
-//! Phase 7 Tasks 1+2+3+4 — integration tests for hook infrastructure and
+//! Phase 7 Tasks 1+2+3+4+5 — integration tests for hook infrastructure and
 //! approval routing.
 //!
 //! These tests verify:
@@ -6,11 +6,14 @@
 //! - `pretooluse_settings.json` has the correct JSON shape
 //! - `respond_to_tool_approval` MCP handler resolves pending approvals
 //! - approvals_state helpers read/write/match allow-always rules
+//! - coordinator routes requests: solo→passthrough, child→driver, dynamic-attach→driver
 //!
 //! We use `CCOM_TEST_SPAWN_CMD=/bin/cat` and
 //! `CCOM_TEST_PRETOOLUSE_HOOK_CMD=echo` to avoid needing the real
 //! Claude binary or the real hook binary.
 
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
@@ -531,4 +534,323 @@ fn unknown_request_id_returns_error() {
         "error must say 'not found'; got: {text:?}"
     );
     server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Task 5 — coordinator routing tests
+// ---------------------------------------------------------------------------
+
+/// Helper: send a fake hook request directly to `socket_path` and return
+/// the decision string ("allow" | "deny" | "passthrough").
+async fn send_fake_hook_request(
+    socket_path: &std::path::Path,
+    ccom_session_id: usize,
+    tool_name: &str,
+) -> String {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixStream;
+
+    let request = json!({
+        "session_id": format!("fake-uuid-{ccom_session_id}"),
+        "ccom_session_id": ccom_session_id,
+        "tool_name": tool_name,
+        "tool_input": {"command": "ls"},
+        "cwd": "/tmp",
+        "tool_use_id": format!("fake-tool-use-{ccom_session_id}"),
+        "nonce": 99u64,
+    });
+    let path = socket_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let stream = UnixStream::connect(&path).expect("connect to approval.sock");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut line = serde_json::to_string(&request).unwrap();
+        line.push('\n');
+        writer.write_all(line.as_bytes()).unwrap();
+        writer.flush().unwrap();
+        let reader = std::io::BufReader::new(stream);
+        reader
+            .lines()
+            .next()
+            .and_then(|l| l.ok())
+            .unwrap_or_default()
+    })
+    .await
+    .expect("blocking task")
+}
+
+/// Spawn a session with `install_hook: true` inside a tokio context,
+/// return (mgr, session_id, hook_dir, approval_socket_rx).
+fn spawn_hook_session(mgr: &mut SessionManager) -> (usize, PathBuf) {
+    let id = mgr
+        .spawn(SpawnConfig {
+            label: format!("hook-test-{}", std::process::id()),
+            working_dir: PathBuf::from("/tmp"),
+            command: &std::env::var("CCOM_TEST_SPAWN_CMD").unwrap_or("/bin/cat".into()),
+            args: vec![],
+            event_tx: make_event_tx(),
+            cols: 80,
+            rows: 24,
+            install_hook: true,
+            mcp_port: None,
+        })
+        .expect("spawn");
+    let hook_dir = mgr
+        .get(id)
+        .and_then(|s| s.hook_dir())
+        .map(|p| p.to_path_buf())
+        .expect("hook_dir");
+    (id, hook_dir)
+}
+
+/// Task 5 test 1 — every Claude session gets a hook dir and approval socket.
+#[cfg(unix)]
+#[tokio::test]
+async fn solo_session_gets_hook_installed() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_test_env();
+    let bus = Arc::new(EventBus::new());
+    let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
+    let (id, hook_dir) = spawn_hook_session(&mut mgr);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        hook_dir.join("approval.sock").exists(),
+        "approval.sock must exist for hook session"
+    );
+    assert!(
+        mgr.get(id).and_then(|s| s.hook_dir()).is_some(),
+        "session must have hook_dir set"
+    );
+    mgr.kill(id);
+}
+
+/// Task 5 test 2 — solo session (no driver) gets passthrough from the coordinator.
+#[cfg(unix)]
+#[tokio::test]
+async fn solo_session_hook_replies_passthrough() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_test_env();
+    let bus = Arc::new(EventBus::new());
+    let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
+    let (id, hook_dir) = spawn_hook_session(&mut mgr);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let socket_path = hook_dir.join("approval.sock");
+    let rx = mgr
+        .get_mut(id)
+        .and_then(|s| s.take_approval_rx())
+        .expect("approval_socket_rx");
+
+    let sessions = Arc::new(Mutex::new(mgr));
+    let approvals = ApprovalRegistry::new();
+    let attachments: Arc<Mutex<HashMap<usize, HashSet<usize>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(ccom::approvals::run_coordinator(
+        rx,
+        Arc::clone(&sessions),
+        Arc::clone(&approvals),
+        Arc::clone(&bus),
+        Arc::clone(&attachments),
+    ));
+
+    let raw = send_fake_hook_request(&socket_path, id, "Bash").await;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON response");
+    assert_eq!(
+        parsed["decision"].as_str(),
+        Some("passthrough"),
+        "solo session must passthrough; got: {raw}"
+    );
+
+    sessions.lock().unwrap().kill(id);
+}
+
+/// Task 5 test 3 — child session (spawned_by driver) routes to driver.
+#[cfg(unix)]
+#[tokio::test]
+async fn driver_owned_child_routes_to_driver() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_test_env();
+    let bus = Arc::new(EventBus::new());
+    let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
+
+    // Add a dummy driver session.
+    let driver_id = mgr.peek_next_id();
+    mgr.push_for_test(
+        Session::dummy_exited(driver_id, "driver").with_role(SessionRole::Driver {
+            spawn_budget: 5,
+            spawn_policy: SpawnPolicy::Budget,
+        }),
+    );
+
+    // Spawn a real child with spawned_by = driver_id.
+    let child_id = {
+        mgr.spawn_with_role(
+            SpawnConfig {
+                label: format!("child-hook-{}", std::process::id()),
+                working_dir: PathBuf::from("/tmp"),
+                command: &std::env::var("CCOM_TEST_SPAWN_CMD").unwrap_or("/bin/cat".into()),
+                args: vec![],
+                event_tx: make_event_tx(),
+                cols: 80,
+                rows: 24,
+                install_hook: true,
+                mcp_port: None,
+            },
+            None,
+            Some(driver_id),
+        )
+        .expect("spawn child")
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let hook_dir = mgr
+        .get(child_id)
+        .and_then(|s| s.hook_dir())
+        .map(|p| p.to_path_buf())
+        .expect("hook_dir");
+    let socket_path = hook_dir.join("approval.sock");
+    let rx = mgr
+        .get_mut(child_id)
+        .and_then(|s| s.take_approval_rx())
+        .expect("approval_socket_rx");
+
+    let sessions = Arc::new(Mutex::new(mgr));
+    let approvals = ApprovalRegistry::new();
+    let attachments: Arc<Mutex<HashMap<usize, HashSet<usize>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(ccom::approvals::run_coordinator(
+        rx,
+        Arc::clone(&sessions),
+        Arc::clone(&approvals),
+        Arc::clone(&bus),
+        Arc::clone(&attachments),
+    ));
+
+    // Send request — coordinator should open a registry entry for the driver.
+    // We resolve it immediately so the socket gets a response.
+    let approvals_clone = Arc::clone(&approvals);
+    let resolve_task = tokio::spawn(async move {
+        // Poll until a pending approval appears.
+        for _ in 0..50 {
+            let pending = approvals_clone.pending_for_driver(driver_id);
+            if let Some(entry) = pending.first() {
+                let request_id = entry.request_id;
+                approvals_clone
+                    .resolve(
+                        request_id,
+                        driver_id,
+                        ccom::approvals::ApprovalDecision::Allow,
+                        ccom::approvals::ApprovalScope::Once,
+                    )
+                    .ok();
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    });
+
+    let raw = send_fake_hook_request(&socket_path, child_id, "Bash").await;
+    let resolved = resolve_task.await.unwrap_or(false);
+    assert!(resolved, "pending approval must have appeared in registry");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON response");
+    assert_eq!(
+        parsed["decision"].as_str(),
+        Some("allow"),
+        "driver-owned child must get allow; got: {raw}"
+    );
+
+    sessions.lock().unwrap().kill(child_id);
+}
+
+/// Task 5 test 4 — dynamically-attached session routes to driver after
+/// attachment, even though it was spawned solo.
+#[cfg(unix)]
+#[tokio::test]
+async fn attached_session_routes_to_driver_dynamically() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_test_env();
+    let bus = Arc::new(EventBus::new());
+    let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
+
+    // Add a dummy driver.
+    let driver_id = mgr.peek_next_id();
+    mgr.push_for_test(
+        Session::dummy_exited(driver_id, "driver").with_role(SessionRole::Driver {
+            spawn_budget: 5,
+            spawn_policy: SpawnPolicy::Budget,
+        }),
+    );
+
+    // Spawn a solo session (no spawned_by).
+    let (solo_id, hook_dir) = spawn_hook_session(&mut mgr);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let socket_path = hook_dir.join("approval.sock");
+    let rx = mgr
+        .get_mut(solo_id)
+        .and_then(|s| s.take_approval_rx())
+        .expect("approval_socket_rx");
+
+    // Dynamically attach solo → driver via the attachment map.
+    let attachments: Arc<Mutex<HashMap<usize, HashSet<usize>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    attachments
+        .lock()
+        .unwrap()
+        .entry(driver_id)
+        .or_default()
+        .insert(solo_id);
+
+    let sessions = Arc::new(Mutex::new(mgr));
+    let approvals = ApprovalRegistry::new();
+    tokio::spawn(ccom::approvals::run_coordinator(
+        rx,
+        Arc::clone(&sessions),
+        Arc::clone(&approvals),
+        Arc::clone(&bus),
+        Arc::clone(&attachments),
+    ));
+
+    // Send request — coordinator must find driver via attachment map.
+    let approvals_clone = Arc::clone(&approvals);
+    let resolve_task = tokio::spawn(async move {
+        for _ in 0..50 {
+            let pending = approvals_clone.pending_for_driver(driver_id);
+            if let Some(entry) = pending.first() {
+                approvals_clone
+                    .resolve(
+                        entry.request_id,
+                        driver_id,
+                        ccom::approvals::ApprovalDecision::Deny,
+                        ccom::approvals::ApprovalScope::Once,
+                    )
+                    .ok();
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    });
+
+    let raw = send_fake_hook_request(&socket_path, solo_id, "Edit").await;
+    let resolved = resolve_task.await.unwrap_or(false);
+    assert!(
+        resolved,
+        "pending approval must appear via dynamic attachment"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON response");
+    assert_eq!(
+        parsed["decision"].as_str(),
+        Some("deny"),
+        "dynamically-attached session must route to driver; got: {raw}"
+    );
+
+    sessions.lock().unwrap().kill(solo_id);
 }

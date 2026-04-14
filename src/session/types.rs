@@ -842,6 +842,36 @@ impl Session {
     pub fn take_approval_rx(&mut self) -> Option<tokio::sync::mpsc::Receiver<ApprovalHookRequest>> {
         self.approval_socket_rx.take()
     }
+
+    /// Phase 7 Task 5: ensure the approval socket listener is running and
+    /// return the `Receiver` end so the caller can start the coordinator.
+    ///
+    /// Two paths:
+    /// - **Tokio context** (tests, MCP-spawned child sessions): the listener
+    ///   was already started during `Session::spawn` because
+    ///   `Handle::try_current()` succeeded. Just `take()` and return the rx.
+    /// - **TUI context** (production App, no tokio on the main thread):
+    ///   `Session::spawn` skipped the listener. Start it now using `handle`
+    ///   from the MCP server's runtime.
+    ///
+    /// Returns `None` if the session has no hook dir (non-Claude session).
+    pub(crate) fn ensure_approval_socket_running(
+        &mut self,
+        handle: &tokio::runtime::Handle,
+    ) -> Option<tokio::sync::mpsc::Receiver<ApprovalHookRequest>> {
+        if self.approval_socket_tx.is_some() {
+            // Listener already started during spawn (tokio path).
+            return self.approval_socket_rx.take();
+        }
+        // Production path: start the listener now on the MCP runtime.
+        let hook_dir = self.hook_dir.as_ref()?;
+        let socket_path = hook_dir.join("approval.sock");
+        let (tx, rx) = tokio::sync::mpsc::channel::<ApprovalHookRequest>(32);
+        let task = handle.spawn(run_approval_socket_listener(socket_path, tx.clone()));
+        self.approval_socket_tx = Some(tx);
+        self.approval_socket_task = Some(task);
+        Some(rx)
+    }
 }
 
 /// Async task that binds a Unix socket at `socket_path` and listens for
