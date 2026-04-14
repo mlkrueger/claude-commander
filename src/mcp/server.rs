@@ -106,6 +106,8 @@ impl McpServer {
             sessions,
             bus,
             confirm: None,
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            event_tx: None,
         }))
     }
 
@@ -132,6 +134,34 @@ impl McpServer {
             sessions,
             bus,
             confirm: Some(bridge),
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            event_tx: None,
+        });
+        let server = Self::start(ctx)?;
+        Ok((server, rx))
+    }
+
+    /// Phase 6 Task 3 test seam: like [`Self::start_with_confirm`]
+    /// but also wires an `event_tx` onto the ctx so `spawn_session`
+    /// can actually create child sessions. Tests pass a real
+    /// `MonitoredSender` they can drain to observe PTY output.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn start_with_confirm_and_event_tx(
+        sessions: Arc<Mutex<crate::session::SessionManager>>,
+        bus: Arc<crate::session::EventBus>,
+        event_tx: crate::event::MonitoredSender,
+    ) -> anyhow::Result<(
+        Self,
+        std::sync::mpsc::Receiver<super::confirm::ConfirmRequest>,
+    )> {
+        let (bridge, rx) = super::confirm::ConfirmBridge::new();
+        let ctx = Arc::new(McpCtx {
+            sessions,
+            bus,
+            confirm: Some(bridge),
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            event_tx: Some(event_tx),
         });
         let server = Self::start(ctx)?;
         Ok((server, rx))
@@ -187,17 +217,6 @@ async fn run_server(
         "::1",
     ]);
 
-    let service = StreamableHttpService::new(
-        {
-            let ctx = Arc::clone(&ctx);
-            move || Ok(Ccom::new(Arc::clone(&ctx)))
-        },
-        LocalSessionManager::default().into(),
-        config,
-    );
-
-    let router = axum::Router::new().nest_service("/mcp", service);
-
     // Task 7: bind loopback ONLY. A future refactor that accidentally
     // flips this to `0.0.0.0` would expose ccom's internal state to
     // the network; the runtime assertion below refuses to start the
@@ -236,6 +255,20 @@ async fn run_server(
         return;
     }
 
+    // Phase 6 Task 3: the `spawn_session` handler needs to know the
+    // port so it can write a `.mcp.json` for newly spawned children.
+    // Build the factory closure AFTER bind so we can hand the port
+    // into every `Ccom` instance.
+    let service = StreamableHttpService::new(
+        {
+            let ctx = Arc::clone(&ctx);
+            move || Ok(Ccom::new_with_port(Arc::clone(&ctx), port))
+        },
+        LocalSessionManager::default().into(),
+        config,
+    );
+    let router = axum::Router::new().nest_service("/mcp", service);
+
     let cancel_for_shutdown = cancel.clone();
     if let Err(e) = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -261,6 +294,8 @@ mod tests {
             sessions,
             bus,
             confirm: None,
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            event_tx: None,
         })
     }
 

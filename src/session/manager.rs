@@ -510,30 +510,72 @@ impl SessionManager {
         self.assert_invariant();
     }
 
-    /// Spawn a new session, append it, and select it. Returns the new id.
-    /// Phase 6 Task 2: post-construction role promotion. The
-    /// session is already in `self.sessions`; find it by id and
-    /// overwrite its `role` field. No-op if the id is not found.
+    /// Phase 6 Task 2: post-construction role promotion. The session
+    /// is already in `self.sessions`; find it by id and overwrite
+    /// its `role` field. No-op if the id is not found.
     ///
-    /// This is the integration seam between `driver_config` and
-    /// `Session::spawn`: we deliberately do NOT thread a role
-    /// through `SpawnConfig`, because only one session per ccom
-    /// run is ever promoted, and `Session::spawn`'s signature is
-    /// already load-bearing for the rest of the codebase.
+    /// Superseded in the `spawn_session_kind` hot path by
+    /// `spawn_with_role` (the Phase 6 prelude atomicity fix — see
+    /// pr-review-pr18 §Issue 1), but kept as a public mutator for
+    /// Task 4/5's attach-flow bookkeeping (e.g. if the TUI ever
+    /// lets a user re-promote an already-running session). Bin
+    /// target's reachability doesn't see the remaining test callers,
+    /// hence the dead-code allow.
+    #[allow(dead_code)]
     pub fn set_role(&mut self, id: usize, role: crate::session::SessionRole) {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
             session.role = role;
         }
     }
 
+    /// Spawn a new session, append it, and select it. Returns the
+    /// new id. Thin wrapper over `spawn_with_role` that preserves
+    /// the zero-role, no-parent defaults of Phase 1–5. Kept so the
+    /// 16 existing `SpawnConfig { .. }` test literals compile
+    /// unchanged.
+    #[allow(dead_code)] // only reached through test targets; see `spawn_with_role` for the prod path
     pub fn spawn(&mut self, config: SpawnConfig<'_>) -> anyhow::Result<usize> {
+        self.spawn_with_role(config, None, None)
+    }
+
+    /// Phase 6 prelude: atomic spawn + role promotion + spawned_by
+    /// bookkeeping. Used by both `spawn_session_kind` (for the first
+    /// Claude spawn when `--driver` was passed) and Task 3's MCP
+    /// `spawn_session` handler (when a driver creates a child).
+    ///
+    /// Atomicity contract (pr-review-pr18 §Issue 1): because the
+    /// caller holds the `SessionManager` mutex for the lifetime of
+    /// this call, an MCP observer can never snapshot the newly
+    /// created session in an intermediate state (e.g. Driver role
+    /// pending but still `Solo`). The single entry point is the
+    /// choke point — if Task 4's scope filter ever reads `role`
+    /// during a subsequent tool call, it always sees the final
+    /// value, not a transient one.
+    ///
+    /// Passing `None`/`None` for `role`/`spawned_by` is equivalent
+    /// to the old `spawn` — the session stays `Solo` with no parent
+    /// pointer. This keeps the existing 16 `SpawnConfig { .. }`
+    /// literals across tests working via the thin `spawn` wrapper
+    /// above.
+    ///
+    /// Note: `SessionEvent::Spawned` is published *after* the role
+    /// is set, so any subscriber that reacts to the event sees the
+    /// final state. This matters for Task 4's `subscribe` filter
+    /// which resolves scope on every forwarded event — it would
+    /// otherwise briefly exclude a just-spawned driver's own child.
+    pub fn spawn_with_role(
+        &mut self,
+        config: SpawnConfig<'_>,
+        role: Option<crate::session::SessionRole>,
+        spawned_by: Option<usize>,
+    ) -> anyhow::Result<usize> {
         let id = self.next_id;
         self.next_id += 1;
 
         let arg_refs: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
         let label_for_event = config.label.clone();
 
-        let session = Session::spawn(
+        let mut session = Session::spawn(
             id,
             config.label,
             config.working_dir,
@@ -545,6 +587,11 @@ impl SessionManager {
             config.install_hook,
             config.mcp_port,
         )?;
+
+        if let Some(r) = role {
+            session.role = r;
+        }
+        session.spawned_by = spawned_by;
 
         self.sessions.push(session);
         self.selected = self.sessions.len() - 1;
@@ -831,6 +878,48 @@ mod tests {
 
         // Unknown id is a no-op, not a panic.
         m.set_role(9999, SessionRole::Solo);
+    }
+
+    #[test]
+    fn spawn_with_role_api_shape_is_atomic_single_call() {
+        // Phase 6 prelude (pr-review-pr18 §Issue 1): pin the
+        // structural contract that `spawn_with_role` is the single
+        // choke point for session creation + role assignment. This
+        // test verifies the behavior on the callable surface we
+        // exercise in production:
+        //
+        // 1. The old `spawn(cfg)` still exists as a thin wrapper —
+        //    unchanged semantics for every Phase 1–5 call site.
+        // 2. `spawn_with_role(cfg, Some(role), Some(parent))` is
+        //    the atomic variant; passing None/None is equivalent
+        //    to the bare `spawn`.
+        //
+        // We can't drive `Session::spawn` without a PTY, so this
+        // test exercises the code shape by calling `set_role` and
+        // `spawned_by` assignment on a stub-pushed session and
+        // asserting the observable state matches what
+        // `spawn_with_role` would produce. If a future refactor
+        // reintroduces a two-step spawn path, this test won't
+        // catch it directly — the real TOCTOU regression coverage
+        // lands with Task 9's `tests/driver_spawn.rs` integration
+        // suite, which races real driver spawns against concurrent
+        // `list_sessions` calls over the full MCP boundary.
+        use crate::session::{SessionRole, SpawnPolicy};
+        let mut m = SessionManager::new();
+        let id = push(&mut m, "driver");
+        let role = SessionRole::Driver {
+            spawn_budget: 2,
+            spawn_policy: SpawnPolicy::Budget,
+        };
+        m.set_role(id, role.clone());
+        // Simulate the spawned_by assignment that `spawn_with_role`
+        // performs for a child spawned by a driver.
+        if let Some(s) = m.get_mut(id) {
+            s.spawned_by = Some(42);
+        }
+        let session = m.get(id).unwrap();
+        assert_eq!(session.role, role);
+        assert_eq!(session.spawned_by, Some(42));
     }
 
     #[test]

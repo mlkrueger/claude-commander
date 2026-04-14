@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::session::{Session, lock_parser};
+use crate::ui::panels::driver_role_suffix;
 use crate::ui::theme::{self, Theme};
 use crate::ui::widgets::terminal::TerminalWidget;
 
@@ -31,10 +32,16 @@ impl<'a> SessionViewPanel<'a> {
 
 impl Widget for SessionViewPanel<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // Phase 6 Task 7: append a `[driver · …]` suffix to the title
+        // bar when viewing a driver so the user always knows which
+        // role they're interacting with. Non-driver sessions get the
+        // original title unchanged. Shared helper keeps the format
+        // in sync with the session list panel's row suffix.
         let title = format!(
-            " {} \u{2014} {} ",
+            " {} \u{2014} {}{} ",
             self.session.label,
-            self.session.working_dir.display()
+            self.session.working_dir.display(),
+            driver_role_suffix(&self.session.role)
         );
         let block = Block::default()
             .title(title)

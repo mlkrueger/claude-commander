@@ -48,6 +48,23 @@ impl App {
             AppMode::Setup => self.handle_setup_key(key),
             AppMode::QuitConfirm => self.handle_quit_confirm_key(key),
             AppMode::McpConfirm => self.handle_mcp_confirm_key(key),
+            AppMode::AttachDriverPicker {
+                target_session_id,
+                drivers,
+                restore_picker_selected,
+            } => {
+                let target = *target_session_id;
+                let driver_count = drivers.len();
+                let selected_driver = drivers.get(self.picker_selected).cloned();
+                let restore = *restore_picker_selected;
+                self.handle_attach_driver_picker_key(
+                    key,
+                    target,
+                    driver_count,
+                    selected_driver,
+                    restore,
+                );
+            }
         }
     }
 
@@ -392,6 +409,17 @@ impl App {
             KeyCode::Esc => {
                 self.mode = AppMode::SessionView(from_session_id);
             }
+            KeyCode::Char('a') => {
+                // Phase 6 Task 5: attach the highlighted session to a
+                // driver. Resolve the current selection into a session
+                // id before transitioning so the driver picker knows
+                // what to attach on Enter.
+                let picker_idx = self.picker_selected;
+                let target_id = self.sessions_lock().iter().nth(picker_idx).map(|s| s.id);
+                if let Some(target_id) = target_id {
+                    self.open_attach_driver_picker(target_id);
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 let len = self.sessions_lock().len();
                 if len > 0 {
@@ -424,6 +452,60 @@ impl App {
                 if let Some(id) = id {
                     self.mode = AppMode::SessionView(id);
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Phase 6 Task 5: driver sub-picker keys. Up/Down cycle through
+    /// live driver indices; Enter commits the attachment; Esc aborts
+    /// back to the main session picker the user came from.
+    fn handle_attach_driver_picker_key(
+        &mut self,
+        key: KeyEvent,
+        target_session_id: usize,
+        driver_count: usize,
+        selected_driver: Option<(usize, String)>,
+        restore_picker_selected: usize,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                // Return to the session picker with its original
+                // highlight row restored — see
+                // pr-review-phase-6-tasks-3-to-7.md finding 2 on
+                // PR #22.
+                self.picker_selected = restore_picker_selected;
+                self.mode = AppMode::SessionPicker(target_session_id);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if driver_count > 0 {
+                    self.picker_selected = (self.picker_selected + 1) % driver_count;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if driver_count > 0 {
+                    self.picker_selected = self
+                        .picker_selected
+                        .checked_sub(1)
+                        .unwrap_or(driver_count - 1);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some((driver_id, driver_label)) = selected_driver {
+                    // `attach_session_to_driver` re-checks that the
+                    // driver is still live at commit time; if it
+                    // exited while the picker was open, the call
+                    // logs a warning and no-ops.
+                    self.attach_session_to_driver(driver_id, target_session_id);
+                    self.status_message = Some(format!(
+                        "Attached session {target_session_id} to driver {driver_label}"
+                    ));
+                }
+                // Same restore as Esc: the user landed in the driver
+                // picker from a specific session-picker row and
+                // should return to that row.
+                self.picker_selected = restore_picker_selected;
+                self.mode = AppMode::SessionPicker(target_session_id);
             }
             _ => {}
         }

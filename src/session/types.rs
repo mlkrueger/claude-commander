@@ -246,7 +246,10 @@ impl Session {
                 // `--mcp-config`. Best-effort — failure logs a
                 // warning but does not fail the spawn.
                 if let Some(port) = mcp_port {
-                    match hook::write_mcp_config(&hook_dir, port) {
+                    // Phase 6 Task 3: inject the session's own id as
+                    // the `X-Ccom-Caller` header so MCP handlers can
+                    // identify the caller for scope resolution.
+                    match hook::write_mcp_config(&hook_dir, port, Some(id)) {
                         Ok(()) => {
                             let mcp_config_path = hook_dir.join(".mcp.json");
                             flags.push("--mcp-config".to_string());

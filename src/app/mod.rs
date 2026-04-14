@@ -1,8 +1,10 @@
+mod attach;
 mod keys;
 mod render;
 
 use crate::event::MonitoredSender;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -33,6 +35,30 @@ pub enum AppMode {
     /// confirmation. The pending request lives in
     /// `App::pending_confirm`.
     McpConfirm,
+    /// Phase 6 Task 5: sub-picker overlay that lists live drivers so
+    /// the user can attach a target session to one of them. Entered
+    /// from `SessionPicker` via `a`; `target_session_id` is the
+    /// session that will be added to the chosen driver's
+    /// `attachment_map` entry.
+    ///
+    /// `drivers` is snapshotted at mode entry time
+    /// (`open_attach_driver_picker`) so the key handler and render
+    /// function don't each acquire `sessions_lock()` per interaction
+    /// — a driver that exits while the picker is open still renders
+    /// in the list until the user dismisses the overlay, but the
+    /// `attach_session_to_driver` call will re-check liveness before
+    /// committing. See pr-review-phase-6-tasks-3-to-7.md §D2.
+    ///
+    /// `restore_picker_selected` is the `App.picker_selected` value
+    /// the user had in the originating `SessionPicker` before
+    /// pressing `a`. Both the Esc and Enter arms of the key handler
+    /// write it back before returning to `SessionPicker` so the
+    /// highlight lands on the originally-selected row, not on 0.
+    AttachDriverPicker {
+        target_session_id: usize,
+        drivers: Vec<(usize, String)>,
+        restore_picker_selected: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +173,27 @@ pub struct App {
     /// `--driver` is passed. `take()`n on first use so subsequent
     /// spawns stay `Solo`.
     pub pending_driver_role: Option<SessionRole>,
+    /// Phase 6 prelude: explicit driver-to-attached-session mapping.
+    /// Keyed by driver session id → set of session ids the user
+    /// has manually attached to that driver via the TUI's attach-to
+    /// -driver action (Task 5). Separate from parent/child spawning:
+    /// attachments are user-initiated and visible to the driver's
+    /// MCP scope filter in addition to its own `spawned_by` children.
+    ///
+    /// Stored as `Arc<Mutex<..>>` rather than plain `HashMap` because
+    /// the MCP server thread needs read access for `McpCtx::caller_scope`,
+    /// and the TUI thread needs write access for attach/detach +
+    /// on-driver-exit cleanup. The shared-pointer contract is
+    /// load-bearing: App owns the only write path, the MCP thread
+    /// observes snapshots. Same memory — no divergence possible.
+    ///
+    /// `#[allow(dead_code)]` until Task 5's attach-to-driver key
+    /// handler lands — at that point the field becomes the TUI's
+    /// write path. The `Arc` clone in `App::new` hands it to
+    /// `McpCtx::attachments`, which already exists but is also
+    /// unread until Task 4's `caller_scope` body replaces the stub.
+    #[allow(dead_code)]
+    pub(crate) attachment_map: Arc<Mutex<HashMap<usize, HashSet<usize>>>>,
 }
 
 const ATTENTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -179,6 +226,14 @@ impl App {
         let event_bus = Arc::new(EventBus::new());
         let sessions = Arc::new(Mutex::new(SessionManager::with_bus(Arc::clone(&event_bus))));
 
+        // Phase 6 prelude: shared driver-attachment map. App is the
+        // only writer (attach/detach + on-driver-exit cleanup); the
+        // `ccom-mcp` thread reads through `McpCtx::caller_scope` when
+        // resolving a driver caller's visible session set. Same
+        // `Arc<Mutex<_>>` on both sides, so there's no divergence.
+        let attachment_map: Arc<Mutex<HashMap<usize, HashSet<usize>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         // Phase 5: cross-thread confirmation bridge for write tools.
         // The bridge's receiver is drained each tick by `handle_event`;
         // the sender side lives on `McpCtx` so tool handlers on the
@@ -192,6 +247,11 @@ impl App {
                 sessions: Arc::clone(&sessions),
                 bus: Arc::clone(&event_bus),
                 confirm: Some(Arc::clone(&confirm_bridge)),
+                attachments: Arc::clone(&attachment_map),
+                // Phase 6 Task 3: hand the event sender to the MCP
+                // ctx so `spawn_session` can spawn new sessions
+                // whose PTY output reaches the main TUI event loop.
+                event_tx: Some(event_tx.clone()),
             });
             match crate::mcp::McpServer::start(ctx) {
                 Ok(server) => {
@@ -242,6 +302,7 @@ impl App {
             tick_count: 0,
             picker_selected: 0,
             pending_driver_role: None,
+            attachment_map,
         }
     }
 
@@ -295,6 +356,19 @@ impl App {
                 }
             }
             Event::SessionExited { session_id, code } => {
+                // Phase 6 Task 5: if the exited session was a driver,
+                // drop its attachment set so stale entries don't
+                // linger. Reads the role before mutating status so
+                // the check still sees `Driver` regardless of the
+                // exit order. Also scrubs the id from any OTHER
+                // driver's attachment set — an attached session
+                // going away should leave the attacher's list clean.
+                let was_driver = self
+                    .sessions_lock()
+                    .get(session_id)
+                    .map(|s| matches!(s.role, SessionRole::Driver { .. }))
+                    .unwrap_or(false);
+                self.scrub_attachments_for_exited(session_id, was_driver);
                 if let Some(session) = self.sessions_lock().get_mut(session_id) {
                     session.status = SessionStatus::Exited(code);
                 }
@@ -385,20 +459,36 @@ impl App {
             mcp_port,
         };
 
-        let spawn_res = self.sessions_lock().spawn(config);
+        // Phase 6 prelude (pr-review-pr18 §Issue 1): route through
+        // `SessionManager::spawn_with_role`, which performs the
+        // session creation + role promotion as a single atomic
+        // operation under one sessions-mutex acquisition. Fixes the
+        // TOCTOU window where an MCP-thread observer could otherwise
+        // snapshot the new session with `role = Solo` between a
+        // `spawn()` and a subsequent `set_role()`.
+        //
+        // `pending_driver_role` is `take()`n BEFORE acquiring the
+        // lock because `self.sessions_lock()` borrows `&self` for
+        // the guard's lifetime. On spawn failure the role is put
+        // back so a subsequent retry can still consume it.
+        let pending_role = if matches!(kind, SessionKind::Claude) {
+            self.pending_driver_role.take()
+        } else {
+            None
+        };
+        if let Some(role) = pending_role.as_ref() {
+            log::info!("promoting next Claude spawn to driver role: {role:?}");
+        }
+        let spawn_res = self
+            .sessions_lock()
+            .spawn_with_role(config, pending_role.clone(), None);
+        if spawn_res.is_err()
+            && let Some(role) = pending_role
+        {
+            self.pending_driver_role = Some(role);
+        }
         match spawn_res {
-            Ok(id) => {
-                // Phase 6 Task 2: if a pending driver role is
-                // queued and this is a Claude session, promote it
-                // in-place. `take()` ensures only the first Claude
-                // spawn is promoted — subsequent spawns (including
-                // any further `--spawn N` startup spawns) stay Solo.
-                if matches!(kind, SessionKind::Claude)
-                    && let Some(role) = self.pending_driver_role.take()
-                {
-                    log::info!("promoting session {id} to driver role: {role:?}");
-                    self.sessions_lock().set_role(id, role);
-                }
+            Ok(_id) => {
                 self.update_file_tree_for_selected();
             }
             Err(e) => {
@@ -418,6 +508,82 @@ impl App {
         if let Some(session) = self.sessions_lock().selected_mut() {
             session.try_write(b"\x1b[B\x1b[B\r");
         }
+    }
+
+    // --- Phase 6 Task 5: driver attachment helpers ---
+
+    /// Returns the set of alive drivers in manager order as
+    /// `(id, label)` tuples. Used by the attach sub-picker for both
+    /// the overlay listing and the Enter-commits path.
+    pub(crate) fn live_drivers(&self) -> Vec<(usize, String)> {
+        self.sessions_lock()
+            .iter()
+            .filter(|s| {
+                matches!(s.role, SessionRole::Driver { .. })
+                    && !matches!(s.status, SessionStatus::Exited(_))
+            })
+            .map(|s| (s.id, s.label.clone()))
+            .collect()
+    }
+
+    /// Switch to the attach-driver sub-picker if any live drivers
+    /// exist. If not, surface a status message and stay put. The
+    /// driver list is snapshotted here and cached on the mode
+    /// variant so subsequent key events and render frames don't
+    /// re-lock `sessions`. See pr-review-phase-6-tasks-3-to-7.md §D2.
+    ///
+    /// Captures `self.picker_selected` before resetting it so the
+    /// Esc/Enter return path can restore the originating session
+    /// picker's highlight (pr-review-phase-6-tasks-3-to-7.md §B —
+    /// finding 2 on PR #22).
+    pub(crate) fn open_attach_driver_picker(&mut self, target_session_id: usize) {
+        let drivers = self.live_drivers();
+        if drivers.is_empty() {
+            self.status_message = Some("No active drivers — launch ccom with --driver".to_string());
+            return;
+        }
+        let restore_picker_selected = self.picker_selected;
+        self.picker_selected = 0;
+        self.mode = AppMode::AttachDriverPicker {
+            target_session_id,
+            drivers,
+            restore_picker_selected,
+        };
+    }
+
+    /// Add `target` to `driver`'s attachment set. Idempotent. No-op
+    /// with a logged warning if `driver` doesn't point at a live
+    /// driver session.
+    pub(crate) fn attach_session_to_driver(&mut self, driver_id: usize, target: usize) {
+        let is_live_driver = self
+            .sessions_lock()
+            .get(driver_id)
+            .map(|s| {
+                matches!(s.role, SessionRole::Driver { .. })
+                    && !matches!(s.status, SessionStatus::Exited(_))
+            })
+            .unwrap_or(false);
+        if !is_live_driver {
+            log::warn!("attach_session_to_driver: {driver_id} is not a live driver");
+            return;
+        }
+        let mut map = self
+            .attachment_map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        attach::attach(&mut map, driver_id, target);
+    }
+
+    /// Invoked from the `SessionExited` handler. If the exited session
+    /// was a driver, drop its entry entirely; either way, scrub its
+    /// id from any OTHER driver's attachment set so references don't
+    /// linger after reaping.
+    pub(crate) fn scrub_attachments_for_exited(&mut self, id: usize, was_driver: bool) {
+        let mut map = self
+            .attachment_map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        attach::scrub_on_exit(&mut map, id, was_driver);
     }
 
     fn kill_selected(&mut self) {

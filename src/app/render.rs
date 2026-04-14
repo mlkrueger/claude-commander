@@ -30,6 +30,23 @@ impl App {
             AppMode::SessionView(id) | AppMode::SessionPicker(id) => {
                 self.draw_session_view_mode(frame, th, tick, *id);
             }
+            AppMode::AttachDriverPicker {
+                target_session_id,
+                drivers,
+                // `restore_picker_selected` is consumed by the key
+                // handler, not rendering — ignore it here.
+                restore_picker_selected: _,
+            } => {
+                // Render the originating session view underneath so
+                // the user still sees context, then overlay the
+                // driver sub-picker. `drivers` is the snapshot
+                // captured when the picker opened — no session lock
+                // needed on the render path.
+                let target = *target_session_id;
+                let drivers = drivers.clone();
+                self.draw_session_view_mode(frame, th, tick, target);
+                self.draw_attach_driver_picker(frame, target, &drivers);
+            }
             AppMode::Setup => {
                 self.draw_setup_mode(frame, th, tick);
             }
@@ -87,6 +104,15 @@ impl App {
         frame.render_widget(tree_panel, layout.file_tree);
 
         {
+            // Snapshot the driver-attachment map before taking the
+            // session lock so rendering holds exactly one lock at a
+            // time. The map is small (driver count × attached ids)
+            // so the clone is cheap.
+            let attachments = self
+                .attachment_map
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
             let mgr = self.sessions_lock();
             let session_list = SessionListPanel::new(
                 mgr.as_slice(),
@@ -94,7 +120,8 @@ impl App {
                 self.focus == PanelFocus::SessionList,
                 th,
                 tick,
-            );
+            )
+            .with_attachments(attachments);
             frame.render_widget(session_list, layout.main);
         }
 
@@ -508,6 +535,7 @@ impl App {
         let tool_name = match req.tool {
             ConfirmTool::SendPrompt => "send_prompt",
             ConfirmTool::KillSession => "kill_session",
+            ConfirmTool::SpawnSession => "spawn_session",
         };
 
         // Look up the session label so the prompt is human-readable.
@@ -565,6 +593,80 @@ impl App {
             Span::styled(" Deny", th.shortcut_desc()),
         ]);
         frame.render_widget(help, Rect::new(inner.x, inner.y + 5, inner.width, 1));
+    }
+
+    /// Phase 6 Task 5: compact overlay listing live drivers. The
+    /// selected row is drawn in the theme's selected style; all
+    /// driver rows carry the `◆ ` prefix so the user knows they're
+    /// picking a driver and not an arbitrary session.
+    ///
+    /// The `drivers` list is the snapshot captured when the picker
+    /// opened (`open_attach_driver_picker`) and stored on the
+    /// `AppMode::AttachDriverPicker` variant — this function takes
+    /// no session lock (pr-review-phase-6-tasks-3-to-7.md §D2).
+    fn draw_attach_driver_picker(
+        &self,
+        frame: &mut Frame,
+        target_session_id: usize,
+        drivers: &[(usize, String)],
+    ) {
+        use ratatui::style::Style;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+        let th = &self.theme;
+
+        let area = frame.area();
+        let width = 50u16.min(area.width.saturating_sub(4));
+        let content_height = (drivers.len() as u16 + 4).max(5);
+        let height = content_height.min(area.height.saturating_sub(2));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let modal_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, modal_area);
+
+        let title = format!(" Attach session {target_session_id} to driver ");
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(th.border_focused());
+        let inner = block.inner(modal_area);
+        frame.render_widget(block, modal_area);
+        if th.is_rainbow() {
+            crate::ui::theme::paint_rainbow_border(frame.buffer_mut(), modal_area, self.tick_count);
+        }
+
+        let mut lines: Vec<Line> = Vec::new();
+        if drivers.is_empty() {
+            lines.push(Line::styled(
+                "  No active drivers.",
+                Style::default().fg(th.status_warn),
+            ));
+        } else {
+            for (i, (id, label)) in drivers.iter().enumerate() {
+                let row_style = if i == self.picker_selected {
+                    th.selected()
+                } else {
+                    Style::default().fg(th.text)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {}", th.driver_icon()),
+                        Style::default().fg(th.driver_color()),
+                    ),
+                    Span::styled(format!("{label} (id={id})"), row_style),
+                ]));
+            }
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("  [Enter]", th.shortcut_key()),
+            Span::styled(" Attach  ", th.shortcut_desc()),
+            Span::styled("[Esc]", th.shortcut_key()),
+            Span::styled(" Cancel", th.shortcut_desc()),
+        ]));
+
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_help_modal(&self, frame: &mut Frame) {

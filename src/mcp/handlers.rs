@@ -19,8 +19,34 @@ use rmcp::{
 };
 
 use super::confirm::{ConfirmResponse, ConfirmTool};
-use super::sanitize::sanitize_prompt_text;
-use super::state::{McpCtx, SendPromptRejection};
+use super::sanitize::{sanitize_label, sanitize_prompt_text};
+use super::state::{McpCtx, Scope, SendPromptRejection};
+
+/// Parse the `X-Ccom-Caller` request header into a ccom session id.
+///
+/// Returns `None` when the header is absent (pre-Phase-6 client,
+/// unit tests that construct a `RequestContext` without it, or a
+/// direct HTTP caller that never set it) or when the value fails
+/// to parse as a `usize`. Callers default to `Scope::Full` on
+/// `None` — the legacy path — so an unparseable header silently
+/// degrades to "unknown caller" rather than hard-failing the tool.
+///
+/// **No authentication is performed.** Any local process that can
+/// reach the loopback port can claim any caller id; there is no
+/// cryptographic identity check. The server is loopback-only
+/// (pinned via `StreamableHttpServerConfig::with_allowed_hosts` in
+/// `src/mcp/server.rs`), which bounds the threat surface to local
+/// processes on the same host. If the server ever grows a
+/// non-loopback binding, this header mechanism becomes insufficient
+/// and needs replacing with a real auth layer — see
+/// `docs/plans/phase-6-driver-role.md` §Risks.
+fn caller_id_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<usize> {
+    ctx.extensions
+        .get::<http::request::Parts>()
+        .and_then(|parts| parts.headers.get("x-ccom-caller"))
+        .and_then(|hv| hv.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+}
 
 /// Per-MCP-session tool handler. Constructed by the factory closure
 /// in [`super::server::run_server`] on every new MCP session, so
@@ -31,6 +57,16 @@ pub struct Ccom {
     /// Shared ctx used by all tool handlers. `Arc<>` so the clone
     /// inside the factory closure is cheap.
     pub(super) ctx: Arc<McpCtx>,
+    /// Loopback port the embedded MCP server is listening on. `Some`
+    /// in production (set by the factory closure in
+    /// `run_server`); `None` in unit tests that construct a `Ccom`
+    /// directly. The `spawn_session` handler uses it to write the
+    /// child session's `.mcp.json` so the child points at the same
+    /// server. Children with `None` get no `.mcp.json` — a degraded
+    /// but still functional mode that matches the pre-Phase-4 Terminal
+    /// session spawn path.
+    #[allow(dead_code)]
+    pub(super) mcp_port: Option<u16>,
     /// Generated tool-router field required by the rmcp
     /// `#[tool_router]` macro. The field name is load-bearing — the
     /// macro reads it by name. Triggers a dead_code warning because
@@ -108,6 +144,28 @@ pub struct KillSessionArgs {
     /// The ccom session id to kill. Scope-restricted: must be a
     /// session currently owned by the TUI.
     pub session_id: usize,
+}
+
+/// Arguments for the `spawn_session` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SpawnSessionArgs {
+    /// Short human label for the child session (shown in the TUI
+    /// session list). Sanitized: ANSI/control stripped, whitelist
+    /// of ASCII alnum + ` -_./:`, truncated to 64 chars.
+    pub label: String,
+    /// Working directory for the child. If omitted, the child
+    /// inherits the driver's `working_dir`.
+    pub working_dir: Option<String>,
+    /// Optional first prompt to send to the child after spawn.
+    /// Sanitized by the same policy as `send_prompt`.
+    pub initial_prompt: Option<String>,
+}
+
+/// Wire-format reply for `spawn_session`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct SpawnSessionWire {
+    pub session_id: usize,
+    pub label: String,
 }
 
 /// Arguments for the `subscribe` tool.
@@ -205,9 +263,22 @@ impl From<&crate::session::SessionEvent> for SessionEventWire {
 
 #[tool_router]
 impl Ccom {
+    #[allow(dead_code)] // used by unit tests; bin target can't see them
     pub(super) fn new(ctx: Arc<McpCtx>) -> Self {
         Self {
             ctx,
+            mcp_port: None,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Production constructor used by the `run_server` factory
+    /// closure once the port is known. Tests use [`Self::new`] which
+    /// leaves `mcp_port = None`.
+    pub(super) fn new_with_port(ctx: Arc<McpCtx>, mcp_port: u16) -> Self {
+        Self {
+            ctx,
+            mcp_port: Some(mcp_port),
             tool_router: Self::tool_router(),
         }
     }
@@ -248,9 +319,22 @@ impl Ccom {
     #[tool(description = "List all sessions ccom is currently managing. \
                        Returns a JSON array of SessionSummary objects \
                        with id, label, working_dir, status, last_activity_secs, \
-                       and context_percent.")]
-    async fn list_sessions(&self) -> Result<CallToolResult, McpError> {
-        let summaries = self.ctx.list_sessions();
+                       and context_percent. A driver caller (identified by \
+                       the X-Ccom-Caller header) sees only sessions it spawned \
+                       or has attached to itself; solo callers see every session.")]
+    async fn list_sessions(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut summaries = self.ctx.list_sessions();
+        // Phase 6 Task 4: scope-filter the output for driver callers.
+        // `caller_id_from_ctx` returns `None` for legacy clients
+        // without the header; `caller_scope` then returns
+        // `Scope::Full` and the retain is a no-op.
+        if let Some(caller_id) = caller_id_from_ctx(&ctx) {
+            let scope = self.ctx.caller_scope(caller_id);
+            summaries.retain(|s| scope.permits(s.id));
+        }
         let json = serde_json::to_string(&summaries)
             .map_err(|e| McpError::internal_error(format!("list_sessions serialize: {e}"), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -264,7 +348,21 @@ impl Ccom {
     async fn read_response(
         &self,
         Parameters(args): Parameters<ReadResponseArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // Phase 6 Task 4: scope check — a driver caller may only
+        // read responses from sessions in its scope. Unknown caller
+        // (no header) → `Scope::Full` → legacy behavior.
+        if let Some(caller_id) = caller_id_from_ctx(&ctx) {
+            let scope = self.ctx.caller_scope(caller_id);
+            if !scope.permits(args.session_id) {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "session {} not found",
+                    args.session_id
+                ))]));
+            }
+        }
+
         let requested_turn = args.turn_id.map(crate::session::TurnId::new);
 
         // Fast path: is the turn already stored?
@@ -345,7 +443,22 @@ impl Ccom {
     async fn send_prompt(
         &self,
         Parameters(args): Parameters<SendPromptArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // Phase 6 Task 4: scope gate. A driver caller that targets a
+        // session outside its scope gets the same `NotFound` shape as
+        // an unknown session id — a driver must not be able to probe
+        // the existence of sibling drivers' children.
+        if let Some(caller_id) = caller_id_from_ctx(&ctx) {
+            let scope = self.ctx.caller_scope(caller_id);
+            if !scope.permits(args.session_id) {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "session {} not found",
+                    args.session_id
+                ))]));
+            }
+        }
+
         // 1. Sanitize the caller-supplied text. Policy violations
         //    (empty, oversized, all-control) come back as plain
         //    strings suitable for a tool-level error.
@@ -385,6 +498,7 @@ impl Ccom {
     async fn kill_session(
         &self,
         Parameters(args): Parameters<KillSessionArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         // 1. Scope check: unknown session → NotFound without any
         //    side effects and without raising a confirmation modal.
@@ -393,6 +507,53 @@ impl Ccom {
             if mgr.get(args.session_id).is_none() {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "session {} not found",
+                    args.session_id
+                ))]));
+            }
+        }
+
+        // Phase 6 Task 6: driver-kill policy.
+        //
+        // - Solo caller (or legacy no-header call) → Scope::Full →
+        //   confirmation modal (Phase 5 behavior, unchanged).
+        // - Driver killing a child/attached session in its scope
+        //   (and NOT itself) → silent: drivers own their children,
+        //   prompting the user for every orchestrated shutdown is
+        //   theater. A driver killing itself still goes through the
+        //   modal — self-termination is destructive and the user
+        //   should confirm.
+        // - Driver targeting something outside its scope →
+        //   NotFound (same opacity as an unknown id).
+        let caller_id = caller_id_from_ctx(&ctx);
+        let silent_driver_kill = if let Some(cid) = caller_id {
+            match self.ctx.caller_scope(cid) {
+                Scope::Full => false,
+                Scope::Restricted(set) => {
+                    if !set.contains(&args.session_id) {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "session {} not found",
+                            args.session_id
+                        ))]));
+                    }
+                    // In scope, and not the driver itself.
+                    args.session_id != cid
+                }
+            }
+        } else {
+            false
+        };
+
+        if silent_driver_kill {
+            let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if mgr.get(args.session_id).is_some() {
+                mgr.kill(args.session_id);
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "session {} killed",
+                    args.session_id
+                ))]));
+            } else {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "session {} was already gone",
                     args.session_id
                 ))]));
             }
@@ -474,6 +635,15 @@ impl Ccom {
         let rx = self.ctx.bus.subscribe();
         let peer = ctx.peer.clone();
         let cancel = ctx.ct.clone();
+        // Phase 6 Task 4: capture caller id for re-resolving scope
+        // on every forwarded event. We deliberately do NOT cache the
+        // scope itself — the set of permitted ids can change over
+        // the lifetime of a subscription (e.g. the driver spawns a
+        // new child, or the TUI attaches a peer). Re-reading once
+        // per event is cheap (a pair of mutex locks) and always
+        // correct; see Phase 6 Risk #2.
+        let caller_id = caller_id_from_ctx(&ctx);
+        let ctx_for_task = Arc::clone(&self.ctx);
 
         // Normalize filters for the spawned task's closure.
         let session_id_filter: Option<Vec<usize>> = args.session_ids.filter(|v| !v.is_empty());
@@ -505,6 +675,19 @@ impl Ccom {
                         Ok(ev) => {
                             any_received = true;
                             let wire = SessionEventWire::from(&ev);
+
+                            // Filter: caller scope. Re-resolve on
+                            // every event so a driver subscription
+                            // sees newly-spawned children as soon
+                            // as they land in the manager. Legacy
+                            // clients (no header) fall through to
+                            // `Scope::Full` and are not filtered.
+                            if let Some(cid) = caller_id {
+                                let scope = ctx_for_task.caller_scope(cid);
+                                if !scope.permits(wire.session_id()) {
+                                    continue;
+                                }
+                            }
 
                             // Filter: session id.
                             if let Some(ids) = session_id_filter.as_ref()
@@ -570,6 +753,249 @@ impl Ccom {
             "subscribed: events will arrive as notifications/message entries with logger=ccom.session",
         )]))
     }
+
+    #[tool(
+        description = "Spawn a new Claude session under the calling driver's control. \
+                       Driver-only: the caller must be a session with role=Driver (set \
+                       via the `--driver` CLI flag / TOML config at ccom startup). \
+                       The label is sanitized (ANSI/control stripped, 64 char max). \
+                       SpawnPolicy gates user confirmation: Trust spawns silently, Budget \
+                       spawns silently until the budget is exhausted then prompts, Ask \
+                       prompts every time. The new child is Solo (v1 nesting cap — \
+                       drivers cannot create drivers) with spawned_by = <driver id>. \
+                       Returns the new session id and sanitized label as JSON."
+    )]
+    async fn spawn_session(
+        &self,
+        Parameters(args): Parameters<SpawnSessionArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // 1. Identify the caller. `spawn_session` is only reachable
+        //    by a driver — any call without the header is rejected.
+        let Some(caller_id) = caller_id_from_ctx(&ctx) else {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "spawn_session requires a driver caller (missing X-Ccom-Caller header)",
+            )]));
+        };
+
+        // 2. Sanitize the label up front so a policy rejection
+        //    surfaces before any lock is taken or modal raised.
+        let clean_label = match sanitize_label(&args.label) {
+            Ok(l) => l,
+            Err(reason) => {
+                return Ok(CallToolResult::error(vec![Content::text(reason)]));
+            }
+        };
+
+        // 3. Role check + budget policy decision + budget decrement,
+        //    all under a single lock acquisition (Phase 6 Risk #4).
+        //    We capture the decided policy and the caller's
+        //    working_dir / cols / rows for the subsequent spawn.
+        //
+        //    Lock is released before any `.await` — critical because
+        //    `ConfirmBridge::request` awaits and PTY spawn blocks.
+        enum Decision {
+            Silent,
+            NeedsConfirm,
+        }
+        // `budget_decremented` carries (policy, pre-decrement-value) so
+        // step 6 can restore the budget if `spawn_with_role` fails.
+        // Otherwise a failing PTY spawn would silently consume a budget
+        // credit — see pr-review-phase-6-tasks-3-to-7.md §A1 (S4).
+        let (decision, default_cwd, cols, rows, budget_decremented) = {
+            let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(caller) = mgr.get(caller_id) else {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "spawn_session: caller session not found",
+                )]));
+            };
+            let (policy, budget) = match &caller.role {
+                crate::session::SessionRole::Driver {
+                    spawn_budget,
+                    spawn_policy,
+                } => (*spawn_policy, *spawn_budget),
+                crate::session::SessionRole::Solo => {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "spawn_session denied: caller is not a driver",
+                    )]));
+                }
+            };
+            let default_cwd = caller.working_dir.clone();
+            let cols = caller.pty_size.cols;
+            let rows = caller.pty_size.rows;
+
+            let mut budget_decremented: Option<(crate::session::SpawnPolicy, u32)> = None;
+            let decision = match policy {
+                crate::session::SpawnPolicy::Trust => Decision::Silent,
+                crate::session::SpawnPolicy::Budget => {
+                    if budget > 0 {
+                        // Atomic decrement under the same lock — no
+                        // TOCTOU window where two concurrent calls
+                        // could each see `budget > 0`.
+                        mgr.set_role(
+                            caller_id,
+                            crate::session::SessionRole::Driver {
+                                spawn_budget: budget - 1,
+                                spawn_policy: policy,
+                            },
+                        );
+                        budget_decremented = Some((policy, budget));
+                        Decision::Silent
+                    } else {
+                        Decision::NeedsConfirm
+                    }
+                }
+                crate::session::SpawnPolicy::Ask => Decision::NeedsConfirm,
+            };
+            (decision, default_cwd, cols, rows, budget_decremented)
+        };
+
+        // 4. If confirmation is needed, go through the same bridge
+        //    pattern `kill_session` uses.
+        if matches!(decision, Decision::NeedsConfirm) {
+            let Some(bridge) = self.ctx.confirm.as_ref() else {
+                log::warn!("spawn_session({caller_id}): no confirm bridge on McpCtx, auto-denying");
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "spawn_session denied: no confirm bridge wired",
+                )]));
+            };
+            let request_fut = bridge.request(ConfirmTool::SpawnSession, caller_id);
+            let resp =
+                match tokio::time::timeout(std::time::Duration::from_secs(25), request_fut).await {
+                    Ok(resp) => resp,
+                    Err(_) => {
+                        log::warn!(
+                            "spawn_session({caller_id}): confirm wait exceeded 25s, auto-denying"
+                        );
+                        return Ok(CallToolResult::error(vec![Content::text(
+                            "spawn_session timed out waiting for user confirmation",
+                        )]));
+                    }
+                };
+            if resp != ConfirmResponse::Allow {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "spawn_session denied by user",
+                )]));
+            }
+        }
+
+        // 5. Resolve cwd and build the SpawnConfig. Children are
+        //    always Claude sessions with hooks installed — v1
+        //    doesn't let drivers spawn terminal children.
+        let cwd = args
+            .working_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or(default_cwd);
+
+        let Some(event_tx) = self.ctx.event_tx.clone() else {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "spawn_session: no event_tx on McpCtx (test context?)",
+            )]));
+        };
+
+        // Command resolution. Tests set `CCOM_TEST_SPAWN_CMD` to a
+        // stand-in like `/bin/cat` so the full tool path can be
+        // exercised without a real Claude binary on PATH. Production
+        // reads the normal launcher.
+        let (claude_cmd, claude_args): (String, Vec<String>) =
+            if let Ok(override_cmd) = std::env::var("CCOM_TEST_SPAWN_CMD") {
+                (override_cmd, Vec::new())
+            } else {
+                (
+                    crate::claude::launcher::claude_command().to_string(),
+                    crate::claude::launcher::claude_args()
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                )
+            };
+
+        // When running under the test command override we must
+        // disable hook + mcp_config injection — `/bin/cat` doesn't
+        // accept `--settings` / `--mcp-config` flags. Production
+        // always gets hooks.
+        let use_test_command = std::env::var_os("CCOM_TEST_SPAWN_CMD").is_some();
+        let spawn_cfg = crate::session::SpawnConfig {
+            label: clean_label.clone(),
+            working_dir: cwd,
+            command: &claude_cmd,
+            args: claude_args,
+            event_tx,
+            cols,
+            rows,
+            install_hook: !use_test_command,
+            mcp_port: if use_test_command {
+                None
+            } else {
+                self.mcp_port
+            },
+        };
+
+        // 6. Spawn + (optionally) send the initial prompt under a
+        //    single lock acquisition so an observer can't snapshot
+        //    the child without its first turn queued. `spawn_with_role`
+        //    leaves the child Solo with `spawned_by = Some(driver_id)` —
+        //    v1 nesting cap: drivers never spawn drivers.
+        //
+        //    Two-phase note (pr-review-phase-6-tasks-3-to-7.md §B2):
+        //    step 3 above holds the sessions mutex across the budget
+        //    check-and-decrement, then releases. This lock is a FRESH
+        //    acquisition — deliberate, not a TOCTOU slip. Holding the
+        //    mutex across the intervening `bridge.request().await` and
+        //    the `Session::spawn` PTY call would serialize every
+        //    MCP reader behind a potentially multi-second blocking
+        //    operation. Budget consistency is preserved by the restore
+        //    path below (A1 fix).
+        let new_id = {
+            let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            let id = match mgr.spawn_with_role(spawn_cfg, None, Some(caller_id)) {
+                Ok(id) => id,
+                Err(e) => {
+                    // Restore the budget if we decremented it in step 3.
+                    // Without this, a PTY-spawn failure permanently
+                    // consumes a silent spawn credit — the driver ends
+                    // up with fewer silent spawns than it should.
+                    // pr-review-phase-6-tasks-3-to-7.md §A1 (S4).
+                    if let Some((policy, original_budget)) = budget_decremented {
+                        mgr.set_role(
+                            caller_id,
+                            crate::session::SessionRole::Driver {
+                                spawn_budget: original_budget,
+                                spawn_policy: policy,
+                            },
+                        );
+                    }
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "spawn_session: spawn failed: {e}"
+                    ))]));
+                }
+            };
+            if let Some(prompt) = args.initial_prompt.as_deref() {
+                match sanitize_prompt_text(prompt) {
+                    Ok(clean) => {
+                        if let Err(e) = mgr.send_prompt(id, &clean) {
+                            log::warn!("spawn_session({id}): initial prompt send failed: {e}");
+                        }
+                    }
+                    Err(reason) => {
+                        log::warn!(
+                            "spawn_session({id}): initial prompt rejected by sanitizer: {reason}"
+                        );
+                    }
+                }
+            }
+            id
+        };
+
+        let wire = SpawnSessionWire {
+            session_id: new_id,
+            label: clean_label,
+        };
+        let json = serde_json::to_string(&wire)
+            .map_err(|e| McpError::internal_error(format!("spawn_session serialize: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[tool_handler]
@@ -608,6 +1034,8 @@ mod tests {
             sessions: Arc::new(Mutex::new(mgr)),
             bus,
             confirm: None,
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            event_tx: None,
         })
     }
 
@@ -622,6 +1050,8 @@ mod tests {
             sessions: Arc::new(Mutex::new(mgr)),
             bus,
             confirm: None,
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            event_tx: None,
         })
     }
 
@@ -704,6 +1134,8 @@ mod tests {
             sessions: Arc::new(Mutex::new(mgr)),
             bus: Arc::clone(&bus),
             confirm: None,
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            event_tx: None,
         });
 
         // Before the turn is pushed, ctx.get_response returns None —
