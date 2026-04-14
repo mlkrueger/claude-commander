@@ -11,8 +11,11 @@
 //! `SessionManager::get_response` (added in Phase 3). See
 //! `docs/designs/session-management.md` §2 for rationale.
 
+use crate::approvals::{ApprovalDecision, ApprovalScope};
 use crate::session::SessionStatus;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::SystemTime;
 
 /// Per-session monotonic counter identifying one prompt/response round-trip.
 ///
@@ -79,6 +82,28 @@ pub enum SessionEvent {
     StatusChanged {
         session_id: usize,
         status: SessionStatus,
+    },
+    /// A child session hit a gated tool call and is waiting for the
+    /// driver to approve or deny it. Published by the approval
+    /// coordinator in `crate::approvals::handle_hook_request`.
+    ToolApprovalRequested {
+        request_id: u64,
+        session_id: usize,
+        driver_id: usize,
+        tool: String,
+        args: serde_json::Value,
+        cwd: PathBuf,
+        timestamp: SystemTime,
+    },
+    /// A pending tool approval has been resolved (allow or deny) by
+    /// the driver. Published by the `respond_to_tool_approval` MCP
+    /// handler after `ApprovalRegistry::resolve` succeeds.
+    ToolApprovalResolved {
+        request_id: u64,
+        session_id: usize,
+        driver_id: usize,
+        decision: ApprovalDecision,
+        scope: ApprovalScope,
     },
 }
 

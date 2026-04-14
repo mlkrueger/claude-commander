@@ -1,4 +1,5 @@
 mod app;
+mod approvals;
 mod claude;
 mod driver_config;
 mod event;

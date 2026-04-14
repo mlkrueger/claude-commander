@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use super::confirm::ConfirmBridge;
+use crate::approvals::ApprovalRegistry;
 use crate::session::{EventBus, SessionManager, SessionRole, StoredTurn, TurnId};
 
 /// Shared context handed to each MCP tool handler instance.
@@ -54,6 +55,11 @@ pub struct McpCtx {
     /// sessions reaches the main TUI event loop. `None` in test
     /// contexts that never exercise `spawn_session`.
     pub event_tx: Option<crate::event::MonitoredSender>,
+    /// Phase 7 Task 2: registry of pending tool-use approvals.
+    /// Used by the `respond_to_tool_approval` MCP handler and the
+    /// `list_tool_approvals` MCP tool. `None` in test contexts that
+    /// don't exercise the approval path.
+    pub approvals: Option<std::sync::Arc<ApprovalRegistry>>,
 }
 
 /// Phase 6 MCP caller scope — the set of session ids a tool call
@@ -226,6 +232,7 @@ mod tests {
             confirm: None,
             attachments: Arc::new(Mutex::new(HashMap::new())),
             event_tx: None,
+            approvals: None,
         })
     }
 
@@ -239,6 +246,7 @@ mod tests {
             confirm: None,
             attachments: Arc::new(Mutex::new(HashMap::new())),
             event_tx: None,
+            approvals: None,
         };
         assert!(ctx.list_sessions().is_empty());
     }
@@ -258,6 +266,7 @@ mod tests {
             confirm: None,
             attachments: Arc::new(Mutex::new(HashMap::new())),
             event_tx: None,
+            approvals: None,
         };
         let summaries = ctx.list_sessions();
         assert_eq!(summaries.len(), 2);

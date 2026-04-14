@@ -239,6 +239,20 @@ impl SessionManager {
         self.sessions.iter_mut().find(|s| s.id == id)
     }
 
+    /// Phase 7 Task 2: look up a session by its Claude Code UUID
+    /// (`session_id` from hook stdin JSON). Returns the ccom session
+    /// id (the `Session::id` field), NOT the vec index.
+    ///
+    /// This is an O(n) scan; the number of live sessions is small
+    /// enough that a hash index is not warranted.
+    #[allow(dead_code)]
+    pub fn find_by_uuid(&self, claude_uuid: &str) -> Option<usize> {
+        self.sessions
+            .iter()
+            .find(|s| s.claude_session_id.as_deref() == Some(claude_uuid))
+            .map(|s| s.id)
+    }
+
     /// Submit `text` to the session identified by `id`, allocating a
     /// fresh `TurnId` and publishing `SessionEvent::PromptSubmitted` on
     /// the bus. Writes the prompt text followed by `SUBMIT_SEQUENCE` to
@@ -2272,6 +2286,32 @@ mod tests {
         m.retain_alive();
         assert!(m.get(driver_id).is_none());
     }
+
+    // ---- Phase 7 Task 2: find_by_uuid tests --------------------------------
+
+    #[test]
+    fn find_by_uuid_returns_correct_session() {
+        let mut m = SessionManager::new();
+        let id_a = push(&mut m, "alpha");
+        let id_b = push(&mut m, "beta");
+
+        // Inject a claude_session_id on each session.
+        m.get_mut(id_a).unwrap().claude_session_id = Some("uuid-alpha".to_string());
+        m.get_mut(id_b).unwrap().claude_session_id = Some("uuid-beta".to_string());
+
+        assert_eq!(m.find_by_uuid("uuid-alpha"), Some(id_a));
+        assert_eq!(m.find_by_uuid("uuid-beta"), Some(id_b));
+    }
+
+    #[test]
+    fn find_by_uuid_missing_returns_none() {
+        let mut m = SessionManager::new();
+        let id = push(&mut m, "solo");
+        m.get_mut(id).unwrap().claude_session_id = Some("uuid-x".to_string());
+
+        assert_eq!(m.find_by_uuid("uuid-does-not-exist"), None);
+        assert_eq!(m.find_by_uuid(""), None);
+    }
 }
 
 #[cfg(test)]
@@ -2437,6 +2477,9 @@ mod test_support {
             hook_dir: None,
             hook_rx: None,
             hook_reader_handle: None,
+            approval_socket_tx: None,
+            approval_socket_rx: None,
+            approval_socket_task: None,
         }
     }
 

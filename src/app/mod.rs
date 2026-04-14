@@ -252,6 +252,9 @@ impl App {
                 // ctx so `spawn_session` can spawn new sessions
                 // whose PTY output reaches the main TUI event loop.
                 event_tx: Some(event_tx.clone()),
+                // Phase 7 Task 2: approval registry (None until Task 2
+                // wires it up from the App-level Arc).
+                approvals: None,
             });
             match crate::mcp::McpServer::start(ctx) {
                 Ok(server) => {

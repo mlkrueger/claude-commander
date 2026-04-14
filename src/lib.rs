@@ -1,3 +1,4 @@
+pub mod approvals;
 pub mod claude;
 pub mod event;
 pub mod fs;
