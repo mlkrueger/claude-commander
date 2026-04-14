@@ -266,7 +266,7 @@ fn is_tool_error(resp: &serde_json::Value) -> bool {
     resp["result"]["isError"].as_bool().unwrap_or(false)
 }
 
-fn make_driver_mgr() -> (SessionManager, usize, usize) {
+fn make_driver_mgr() -> (SessionManager, Arc<EventBus>, usize, usize) {
     let bus = Arc::new(EventBus::new());
     let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
     let driver_id = mgr.peek_next_id();
@@ -278,14 +278,13 @@ fn make_driver_mgr() -> (SessionManager, usize, usize) {
     );
     let child_id = mgr.peek_next_id();
     mgr.push_for_test(Session::dummy_exited(child_id, "child").with_spawned_by(driver_id));
-    (mgr, driver_id, child_id)
+    (mgr, bus, driver_id, child_id)
 }
 
 #[test]
 fn driver_allows_once_child_proceeds() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-    let (mgr, driver_id, child_id) = make_driver_mgr();
-    let bus = Arc::new(EventBus::new());
+    let (mgr, bus, driver_id, child_id) = make_driver_mgr();
     let registry = ApprovalRegistry::new();
     let (request_id, _decision_rx) = registry.open_request(
         child_id,
@@ -322,8 +321,7 @@ fn driver_allows_once_child_proceeds() {
 #[test]
 fn driver_denies_child_aborts() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-    let (mgr, driver_id, child_id) = make_driver_mgr();
-    let bus = Arc::new(EventBus::new());
+    let (mgr, bus, driver_id, child_id) = make_driver_mgr();
     let registry = ApprovalRegistry::new();
     let (request_id, _rx) = registry.open_request(
         child_id,
@@ -361,12 +359,12 @@ fn driver_allows_always_writes_state_file() {
     let uuid = format!("allow-always-{}", std::process::id());
     let state_base = std::env::temp_dir().join("ccom-it-approvals-state");
     std::fs::create_dir_all(&state_base).unwrap();
+    let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
     unsafe {
         std::env::set_var("XDG_STATE_HOME", state_base.to_str().unwrap());
     }
 
-    let (mgr, driver_id, child_id) = make_driver_mgr();
-    let bus = Arc::new(EventBus::new());
+    let (mgr, bus, driver_id, child_id) = make_driver_mgr();
     let registry = ApprovalRegistry::new();
     let tool_args = json!({"command": "ls -la"});
     let (request_id, _rx) = registry.open_request(
@@ -405,6 +403,12 @@ fn driver_allows_always_writes_state_file() {
             .parent()
             .unwrap(),
     );
+    unsafe {
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
     server.stop();
 }
 
@@ -503,8 +507,7 @@ fn solo_caller_rejected_from_respond_tool() {
 #[test]
 fn unknown_request_id_returns_error() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-    let (mgr, driver_id, _) = make_driver_mgr();
-    let bus = Arc::new(EventBus::new());
+    let (mgr, bus, driver_id, _) = make_driver_mgr();
     let registry = ApprovalRegistry::new();
 
     let (server, _) = McpServer::start_with_approvals(Arc::new(Mutex::new(mgr)), bus, registry)
