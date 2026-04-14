@@ -213,12 +213,48 @@ pub struct RespondToToolApprovalWire {
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SessionEventWire {
-    Spawned { session_id: usize, label: String },
-    PromptSubmitted { session_id: usize, turn_id: u64 },
-    ResponseComplete { session_id: usize, turn_id: u64 },
-    PromptPending { session_id: usize, kind: String },
-    Exited { session_id: usize, code: i32 },
-    StatusChanged { session_id: usize, status: String },
+    Spawned {
+        session_id: usize,
+        label: String,
+    },
+    PromptSubmitted {
+        session_id: usize,
+        turn_id: u64,
+    },
+    ResponseComplete {
+        session_id: usize,
+        turn_id: u64,
+    },
+    PromptPending {
+        session_id: usize,
+        kind: String,
+    },
+    Exited {
+        session_id: usize,
+        code: i32,
+    },
+    StatusChanged {
+        session_id: usize,
+        status: String,
+    },
+    /// A child session is waiting on a gated tool call. Only
+    /// forwarded to the matching driver (driver_id == caller_id).
+    ToolApprovalRequested {
+        request_id: u64,
+        session_id: usize,
+        driver_id: usize,
+        tool: String,
+        args: serde_json::Value,
+    },
+    /// A pending approval was resolved. Only forwarded to the
+    /// matching driver (driver_id == caller_id).
+    ToolApprovalResolved {
+        request_id: u64,
+        session_id: usize,
+        driver_id: usize,
+        decision: String,
+        scope: String,
+    },
 }
 
 impl SessionEventWire {
@@ -231,6 +267,8 @@ impl SessionEventWire {
             Self::PromptPending { .. } => "prompt_pending",
             Self::Exited { .. } => "exited",
             Self::StatusChanged { .. } => "status_changed",
+            Self::ToolApprovalRequested { .. } => "tool_approval_requested",
+            Self::ToolApprovalResolved { .. } => "tool_approval_resolved",
         }
     }
 
@@ -243,7 +281,19 @@ impl SessionEventWire {
             | Self::ResponseComplete { session_id, .. }
             | Self::PromptPending { session_id, .. }
             | Self::Exited { session_id, .. }
-            | Self::StatusChanged { session_id, .. } => *session_id,
+            | Self::StatusChanged { session_id, .. }
+            | Self::ToolApprovalRequested { session_id, .. }
+            | Self::ToolApprovalResolved { session_id, .. } => *session_id,
+        }
+    }
+
+    /// For approval events, returns the driver_id that should receive
+    /// this event. Returns `None` for all other event types.
+    fn approval_driver_id(&self) -> Option<usize> {
+        match self {
+            Self::ToolApprovalRequested { driver_id, .. }
+            | Self::ToolApprovalResolved { driver_id, .. } => Some(*driver_id),
+            _ => None,
         }
     }
 }
@@ -282,17 +332,32 @@ impl From<&crate::session::SessionEvent> for SessionEventWire {
                 session_id: *session_id,
                 status: format!("{status:?}"),
             },
-            // Phase 7 events: not exposed over the MCP event stream
-            // yet (no SessionEventWire variants for them). Emit a
-            // generic StatusChanged so subscribers stay up-to-date
-            // without requiring a wire-format change.
-            SessionEvent::ToolApprovalRequested { session_id, .. } => Self::StatusChanged {
+            SessionEvent::ToolApprovalRequested {
+                request_id,
+                session_id,
+                driver_id,
+                tool,
+                args,
+                ..
+            } => Self::ToolApprovalRequested {
+                request_id: *request_id,
                 session_id: *session_id,
-                status: "ToolApprovalPending".to_string(),
+                driver_id: *driver_id,
+                tool: tool.clone(),
+                args: args.clone(),
             },
-            SessionEvent::ToolApprovalResolved { session_id, .. } => Self::StatusChanged {
+            SessionEvent::ToolApprovalResolved {
+                request_id,
+                session_id,
+                driver_id,
+                decision,
+                scope,
+            } => Self::ToolApprovalResolved {
+                request_id: *request_id,
                 session_id: *session_id,
-                status: "ToolApprovalResolved".to_string(),
+                driver_id: *driver_id,
+                decision: format!("{decision:?}").to_ascii_lowercase(),
+                scope: format!("{scope:?}").to_ascii_lowercase(),
             },
         }
     }
@@ -679,6 +744,18 @@ impl Ccom {
                         Ok(ev) => {
                             any_received = true;
                             let wire = SessionEventWire::from(&ev);
+
+                            // Filter: approval events are directed —
+                            // only the target driver sees them. For
+                            // callers without an id (legacy path),
+                            // approval events are dropped entirely
+                            // since there is no safe default target.
+                            if let Some(target_driver) = wire.approval_driver_id() {
+                                match caller_id {
+                                    Some(cid) if cid == target_driver => {}
+                                    _ => continue,
+                                }
+                            }
 
                             // Filter: caller scope. Re-resolve on
                             // every event so a driver subscription
@@ -1449,6 +1526,30 @@ mod tests {
                 "status_changed",
                 6,
             ),
+            (
+                SessionEvent::ToolApprovalRequested {
+                    request_id: 1,
+                    session_id: 7,
+                    driver_id: 99,
+                    tool: "Bash".into(),
+                    args: serde_json::json!({}),
+                    cwd: std::path::PathBuf::from("/tmp"),
+                    timestamp: std::time::SystemTime::now(),
+                },
+                "tool_approval_requested",
+                7,
+            ),
+            (
+                SessionEvent::ToolApprovalResolved {
+                    request_id: 2,
+                    session_id: 8,
+                    driver_id: 99,
+                    decision: crate::approvals::ApprovalDecision::Allow,
+                    scope: crate::approvals::ApprovalScope::Once,
+                },
+                "tool_approval_resolved",
+                8,
+            ),
         ];
         for (ev, expected_name, expected_session) in cases {
             let wire = SessionEventWire::from(&ev);
@@ -1514,5 +1615,135 @@ mod tests {
         assert!(json.contains("\"turn_id\":7"));
         assert!(json.contains("\"body\":\"hello\""));
         assert!(json.contains("\"completed\":true"));
+    }
+
+    // ---- Task 6: approval event filtering ----
+
+    /// `ToolApprovalRequested` is forwarded only to the matching driver.
+    #[test]
+    fn approval_event_only_reaches_target_driver() {
+        use crate::session::SessionEvent;
+        use std::time::SystemTime;
+
+        let ev = SessionEvent::ToolApprovalRequested {
+            request_id: 1,
+            session_id: 10,
+            driver_id: 42,
+            tool: "Bash".to_string(),
+            args: serde_json::json!({"command": "ls"}),
+            cwd: std::path::PathBuf::from("/tmp"),
+            timestamp: SystemTime::now(),
+        };
+        let wire = SessionEventWire::from(&ev);
+        assert_eq!(wire.type_name(), "tool_approval_requested");
+        assert_eq!(wire.session_id(), 10);
+        // approval_driver_id must return the driver, not None
+        assert_eq!(wire.approval_driver_id(), Some(42));
+
+        // The subscribe loop: if caller_id == driver_id → forward.
+        let caller_is_driver: usize = 42;
+        match wire.approval_driver_id() {
+            Some(target) if target == caller_is_driver => {} // correct: forward
+            _ => panic!("should have forwarded to the matching driver"),
+        }
+
+        // If caller_id != driver_id → skip.
+        let caller_is_other: usize = 99;
+        let should_skip = wire
+            .approval_driver_id()
+            .map(|t| t != caller_is_other)
+            .unwrap_or(true);
+        assert!(
+            should_skip,
+            "non-driver caller must not receive approval event"
+        );
+    }
+
+    /// A subscriber without a driver id must NOT receive approval events.
+    #[test]
+    fn approval_event_not_visible_to_solo_caller() {
+        use crate::session::SessionEvent;
+        use std::time::SystemTime;
+
+        let ev = SessionEvent::ToolApprovalRequested {
+            request_id: 2,
+            session_id: 20,
+            driver_id: 5,
+            tool: "Edit".to_string(),
+            args: serde_json::json!({}),
+            cwd: std::path::PathBuf::from("/tmp"),
+            timestamp: SystemTime::now(),
+        };
+        let wire = SessionEventWire::from(&ev);
+
+        // caller_id is None (solo, no X-Ccom-Caller header).
+        let caller_id: Option<usize> = None;
+        let dropped = match wire.approval_driver_id() {
+            Some(_target) => match caller_id {
+                Some(cid) if cid == _target => false,
+                _ => true, // drop
+            },
+            None => false,
+        };
+        assert!(
+            dropped,
+            "solo caller must not receive ToolApprovalRequested"
+        );
+    }
+
+    /// `ToolApprovalResolved` is forwarded only to the matching driver.
+    #[test]
+    fn resolved_event_reaches_target_driver() {
+        use crate::approvals::{ApprovalDecision, ApprovalScope};
+        use crate::session::SessionEvent;
+
+        let ev = SessionEvent::ToolApprovalResolved {
+            request_id: 3,
+            session_id: 30,
+            driver_id: 7,
+            decision: ApprovalDecision::Allow,
+            scope: ApprovalScope::Once,
+        };
+        let wire = SessionEventWire::from(&ev);
+        assert_eq!(wire.type_name(), "tool_approval_resolved");
+        assert_eq!(wire.session_id(), 30);
+        assert_eq!(wire.approval_driver_id(), Some(7));
+
+        // Verify the serialized shape includes decision and scope fields.
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["type"], "tool_approval_resolved");
+        assert_eq!(json["request_id"], 3u64);
+        assert_eq!(json["session_id"], 30usize);
+        assert_eq!(json["driver_id"], 7usize);
+        // decision and scope are lowercased Debug repr strings
+        assert!(
+            json["decision"].as_str().unwrap().contains("allow"),
+            "got: {}",
+            json["decision"]
+        );
+    }
+
+    /// Non-approval events return `None` from `approval_driver_id`.
+    #[test]
+    fn non_approval_events_have_no_driver_id() {
+        use crate::session::SessionEvent;
+        let cases: Vec<SessionEvent> = vec![
+            SessionEvent::Spawned {
+                session_id: 1,
+                label: "a".into(),
+            },
+            SessionEvent::Exited {
+                session_id: 2,
+                code: 0,
+            },
+        ];
+        for ev in &cases {
+            let wire = SessionEventWire::from(ev);
+            assert_eq!(
+                wire.approval_driver_id(),
+                None,
+                "non-approval event must return None: {ev:?}"
+            );
+        }
     }
 }
