@@ -37,6 +37,10 @@ pub enum ApprovalScope {
 pub struct ApprovalHookRequest {
     /// Claude Code's internal session UUID (from hook stdin).
     pub session_id: String,
+    /// ccom's own session index (from CCOM_SESSION_ID env var in the hook
+    /// binary). Used for direct session lookup — avoids depending on
+    /// `claude_session_id` which is only populated after the Stop hook fires.
+    pub ccom_session_id: usize,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub cwd: String,
@@ -176,18 +180,20 @@ impl ApprovalRegistry {
         decision: ApprovalDecision,
         scope: ApprovalScope,
     ) -> Result<PendingApprovalMeta, ResolveError> {
-        let entry = {
-            let mut map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-            map.remove(&request_id).ok_or(ResolveError::NotFound)?
-        };
+        // Hold the lock across the driver check AND the conditional
+        // re-insert to prevent a TOCTOU window where a concurrent
+        // legitimate-driver call sees NotFound between our remove and
+        // re-insert.
+        let mut map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = map.remove(&request_id).ok_or(ResolveError::NotFound)?;
         if entry.driver_id != caller_driver_id {
-            // Put it back so a legitimate driver can still resolve it.
-            self.pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(request_id, entry);
+            // Put it back while still holding the lock.
+            map.insert(request_id, entry);
             return Err(ResolveError::DriverMismatch);
         }
+        // Release the lock before the oneshot send so we don't hold it
+        // while the coordinator wakes up and accesses the registry.
+        drop(map);
         // Send the decision to the coordinator (ignore send error — the
         // coordinator may have already timed out and dropped its receiver).
         let _ = entry.response_tx.send(decision);
@@ -197,6 +203,15 @@ impl ApprovalRegistry {
             args: entry.args,
             scope,
         })
+    }
+
+    /// Remove a pending approval by request id. Used by the coordinator
+    /// to clean up entries that timed out before the driver responded.
+    pub fn cancel(&self, request_id: u64) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&request_id);
     }
 
     /// Return wire-safe snapshots of all pending approvals for the given
@@ -244,33 +259,29 @@ pub async fn handle_hook_request(
     };
 
     let claude_uuid = request.session_id.clone();
+    let ccom_session_id = request.ccom_session_id;
     let tool_name = request.tool_name.clone();
     let tool_input = request.tool_input.clone();
     let cwd = PathBuf::from(&request.cwd);
 
     // --- Lock-free snapshot of session + driver ids ---
+    // Use the ccom session index directly (sent by the hook binary via
+    // CCOM_SESSION_ID env var). This avoids depending on
+    // `Session.claude_session_id`, which is only populated after the Stop
+    // hook fires — i.e. after the first turn ends. PreToolUse fires before
+    // any Stop hook, so find_by_uuid would always return None on first use.
     let (session_id, driver_id) = {
         let mgr = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        // 1. Find the ccom session with this Claude UUID
-        let session_idx = match mgr.find_by_uuid(&claude_uuid) {
-            Some(idx) => idx,
-            None => {
-                let _ = response_tx.send(ApprovalHookResponse::Passthrough);
-                return;
-            }
-        };
-        // 2. Find the driver: spawned_by first, then check if there's
-        //    any driver that has this session in scope (simplified: just
-        //    check spawned_by for now; attachment-based lookup is handled
-        //    by the MCP scope filter separately).
-        let driver_id = match mgr.get(session_idx).and_then(|s| s.spawned_by) {
+        // Find the driver for this session (spawned_by chain).
+        // Attachment-based lookup is handled by the MCP scope filter.
+        let driver_id = match mgr.get(ccom_session_id).and_then(|s| s.spawned_by) {
             Some(did) => did,
             None => {
                 let _ = response_tx.send(ApprovalHookResponse::Passthrough);
                 return;
             }
         };
-        (session_idx, driver_id)
+        (ccom_session_id, driver_id)
     };
 
     // --- Register the pending approval (no mutex held across await) ---
@@ -303,7 +314,9 @@ pub async fn handle_hook_request(
             let _ = response_tx.send(ApprovalHookResponse::Deny);
         }
         Ok(Err(_)) | Err(_) => {
-            // Channel closed (registry entry removed) or timeout
+            // Channel closed or timeout: remove the stale entry so it
+            // doesn't show as a ghost approval in pending_for_driver.
+            approvals.cancel(request_id);
             let _ = response_tx.send(ApprovalHookResponse::Deny);
         }
     }

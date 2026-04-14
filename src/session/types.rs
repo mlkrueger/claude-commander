@@ -392,6 +392,9 @@ impl Session {
         cmd.cwd(&working_dir);
         if install_hook {
             cmd.env("CCOM_SESSION_ID", id.to_string());
+            if let Some(ref dir) = hook_dir {
+                cmd.env("CCOM_HOOK_DIR", dir.as_os_str());
+            }
         }
 
         let child = match pair.slave.spawn_command(cmd) {

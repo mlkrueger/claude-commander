@@ -52,7 +52,12 @@ struct SocketResponse {
 
 #[derive(serde::Serialize)]
 struct SocketRequest<'a> {
+    /// Claude Code's internal session UUID (from hook stdin).
     session_id: &'a str,
+    /// ccom's own session index (from CCOM_SESSION_ID env var).
+    /// Allows the coordinator to look up the session without waiting
+    /// for the Stop hook to populate `claude_session_id`.
+    ccom_session_id: usize,
     tool_name: &'a str,
     tool_input: &'a Value,
     cwd: &'a str,
@@ -203,11 +208,21 @@ fn main() {
     let cwd = input.cwd.as_deref().unwrap_or("");
     let tool_use_id = input.tool_use_id.as_deref().unwrap_or("");
 
-    // 2. Get hook dir from env
+    // 2. Get hook dir and ccom session id from env
     let hook_dir = match std::env::var("CCOM_HOOK_DIR") {
         Ok(d) => std::path::PathBuf::from(d),
         Err(_) => {
             // No hook dir configured → passthrough
+            return;
+        }
+    };
+    let ccom_session_id: usize = match std::env::var("CCOM_SESSION_ID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(id) => id,
+        None => {
+            // Missing or unparseable → passthrough
             return;
         }
     };
@@ -241,6 +256,7 @@ fn main() {
 
     let request = SocketRequest {
         session_id: claude_session_id,
+        ccom_session_id,
         tool_name,
         tool_input,
         cwd,
