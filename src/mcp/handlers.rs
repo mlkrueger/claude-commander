@@ -356,8 +356,16 @@ impl From<&crate::session::SessionEvent> for SessionEventWire {
                 request_id: *request_id,
                 session_id: *session_id,
                 driver_id: *driver_id,
-                decision: format!("{decision:?}").to_ascii_lowercase(),
-                scope: format!("{scope:?}").to_ascii_lowercase(),
+                decision: match decision {
+                    crate::approvals::ApprovalDecision::Allow => "allow",
+                    crate::approvals::ApprovalDecision::Deny => "deny",
+                }
+                .to_string(),
+                scope: match scope {
+                    crate::approvals::ApprovalScope::Once => "once",
+                    crate::approvals::ApprovalScope::AllowAlways => "allow_always",
+                }
+                .to_string(),
             },
         }
     }
@@ -742,7 +750,6 @@ impl Ccom {
                 loop {
                     match rx.try_recv() {
                         Ok(ev) => {
-                            any_received = true;
                             let wire = SessionEventWire::from(&ev);
 
                             // Filter: approval events are directed —
@@ -785,6 +792,7 @@ impl Ccom {
                             }
 
                             // Serialize + send as a logging notification.
+                            any_received = true;
                             let data = match serde_json::to_value(&wire) {
                                 Ok(v) => v,
                                 Err(e) => {
