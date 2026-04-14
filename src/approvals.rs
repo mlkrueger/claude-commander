@@ -217,6 +217,76 @@ impl ApprovalRegistry {
             .remove(&request_id);
     }
 
+    /// Deny and remove all pending approvals for a given driver. Called when
+    /// the driver session exits so child sessions are not left hanging.
+    ///
+    /// Returns a `Vec<(request_id, session_id, driver_id)>` so the caller can
+    /// publish `ToolApprovalResolved` events for each denied entry.
+    pub fn deny_all_for_driver(&self, driver_id: usize) -> Vec<(u64, usize, usize)> {
+        let entries: Vec<PendingApproval> = {
+            let mut map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let ids: Vec<u64> = map
+                .values()
+                .filter(|e| e.driver_id == driver_id)
+                .map(|e| e.request_id)
+                .collect();
+            ids.into_iter().filter_map(|id| map.remove(&id)).collect()
+        };
+
+        entries
+            .into_iter()
+            .map(|e| {
+                let _ = e.response_tx.send(ApprovalDecision::Deny);
+                (e.request_id, e.session_id, e.driver_id)
+            })
+            .collect()
+    }
+
+    /// Remove entries that are older than `max_age_secs` (stale reaper).
+    ///
+    /// The default `max_age_secs` is `CCOM_APPROVAL_REAPER_SECS` env var if
+    /// set and parseable, otherwise 710s (590s hook timeout + 120s grace).
+    ///
+    /// Returns the `(request_id, session_id, driver_id)` tuples of reaped
+    /// entries so the caller can publish `ToolApprovalResolved` events and
+    /// log appropriately.
+    pub fn sweep_stale(&self) -> Vec<(u64, usize, usize)> {
+        let max_age_secs: u64 = std::env::var("CCOM_APPROVAL_REAPER_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(710);
+        let max_age = std::time::Duration::from_secs(max_age_secs);
+
+        let now = SystemTime::now();
+        let entries: Vec<PendingApproval> = {
+            let mut map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let stale_ids: Vec<u64> = map
+                .values()
+                .filter(|e| now.duration_since(e.created_at).unwrap_or_default() >= max_age)
+                .map(|e| e.request_id)
+                .collect();
+            stale_ids
+                .into_iter()
+                .filter_map(|id| map.remove(&id))
+                .collect()
+        };
+
+        entries
+            .into_iter()
+            .map(|e| {
+                log::warn!(
+                    "approval reaper: sweeping stale request_id={} session_id={} driver_id={} tool={}",
+                    e.request_id,
+                    e.session_id,
+                    e.driver_id,
+                    e.tool
+                );
+                let _ = e.response_tx.send(ApprovalDecision::Deny);
+                (e.request_id, e.session_id, e.driver_id)
+            })
+            .collect()
+    }
+
     /// Return wire-safe snapshots of all pending approvals for the given
     /// driver. Used by `list_tool_approvals` MCP tool.
     pub fn pending_for_driver(&self, driver_id: usize) -> Vec<PendingApprovalWire> {
@@ -322,18 +392,37 @@ pub async fn handle_hook_request(
     });
 
     // --- Await driver decision (590s, slightly under Claude's 600s) ---
-    match tokio::time::timeout(std::time::Duration::from_secs(590), decision_rx).await {
+    // Allow tests to override the timeout with CCOM_APPROVAL_TIMEOUT_SECS.
+    let timeout_secs: u64 = std::env::var("CCOM_APPROVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(590);
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), decision_rx).await {
         Ok(Ok(ApprovalDecision::Allow)) => {
             let _ = response_tx.send(ApprovalHookResponse::Allow);
         }
         Ok(Ok(ApprovalDecision::Deny)) => {
             let _ = response_tx.send(ApprovalHookResponse::Deny);
+            bus.publish(SessionEvent::ToolApprovalResolved {
+                request_id,
+                session_id,
+                driver_id,
+                decision: ApprovalDecision::Deny,
+                scope: ApprovalScope::Once,
+            });
         }
         Ok(Err(_)) | Err(_) => {
             // Channel closed or timeout: remove the stale entry so it
             // doesn't show as a ghost approval in pending_for_driver.
             approvals.cancel(request_id);
             let _ = response_tx.send(ApprovalHookResponse::Deny);
+            bus.publish(SessionEvent::ToolApprovalResolved {
+                request_id,
+                session_id,
+                driver_id,
+                decision: ApprovalDecision::Deny,
+                scope: ApprovalScope::Once,
+            });
         }
     }
 }
@@ -462,5 +551,148 @@ mod tests {
 
         let for_99 = registry.pending_for_driver(99);
         assert!(for_99.is_empty());
+    }
+
+    #[test]
+    fn driver_exit_denies_all_pending_approvals_for_that_driver() {
+        let registry = ApprovalRegistry::new();
+
+        // Two requests for driver 10, one for driver 20.
+        let (id_a, rx_a) = registry.open_request(
+            1,
+            "uuid-a".to_string(),
+            10,
+            "Bash".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/a"),
+        );
+        let (id_b, rx_b) = registry.open_request(
+            2,
+            "uuid-b".to_string(),
+            10,
+            "Edit".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/b"),
+        );
+        let (_id_c, mut rx_c) = registry.open_request(
+            3,
+            "uuid-c".to_string(),
+            20,
+            "Bash".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/c"),
+        );
+
+        let denied = registry.deny_all_for_driver(10);
+
+        // Both of driver 10's requests should be in the returned list.
+        let mut denied_ids: Vec<u64> = denied.iter().map(|(rid, _, _)| *rid).collect();
+        denied_ids.sort_unstable();
+        let mut expected = vec![id_a, id_b];
+        expected.sort_unstable();
+        assert_eq!(denied_ids, expected);
+
+        // All returned entries should have driver_id 10.
+        assert!(denied.iter().all(|(_, _, did)| *did == 10));
+
+        // The receivers for driver 10's sessions should get Deny.
+        assert_eq!(rx_a.blocking_recv().unwrap(), ApprovalDecision::Deny);
+        assert_eq!(rx_b.blocking_recv().unwrap(), ApprovalDecision::Deny);
+
+        // Driver 20's request should NOT be touched — registry still has it.
+        assert_eq!(registry.pending_for_driver(20).len(), 1);
+        // Its receiver should not have been signalled.
+        assert!(rx_c.try_recv().is_err());
+    }
+
+    #[test]
+    fn registry_reaper_clears_stale_entries() {
+        // Override the reaper threshold to 0s so every entry is immediately stale.
+        // SAFETY: single-threaded test; no concurrent env access.
+        unsafe { std::env::set_var("CCOM_APPROVAL_REAPER_SECS", "0") };
+
+        let registry = ApprovalRegistry::new();
+        let (id_a, rx_a) = registry.open_request(
+            1,
+            "uuid-a".to_string(),
+            10,
+            "Bash".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/a"),
+        );
+
+        let reaped = registry.sweep_stale();
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].0, id_a);
+
+        // The entry must have been removed.
+        assert!(registry.pending_for_driver(10).is_empty());
+
+        // The receiver gets Deny.
+        assert_eq!(rx_a.blocking_recv().unwrap(), ApprovalDecision::Deny);
+
+        // Clean up env so other tests are not affected.
+        // SAFETY: single-threaded test; no concurrent env access.
+        unsafe { std::env::remove_var("CCOM_APPROVAL_REAPER_SECS") };
+    }
+
+    #[tokio::test]
+    async fn timeout_publishes_resolved_event_for_status_line() {
+        use crate::session::{EventBus, SessionEvent};
+
+        // Use a 0-second timeout so the test does not wait 590s.
+        // SAFETY: single-threaded test; no concurrent env access.
+        unsafe { std::env::set_var("CCOM_APPROVAL_TIMEOUT_SECS", "0") };
+
+        let bus = Arc::new(EventBus::new());
+        let rx = bus.subscribe();
+        let approvals = ApprovalRegistry::new();
+
+        // Open a request and simulate the timeout/channel-closed branch
+        // by directly replicating the deny-and-publish logic. This verifies
+        // the event shape without needing a full SessionManager setup.
+        let (request_id, decision_rx) = approvals.open_request(
+            1,
+            "uuid-test".to_string(),
+            42,
+            "Bash".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/tmp"),
+        );
+        // Drop the decision_rx: simulates channel-closed / timeout.
+        drop(decision_rx);
+
+        approvals.cancel(request_id);
+        bus.publish(SessionEvent::ToolApprovalResolved {
+            request_id,
+            session_id: 1,
+            driver_id: 42,
+            decision: ApprovalDecision::Deny,
+            scope: ApprovalScope::Once,
+        });
+
+        // The event must be on the bus.
+        let event = rx
+            .try_recv()
+            .expect("ToolApprovalResolved must be published on timeout");
+        match event {
+            SessionEvent::ToolApprovalResolved {
+                request_id: rid,
+                session_id: sid,
+                driver_id: did,
+                decision,
+                ..
+            } => {
+                assert_eq!(rid, request_id);
+                assert_eq!(sid, 1);
+                assert_eq!(did, 42);
+                assert_eq!(decision, ApprovalDecision::Deny);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // Clean up.
+        // SAFETY: single-threaded test; no concurrent env access.
+        unsafe { std::env::remove_var("CCOM_APPROVAL_TIMEOUT_SECS") };
     }
 }

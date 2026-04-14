@@ -159,6 +159,8 @@ pub struct App {
     pub git_status: Option<GitStatusMap>,
     pub last_git_refresh: Instant,
     pub last_usage_refresh: Instant,
+    /// Phase 7 Task 9: timestamp of the last approval-registry reaper sweep.
+    pub last_reaper_sweep: Instant,
     pub rate_limit: Option<RateLimitInfo>,
     pub setup_items: Vec<SetupItem>,
     pub setup_selected: usize,
@@ -214,6 +216,8 @@ pub struct App {
 const ATTENTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the approval-registry reaper sweeps for stale entries.
+const APPROVAL_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 const PTY_COL_OVERHEAD: u16 = 34;
 const PTY_ROW_OVERHEAD: u16 = 3;
 
@@ -320,6 +324,7 @@ impl App {
             git_status,
             last_git_refresh: Instant::now(),
             last_usage_refresh: Instant::now() - Duration::from_secs(60),
+            last_reaper_sweep: Instant::now(),
             rate_limit,
             setup_items,
             setup_selected: 0,
@@ -389,6 +394,11 @@ impl App {
                 // Phase 7 Task 8: drain approval bus events to keep the
                 // per-driver pending-count map up to date.
                 self.drain_approval_events();
+                // Phase 7 Task 9: reap stale approval entries once per minute.
+                if self.last_reaper_sweep.elapsed() > APPROVAL_REAPER_INTERVAL {
+                    self.approvals.sweep_stale();
+                    self.last_reaper_sweep = Instant::now();
+                }
             }
             Event::SessionExited { session_id, code } => {
                 // Drain any queued approval events before removing the driver
@@ -407,10 +417,12 @@ impl App {
                     .map(|s| matches!(s.role, SessionRole::Driver { .. }))
                     .unwrap_or(false);
                 self.scrub_attachments_for_exited(session_id, was_driver);
-                // Phase 7 Task 8: drop stale pending-approval count for
-                // an exited driver — any in-flight requests are now
-                // unresolvable.
+                // Phase 7 Task 9: when a driver exits, deny all pending
+                // approvals for its children so they are not left hanging.
+                // Phase 7 Task 8: also drop the stale pending-approval count
+                // for the exited driver.
                 if was_driver {
+                    self.approvals.deny_all_for_driver(session_id);
                     self.pending_approvals_per_driver.remove(&session_id);
                 }
                 if let Some(session) = self.sessions_lock().get_mut(session_id) {
