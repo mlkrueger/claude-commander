@@ -91,8 +91,10 @@ pub struct HookStopSignal {
     /// at spawn time).
     pub ccom_session_id: usize,
     /// Claude Code's internal session UUID (from the `session_id`
-    /// field in the stdin JSON).
-    pub claude_session_id: String,
+    /// field in the stdin JSON). `None` if the payload lacks the
+    /// field (older Claude Code versions / malformed hook input) —
+    /// consumers treat absence as "no change" rather than a clear.
+    pub claude_session_id: Option<String>,
     /// The full text of the most recent assistant response. Used as
     /// the `StoredTurn::body` for hook-based sessions, replacing the
     /// ANSI-stripped PTY byte capture used by the regex detector.
@@ -126,11 +128,13 @@ pub fn parse_hook_stdin(json: &str, ccom_session_id: usize) -> Option<HookStopSi
         None => return None,
     };
 
+    // Empty string is treated the same as missing so a bogus payload
+    // can't clobber a previously-captured UUID downstream.
     let claude_session_id = obj
         .get("session_id")
         .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_default();
+        .filter(|s| !s.is_empty())
+        .map(String::from);
 
     let transcript_path = obj
         .get("transcript_path")
@@ -650,7 +654,7 @@ mod tests {
         }"#;
         let signal = parse_hook_stdin(json, 42).expect("should parse");
         assert_eq!(signal.ccom_session_id, 42);
-        assert_eq!(signal.claude_session_id, "abc-123");
+        assert_eq!(signal.claude_session_id.as_deref(), Some("abc-123"));
         assert_eq!(signal.last_assistant_message, "pong");
         assert_eq!(signal.transcript_path.as_deref(), Some("/tmp/t.jsonl"));
     }

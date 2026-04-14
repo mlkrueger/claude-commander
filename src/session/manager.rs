@@ -349,6 +349,16 @@ impl SessionManager {
                     "hook signal received for session {session_id}: {} bytes",
                     signal.last_assistant_message.len()
                 );
+                // Capture the Claude UUID the first time the hook
+                // reports it. We deliberately don't overwrite a
+                // previously-captured value — a spurious empty or
+                // mutated payload shouldn't clobber the adoption key
+                // that Phase 7/8 consumers rely on.
+                if session.claude_session_id.is_none()
+                    && let Some(uuid) = signal.claude_session_id
+                {
+                    session.claude_session_id = Some(uuid);
+                }
                 let mut sink = StoreAndBus {
                     session_id,
                     store: &mut session.response_store,
@@ -1696,7 +1706,7 @@ mod tests {
             .install_test_hook_channel();
         tx.send(HookStopSignal {
             ccom_session_id: id,
-            claude_session_id: "fake-uuid".to_string(),
+            claude_session_id: Some("fake-uuid".to_string()),
             last_assistant_message: "hello from hook".to_string(),
             transcript_path: None,
         })
@@ -1725,6 +1735,56 @@ mod tests {
             })
             .collect();
         assert_eq!(completes, vec![(id, turn_id)]);
+
+        // Verify the Claude UUID was captured from the hook payload.
+        assert_eq!(
+            m.get(id).unwrap().claude_session_id.as_deref(),
+            Some("fake-uuid")
+        );
+    }
+
+    #[test]
+    fn check_hook_signals_preserves_first_captured_uuid() {
+        use crate::session::hook::HookStopSignal;
+
+        let (mut m, _bus) = manager_with_synthetic_detector();
+        let id = push_running(&mut m, "a");
+        let tx = m
+            .get_mut(id)
+            .expect("session exists")
+            .install_test_hook_channel();
+
+        // First signal: no active turn, body is dropped, but the UUID
+        // should still be captured since it's the first one seen.
+        tx.send(HookStopSignal {
+            ccom_session_id: id,
+            claude_session_id: Some("first-uuid".to_string()),
+            last_assistant_message: "first".to_string(),
+            transcript_path: None,
+        })
+        .unwrap();
+        m.check_hook_signals();
+        assert_eq!(
+            m.get(id).unwrap().claude_session_id.as_deref(),
+            Some("first-uuid")
+        );
+
+        // Second signal reports a different UUID — must NOT clobber
+        // the already-captured value. A Claude session's UUID is
+        // stable for its lifetime; divergence is a bug or a mutated
+        // payload and we refuse to trust it.
+        tx.send(HookStopSignal {
+            ccom_session_id: id,
+            claude_session_id: Some("second-uuid".to_string()),
+            last_assistant_message: "second".to_string(),
+            transcript_path: None,
+        })
+        .unwrap();
+        m.check_hook_signals();
+        assert_eq!(
+            m.get(id).unwrap().claude_session_id.as_deref(),
+            Some("first-uuid")
+        );
     }
 
     #[test]
@@ -1742,7 +1802,7 @@ mod tests {
             .install_test_hook_channel();
         tx.send(HookStopSignal {
             ccom_session_id: id,
-            claude_session_id: "fake-uuid".to_string(),
+            claude_session_id: Some("fake-uuid".to_string()),
             last_assistant_message: "orphaned".to_string(),
             transcript_path: None,
         })
@@ -2075,7 +2135,7 @@ mod tests {
             .install_test_hook_channel();
         tx.send(HookStopSignal {
             ccom_session_id: id,
-            claude_session_id: "fake-uuid".to_string(),
+            claude_session_id: Some("fake-uuid".to_string()),
             last_assistant_message: "final answer".to_string(),
             transcript_path: None,
         })
