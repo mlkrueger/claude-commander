@@ -65,22 +65,17 @@ pub struct McpCtx {
     pub event_tx: Option<crate::event::MonitoredSender>,
 }
 
-/// Phase 6 prelude: MCP caller scope — the set of session ids a
-/// tool call is allowed to see and touch.
-///
-/// Resolved by [`McpCtx::caller_scope`]. Currently returns
-/// [`Scope::Full`] for every caller (the full-fledged role-based
-/// logic lands in Task 4, which reads `Session::role`, unions in
-/// `spawned_by` children, and adds explicit attachments). Stubbed
-/// now so the type surface is in place for the MCP-side subagent
-/// to consume without the TUI-side subagent needing coordinated
-/// edits.
+/// Phase 6 MCP caller scope — the set of session ids a tool call
+/// is allowed to see and touch. Resolved by [`McpCtx::caller_scope`]
+/// from the caller's [`SessionRole`], the `spawned_by` parent
+/// pointers in the manager, and the shared TUI attachment map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Scope {
     /// Solo caller — may observe and mutate every session in the
-    /// manager (the Phase 1–5 default, and currently the only
-    /// path the stub returns).
+    /// manager. This is the Phase 1–5 default and is also what
+    /// an unknown caller id resolves to (legacy MCP clients that
+    /// don't set the `X-Ccom-Caller` header).
     Full,
     /// Driver caller — restricted to the explicit set of session
     /// ids this driver owns (via `spawned_by`) or has attached

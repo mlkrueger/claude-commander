@@ -48,9 +48,16 @@ pub enum AppMode {
     /// in the list until the user dismisses the overlay, but the
     /// `attach_session_to_driver` call will re-check liveness before
     /// committing. See pr-review-phase-6-tasks-3-to-7.md §D2.
+    ///
+    /// `restore_picker_selected` is the `App.picker_selected` value
+    /// the user had in the originating `SessionPicker` before
+    /// pressing `a`. Both the Esc and Enter arms of the key handler
+    /// write it back before returning to `SessionPicker` so the
+    /// highlight lands on the originally-selected row, not on 0.
     AttachDriverPicker {
         target_session_id: usize,
         drivers: Vec<(usize, String)>,
+        restore_picker_selected: usize,
     },
 }
 
@@ -524,16 +531,23 @@ impl App {
     /// driver list is snapshotted here and cached on the mode
     /// variant so subsequent key events and render frames don't
     /// re-lock `sessions`. See pr-review-phase-6-tasks-3-to-7.md §D2.
+    ///
+    /// Captures `self.picker_selected` before resetting it so the
+    /// Esc/Enter return path can restore the originating session
+    /// picker's highlight (pr-review-phase-6-tasks-3-to-7.md §B —
+    /// finding 2 on PR #22).
     pub(crate) fn open_attach_driver_picker(&mut self, target_session_id: usize) {
         let drivers = self.live_drivers();
         if drivers.is_empty() {
             self.status_message = Some("No active drivers — launch ccom with --driver".to_string());
             return;
         }
+        let restore_picker_selected = self.picker_selected;
         self.picker_selected = 0;
         self.mode = AppMode::AttachDriverPicker {
             target_session_id,
             drivers,
+            restore_picker_selected,
         };
     }
 

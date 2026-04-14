@@ -33,6 +33,9 @@ impl App {
             AppMode::AttachDriverPicker {
                 target_session_id,
                 drivers,
+                // `restore_picker_selected` is consumed by the key
+                // handler, not rendering — ignore it here.
+                restore_picker_selected: _,
             } => {
                 // Render the originating session view underneath so
                 // the user still sees context, then overlay the

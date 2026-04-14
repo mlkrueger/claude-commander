@@ -51,11 +51,19 @@ impl App {
             AppMode::AttachDriverPicker {
                 target_session_id,
                 drivers,
+                restore_picker_selected,
             } => {
                 let target = *target_session_id;
                 let driver_count = drivers.len();
                 let selected_driver = drivers.get(self.picker_selected).cloned();
-                self.handle_attach_driver_picker_key(key, target, driver_count, selected_driver);
+                let restore = *restore_picker_selected;
+                self.handle_attach_driver_picker_key(
+                    key,
+                    target,
+                    driver_count,
+                    selected_driver,
+                    restore,
+                );
             }
         }
     }
@@ -458,14 +466,15 @@ impl App {
         target_session_id: usize,
         driver_count: usize,
         selected_driver: Option<(usize, String)>,
+        restore_picker_selected: usize,
     ) {
         match key.code {
             KeyCode::Esc => {
-                // Return to the session picker the user came from.
-                // The source session for the picker is the target
-                // being attached — same id either way in the common
-                // case, but falling back to Dashboard is safer if
-                // the target no longer exists.
+                // Return to the session picker with its original
+                // highlight row restored — see
+                // pr-review-phase-6-tasks-3-to-7.md finding 2 on
+                // PR #22.
+                self.picker_selected = restore_picker_selected;
                 self.mode = AppMode::SessionPicker(target_session_id);
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -492,6 +501,10 @@ impl App {
                         "Attached session {target_session_id} to driver {driver_label}"
                     ));
                 }
+                // Same restore as Esc: the user landed in the driver
+                // picker from a specific session-picker row and
+                // should return to that row.
+                self.picker_selected = restore_picker_selected;
                 self.mode = AppMode::SessionPicker(target_session_id);
             }
             _ => {}
