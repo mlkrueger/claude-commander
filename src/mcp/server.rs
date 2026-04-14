@@ -167,6 +167,36 @@ impl McpServer {
         Ok((server, rx))
     }
 
+    /// Phase 6 Task 9 test seam: like
+    /// [`Self::start_with_confirm_and_event_tx`] but also accepts a
+    /// pre-built `attachments` map so integration tests can seed
+    /// driver-side attachment visibility before the server starts.
+    /// Used by `tests/driver_spawn.rs` test #9
+    /// (`attached_session_visible_in_driver_scope`) to validate that
+    /// a driver's `list_sessions` respects the shared attachment map.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn start_with_confirm_event_tx_and_attachments(
+        sessions: Arc<Mutex<crate::session::SessionManager>>,
+        bus: Arc<crate::session::EventBus>,
+        event_tx: crate::event::MonitoredSender,
+        attachments: Arc<Mutex<std::collections::HashMap<usize, std::collections::HashSet<usize>>>>,
+    ) -> anyhow::Result<(
+        Self,
+        std::sync::mpsc::Receiver<super::confirm::ConfirmRequest>,
+    )> {
+        let (bridge, rx) = super::confirm::ConfirmBridge::new();
+        let ctx = Arc::new(McpCtx {
+            sessions,
+            bus,
+            confirm: Some(bridge),
+            attachments,
+            event_tx: Some(event_tx),
+        });
+        let server = Self::start(ctx)?;
+        Ok((server, rx))
+    }
+
     /// Assigned loopback port.
     pub fn port(&self) -> u16 {
         self.port

@@ -21,6 +21,7 @@
 //! execution is safe for THIS file alone. Do not add tests that
 //! depend on the override being absent.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
@@ -466,6 +467,63 @@ fn spawn_session_empty_label_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// initial_prompt handling.
+// ---------------------------------------------------------------------------
+
+/// `spawn_session` with an `initial_prompt` must still return a valid
+/// session_id. In test mode (CCOM_TEST_SPAWN_CMD=/bin/cat) the Idle-wait
+/// is skipped and the prompt is not sent to the PTY (cat doesn't accept
+/// Claude's submit sequence), but the spawn itself must succeed and the
+/// returned session_id must be a live child of the driver.
+///
+/// The primary goal is to pin the no-panic contract — the pre-fix code
+/// would call send_prompt immediately (racing Claude's startup); the new
+/// code skips the wait for test commands. A real end-to-end test of the
+/// idle-wait path requires a live Claude binary and is covered by the
+/// manual smoke test (phase-6-task-10-smoke-test.md).
+#[test]
+fn spawn_session_with_initial_prompt_returns_valid_id() {
+    ensure_test_spawn_cmd();
+    let mut fixture = DriverFixture::build(SpawnPolicy::Trust, 0);
+    let _confirm_rx = fixture.confirm_rx.take();
+    let client = McpClient::initialize(fixture.port(), Some(&fixture.driver_id.to_string()));
+
+    let resp = client.call_tool(
+        75,
+        "spawn_session",
+        json!({
+            "label": "prompt-worker",
+            "working_dir": "/tmp",
+            "initial_prompt": "ls src/ and reply with a JSON array"
+        }),
+    );
+    assert!(
+        !tool_is_error(&resp),
+        "spawn with initial_prompt failed: {resp}"
+    );
+    let text = tool_result_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let child_id = parsed["session_id"].as_u64().expect("session_id missing") as usize;
+
+    // Verify the child is registered and linked to the driver.
+    {
+        let mgr = fixture.sessions.lock().unwrap();
+        let child = mgr.get(child_id).expect("child session not found");
+        assert_eq!(
+            child.spawned_by,
+            Some(fixture.driver_id),
+            "child should be spawned_by the driver"
+        );
+    }
+
+    {
+        let mut mgr = fixture.sessions.lock().unwrap();
+        mgr.kill(child_id);
+    }
+    fixture.stop();
+}
+
+// ---------------------------------------------------------------------------
 // Task 6 — driver-kill policy tests.
 // ---------------------------------------------------------------------------
 
@@ -609,4 +667,212 @@ fn solo_kill_still_prompts() {
     );
     assert_eq!(observed[0].0, ConfirmTool::KillSession);
     assert_eq!(observed[0].1, target_id);
+}
+
+// ---------------------------------------------------------------------------
+// Task 9 — gap fills: plan matrix entries #5, #6, #9.
+// ---------------------------------------------------------------------------
+
+/// Plan #5 — `spawn_session` MUST produce Solo children, never another
+/// Driver. The MCP handler calls `SessionManager::spawn_with_role` with
+/// `role = None` which defaults to Solo; this test verifies that
+/// end-to-end by inspecting the child's role in the manager after a
+/// successful spawn. This is the "nesting cap": a driver's spawned
+/// child can't recursively act as a driver itself.
+#[test]
+fn driver_cannot_spawn_driver_nesting_cap() {
+    let mut fixture = DriverFixture::build(SpawnPolicy::Trust, 0);
+    let confirm_rx = fixture.confirm_rx.take().unwrap();
+    let _responder = spawn_auto_responder(confirm_rx, ConfirmResponse::Allow);
+    let client = McpClient::initialize(fixture.port(), Some(&fixture.driver_id.to_string()));
+
+    let resp = client.call_tool(
+        200,
+        "spawn_session",
+        json!({"label": "nested", "working_dir": "/tmp"}),
+    );
+    assert!(!tool_is_error(&resp), "spawn failed: {resp}");
+    let text = tool_result_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let child_id = parsed["session_id"].as_u64().unwrap() as usize;
+
+    {
+        let mgr = fixture.sessions.lock().unwrap();
+        let child = mgr.get(child_id).expect("child should exist in manager");
+        assert_eq!(
+            child.role,
+            SessionRole::Solo,
+            "nesting cap: spawned child must be Solo, not Driver: got {:?}",
+            child.role
+        );
+        assert_eq!(
+            child.spawned_by,
+            Some(fixture.driver_id),
+            "child must record driver as its parent"
+        );
+    }
+
+    {
+        let mut mgr = fixture.sessions.lock().unwrap();
+        mgr.kill(child_id);
+    }
+    fixture.stop();
+}
+
+/// Plan #6 — `list_sessions` output is scope-filtered for driver
+/// callers: the driver sees itself + its spawned children + any
+/// attached sessions, never unrelated sessions. A solo/no-header
+/// caller still sees every session (legacy Phase 1–5 behavior).
+#[test]
+fn list_sessions_filtered_for_driver_caller() {
+    let mut fixture = DriverFixture::build(SpawnPolicy::Trust, 0);
+    let confirm_rx = fixture.confirm_rx.take().unwrap();
+    let _responder = spawn_auto_responder(confirm_rx, ConfirmResponse::Allow);
+
+    // Seed one unrelated solo session directly in the manager. The
+    // driver must NOT see this one.
+    let stranger_id = {
+        let mut mgr = fixture.sessions.lock().unwrap();
+        let id = mgr.peek_next_id();
+        mgr.push_for_test(Session::dummy_exited(id, "stranger"));
+        id
+    };
+
+    // Driver spawns two children via MCP.
+    let driver_client = McpClient::initialize(fixture.port(), Some(&fixture.driver_id.to_string()));
+    let mut child_ids: Vec<usize> = Vec::new();
+    for i in 0..2 {
+        let resp = driver_client.call_tool(
+            210 + i,
+            "spawn_session",
+            json!({"label": format!("owned-{}", i), "working_dir": "/tmp"}),
+        );
+        assert!(!tool_is_error(&resp), "spawn {i} failed: {resp}");
+        let text = tool_result_text(&resp);
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        child_ids.push(parsed["session_id"].as_u64().unwrap() as usize);
+    }
+
+    // Driver's list_sessions → only driver + 2 children (3 total),
+    // stranger not visible.
+    let driver_list = driver_client.call_tool(220, "list_sessions", json!({}));
+    assert!(
+        !tool_is_error(&driver_list),
+        "driver list failed: {driver_list}"
+    );
+    let driver_text = tool_result_text(&driver_list);
+    let driver_rows: Vec<Value> = serde_json::from_str(&driver_text).unwrap();
+    let driver_ids: HashSet<usize> = driver_rows
+        .iter()
+        .map(|r| r["id"].as_u64().unwrap() as usize)
+        .collect();
+    let mut expected_driver: HashSet<usize> = child_ids.iter().copied().collect();
+    expected_driver.insert(fixture.driver_id);
+    assert_eq!(
+        driver_ids, expected_driver,
+        "driver scope: got {driver_ids:?}, expected {expected_driver:?}"
+    );
+    assert!(
+        !driver_ids.contains(&stranger_id),
+        "stranger must not appear in driver scope"
+    );
+
+    // Solo/no-header caller sees everything: driver + 2 children +
+    // stranger = 4.
+    let solo_client = McpClient::initialize(fixture.port(), None);
+    let solo_list = solo_client.call_tool(221, "list_sessions", json!({}));
+    assert!(!tool_is_error(&solo_list), "solo list failed: {solo_list}");
+    let solo_text = tool_result_text(&solo_list);
+    let solo_rows: Vec<Value> = serde_json::from_str(&solo_text).unwrap();
+    let solo_ids: HashSet<usize> = solo_rows
+        .iter()
+        .map(|r| r["id"].as_u64().unwrap() as usize)
+        .collect();
+    let mut expected_solo = expected_driver.clone();
+    expected_solo.insert(stranger_id);
+    assert_eq!(
+        solo_ids, expected_solo,
+        "solo scope: got {solo_ids:?}, expected {expected_solo:?}"
+    );
+
+    {
+        let mut mgr = fixture.sessions.lock().unwrap();
+        for id in &child_ids {
+            mgr.kill(*id);
+        }
+    }
+    fixture.stop();
+}
+
+/// Plan #9 — a session placed into a driver's attachment map (without
+/// being spawned by that driver) becomes visible in the driver's
+/// `list_sessions` result. Validates the shared `Arc<Mutex<_>>`
+/// attachment contract between `App` and `McpCtx::caller_scope`.
+///
+/// Uses a dedicated fixture path that passes a pre-built `attachments`
+/// map into `McpServer::start_with_confirm_event_tx_and_attachments`
+/// so the test can mutate it directly.
+#[test]
+fn attached_session_visible_in_driver_scope() {
+    ensure_test_spawn_cmd();
+    let bus = Arc::new(EventBus::new());
+    let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
+
+    // Push a driver and an unrelated "attached" session.
+    let driver_id = mgr.peek_next_id();
+    mgr.push_for_test(
+        Session::dummy_exited(driver_id, "orch").with_role(SessionRole::Driver {
+            spawn_budget: 0,
+            spawn_policy: SpawnPolicy::Trust,
+        }),
+    );
+    let attached_id = mgr.peek_next_id();
+    mgr.push_for_test(Session::dummy_exited(attached_id, "attached"));
+    // And an unrelated stranger the driver must NOT see.
+    let stranger_id = mgr.peek_next_id();
+    mgr.push_for_test(Session::dummy_exited(stranger_id, "stranger"));
+    let sessions = Arc::new(Mutex::new(mgr));
+
+    // Pre-seed the attachment map with { driver_id -> {attached_id} }.
+    let attachments: Arc<Mutex<HashMap<usize, HashSet<usize>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    {
+        let mut att = attachments.lock().unwrap();
+        let mut set = HashSet::new();
+        set.insert(attached_id);
+        att.insert(driver_id, set);
+    }
+
+    let (raw_tx, _event_rx) = std::sync::mpsc::channel();
+    let event_tx = MonitoredSender::wrap(raw_tx);
+    let (server, _confirm_rx) = McpServer::start_with_confirm_event_tx_and_attachments(
+        Arc::clone(&sessions),
+        Arc::clone(&bus),
+        event_tx,
+        Arc::clone(&attachments),
+    )
+    .expect("server start");
+
+    let client = McpClient::initialize(server.port(), Some(&driver_id.to_string()));
+    let resp = client.call_tool(300, "list_sessions", json!({}));
+    assert!(!tool_is_error(&resp), "list_sessions failed: {resp}");
+    let text = tool_result_text(&resp);
+    let rows: Vec<Value> = serde_json::from_str(&text).unwrap();
+    let ids: HashSet<usize> = rows
+        .iter()
+        .map(|r| r["id"].as_u64().unwrap() as usize)
+        .collect();
+
+    assert!(ids.contains(&driver_id), "driver must see itself: {ids:?}");
+    assert!(
+        ids.contains(&attached_id),
+        "attached session must be visible to driver scope: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&stranger_id),
+        "unrelated stranger must not leak into driver scope: {ids:?}"
+    );
+    assert_eq!(ids.len(), 2, "expected exactly driver + attached: {ids:?}");
+
+    server.stop();
 }

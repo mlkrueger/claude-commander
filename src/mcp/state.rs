@@ -41,27 +41,18 @@ pub struct McpCtx {
     pub sessions: Arc<Mutex<SessionManager>>,
     pub bus: Arc<EventBus>,
     pub confirm: Option<Arc<ConfirmBridge>>,
-    /// Phase 6 prelude: shared driver-attachment map. Keyed by
-    /// driver session id → set of session ids the user has manually
-    /// attached to that driver via the TUI (Task 5). Read by
-    /// `caller_scope` when resolving a driver caller's visible set;
-    /// written only by the main TUI thread. Same `Arc<Mutex<_>>` as
-    /// `App::attachment_map` — the shared-pointer contract is
-    /// load-bearing.
-    ///
-    /// `#[allow(dead_code)]` because the bin-target reachability
-    /// graph doesn't see the real reader until Task 4's
-    /// `caller_scope` body lands. Test constructors and tests in
-    /// `state.rs` already reference it, but those don't satisfy
-    /// the bin lint on their own.
-    #[allow(dead_code)]
+    /// Shared driver-attachment map. Keyed by driver session id →
+    /// set of session ids the user has manually attached to that
+    /// driver via the TUI. Read by `caller_scope` when resolving a
+    /// driver caller's visible set; written only by the main TUI
+    /// thread. Same `Arc<Mutex<_>>` as `App::attachment_map` — the
+    /// shared-pointer contract is load-bearing.
     pub attachments: Arc<Mutex<HashMap<usize, HashSet<usize>>>>,
-    /// Phase 6 Task 3: event channel the `spawn_session` handler
-    /// hands to newly-spawned sessions via their `SpawnConfig`. Same
-    /// sender App uses for its own spawns — so PTY output from
-    /// MCP-created sessions reaches the main TUI event loop. `None`
-    /// in test contexts that never exercise `spawn_session`.
-    #[allow(dead_code)]
+    /// Event channel the `spawn_session` handler hands to
+    /// newly-spawned sessions via their `SpawnConfig`. Same sender
+    /// App uses for its own spawns — so PTY output from MCP-created
+    /// sessions reaches the main TUI event loop. `None` in test
+    /// contexts that never exercise `spawn_session`.
     pub event_tx: Option<crate::event::MonitoredSender>,
 }
 
@@ -70,7 +61,6 @@ pub struct McpCtx {
 /// from the caller's [`SessionRole`], the `spawned_by` parent
 /// pointers in the manager, and the shared TUI attachment map.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Scope {
     /// Solo caller — may observe and mutate every session in the
     /// manager. This is the Phase 1–5 default and is also what
@@ -83,7 +73,6 @@ pub enum Scope {
     Restricted(HashSet<usize>),
 }
 
-#[allow(dead_code)]
 impl Scope {
     /// Convenience: does this scope permit access to `session_id`?
     /// `Full` always permits; `Restricted` checks membership.

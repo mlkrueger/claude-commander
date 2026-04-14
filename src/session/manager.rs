@@ -2141,6 +2141,77 @@ mod tests {
         assert!(s.hook_rx.is_none());
         assert!(s.hook_dir.is_none());
     }
+
+    // Phase 6 Task 8: orphan handling + budget reset on driver exit.
+    //
+    // The next two tests pin behaviors that Rust ownership already
+    // gives us for free — they exist so a future refactor that grows
+    // cascading-kill logic or stashes budget counters outside the
+    // `Session` struct will trip a loud test failure instead of
+    // silently leaking state across driver lifetimes.
+
+    #[test]
+    fn killing_driver_leaves_children_alive_as_orphans() {
+        use crate::session::{SessionRole, SpawnPolicy};
+        let mut m = SessionManager::new();
+
+        let driver_id = m.peek_next_id();
+        m.push_for_test(
+            Session::dummy_exited(driver_id, "orch").with_role(SessionRole::Driver {
+                spawn_budget: 3,
+                spawn_policy: SpawnPolicy::Budget,
+            }),
+        );
+
+        let child_a = m.peek_next_id();
+        let mut child = Session::dummy_exited(child_a, "kid-a");
+        child.spawned_by = Some(driver_id);
+        m.push_for_test(child);
+
+        let child_b = m.peek_next_id();
+        let mut child = Session::dummy_exited(child_b, "kid-b");
+        child.spawned_by = Some(driver_id);
+        m.push_for_test(child);
+
+        assert!(m.kill(driver_id));
+
+        // Driver is gone. Children still present with their
+        // spawned_by pointer intact — orphan rendering in the tree
+        // panel relies on this exact shape (see session_tree.rs:
+        // `orphaned_child_renders_at_top_level`).
+        assert!(m.get(driver_id).is_none());
+        assert_eq!(m.get(child_a).map(|s| s.spawned_by), Some(Some(driver_id)));
+        assert_eq!(m.get(child_b).map(|s| s.spawned_by), Some(Some(driver_id)));
+    }
+
+    #[test]
+    fn retain_alive_drops_driver_budget_with_session() {
+        use crate::session::{SessionRole, SpawnPolicy};
+        let mut m = SessionManager::new();
+
+        let driver_id = m.peek_next_id();
+        m.push_for_test(
+            Session::dummy_exited(driver_id, "orch").with_role(SessionRole::Driver {
+                spawn_budget: 5,
+                spawn_policy: SpawnPolicy::Budget,
+            }),
+        );
+
+        // `dummy_exited` lands in `Exited(0)` already, matching the
+        // post-reap state. `retain_alive` is what physically drops
+        // exited sessions from the manager — and with them, the
+        // `spawn_budget` field owned by `SessionRole::Driver`. No
+        // side table, no leak, nothing to reset explicitly.
+        assert!(matches!(
+            m.get(driver_id).unwrap().role,
+            SessionRole::Driver {
+                spawn_budget: 5,
+                ..
+            }
+        ));
+        m.retain_alive();
+        assert!(m.get(driver_id).is_none());
+    }
 }
 
 #[cfg(test)]

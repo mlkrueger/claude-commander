@@ -283,39 +283,6 @@ impl Ccom {
         }
     }
 
-    /// Phase 6 caller-id spike: return the value of the
-    /// `X-Ccom-Caller` HTTP header on the incoming tool-call request.
-    ///
-    /// This proves that rmcp 1.4's `StreamableHttpService` surfaces
-    /// custom request headers via `ctx.extensions.get::<http::request::Parts>()`
-    /// inside a `#[tool]` handler, which is the mechanism Phase 6's
-    /// `spawn_session` / scope-filtering will use to identify the
-    /// caller ccom session. If the spike passes, Task 3's caller
-    /// identification is validated and we can delete this probe (or
-    /// keep it as a diagnostic — it leaks no sensitive state).
-    ///
-    /// Returns `"<missing>"` if no header is present, the header
-    /// value verbatim otherwise.
-    #[tool(
-        description = "Spike/diagnostic: return the X-Ccom-Caller request header value. \
-                       Returns the literal string \"<missing>\" if the header is absent. \
-                       Used to validate Phase 6 caller identification — safe to remove \
-                       once spawn_session is in place."
-    )]
-    async fn _caller_probe(
-        &self,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let value = ctx
-            .extensions
-            .get::<http::request::Parts>()
-            .and_then(|parts| parts.headers.get("x-ccom-caller"))
-            .and_then(|hv| hv.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "<missing>".to_string());
-        Ok(CallToolResult::success(vec![Content::text(value)]))
-    }
-
     #[tool(description = "List all sessions ccom is currently managing. \
                        Returns a JSON array of SessionSummary objects \
                        with id, label, working_dir, status, last_activity_secs, \
@@ -794,15 +761,12 @@ impl Ccom {
         //
         //    Lock is released before any `.await` — critical because
         //    `ConfirmBridge::request` awaits and PTY spawn blocks.
-        enum Decision {
-            Silent,
-            NeedsConfirm,
-        }
+        //
         // `budget_decremented` carries (policy, pre-decrement-value) so
         // step 6 can restore the budget if `spawn_with_role` fails.
-        // Otherwise a failing PTY spawn would silently consume a budget
-        // credit — see pr-review-phase-6-tasks-3-to-7.md §A1 (S4).
-        let (decision, default_cwd, cols, rows, budget_decremented) = {
+        // Without this a failing PTY spawn permanently consumes a silent
+        // spawn credit.
+        let (needs_confirm, default_cwd, cols, rows, budget_decremented) = {
             let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
             let Some(caller) = mgr.get(caller_id) else {
                 return Ok(CallToolResult::error(vec![Content::text(
@@ -825,8 +789,8 @@ impl Ccom {
             let rows = caller.pty_size.rows;
 
             let mut budget_decremented: Option<(crate::session::SpawnPolicy, u32)> = None;
-            let decision = match policy {
-                crate::session::SpawnPolicy::Trust => Decision::Silent,
+            let needs_confirm = match policy {
+                crate::session::SpawnPolicy::Trust => false,
                 crate::session::SpawnPolicy::Budget => {
                     if budget > 0 {
                         // Atomic decrement under the same lock — no
@@ -840,19 +804,19 @@ impl Ccom {
                             },
                         );
                         budget_decremented = Some((policy, budget));
-                        Decision::Silent
+                        false
                     } else {
-                        Decision::NeedsConfirm
+                        true
                     }
                 }
-                crate::session::SpawnPolicy::Ask => Decision::NeedsConfirm,
+                crate::session::SpawnPolicy::Ask => true,
             };
-            (decision, default_cwd, cols, rows, budget_decremented)
+            (needs_confirm, default_cwd, cols, rows, budget_decremented)
         };
 
         // 4. If confirmation is needed, go through the same bridge
         //    pattern `kill_session` uses.
-        if matches!(decision, Decision::NeedsConfirm) {
+        if needs_confirm {
             let Some(bridge) = self.ctx.confirm.as_ref() else {
                 log::warn!("spawn_session({caller_id}): no confirm bridge on McpCtx, auto-denying");
                 return Ok(CallToolResult::error(vec![Content::text(
@@ -898,24 +862,23 @@ impl Ccom {
         // stand-in like `/bin/cat` so the full tool path can be
         // exercised without a real Claude binary on PATH. Production
         // reads the normal launcher.
-        let (claude_cmd, claude_args): (String, Vec<String>) =
-            if let Ok(override_cmd) = std::env::var("CCOM_TEST_SPAWN_CMD") {
-                (override_cmd, Vec::new())
-            } else {
-                (
-                    crate::claude::launcher::claude_command().to_string(),
-                    crate::claude::launcher::claude_args()
-                        .into_iter()
-                        .map(String::from)
-                        .collect(),
-                )
-            };
-
-        // When running under the test command override we must
-        // disable hook + mcp_config injection — `/bin/cat` doesn't
-        // accept `--settings` / `--mcp-config` flags. Production
-        // always gets hooks.
-        let use_test_command = std::env::var_os("CCOM_TEST_SPAWN_CMD").is_some();
+        //
+        // `use_test_command` also gates hook + mcp_config injection —
+        // `/bin/cat` doesn't accept `--settings` / `--mcp-config` flags.
+        let test_cmd = std::env::var("CCOM_TEST_SPAWN_CMD").ok();
+        let use_test_command = test_cmd.is_some();
+        let (claude_cmd, claude_args): (String, Vec<String>) = if let Some(override_cmd) = test_cmd
+        {
+            (override_cmd, Vec::new())
+        } else {
+            (
+                crate::claude::launcher::claude_command().to_string(),
+                crate::claude::launcher::claude_args()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            )
+        };
         let spawn_cfg = crate::session::SpawnConfig {
             label: clean_label.clone(),
             working_dir: cwd,
@@ -932,11 +895,30 @@ impl Ccom {
             },
         };
 
-        // 6. Spawn + (optionally) send the initial prompt under a
-        //    single lock acquisition so an observer can't snapshot
-        //    the child without its first turn queued. `spawn_with_role`
-        //    leaves the child Solo with `spawned_by = Some(driver_id)` —
-        //    v1 nesting cap: drivers never spawn drivers.
+        // 6. Sanitize the initial_prompt before subscribing/spawning so
+        //    we can bail early without side-effects. Subscribe to the
+        //    bus *before* spawning to close the TOCTOU window between
+        //    spawn and subscribe — the session could become Idle in that
+        //    gap and we'd miss the event.
+        let clean_prompt: Option<String> = match args.initial_prompt.as_deref() {
+            Some(prompt) => match sanitize_prompt_text(prompt) {
+                Ok(clean) => Some(clean),
+                Err(reason) => {
+                    log::warn!("spawn_session: initial_prompt rejected by sanitizer: {reason}");
+                    None
+                }
+            },
+            None => None,
+        };
+        // Only subscribe for the Idle wait when running against a real
+        // Claude binary. The test command override (`/bin/cat`) never
+        // produces PTY output that would trigger the Idle transition, so
+        // waiting would always time out and slow every test by 30s.
+        let prompt_rx =
+            (clean_prompt.is_some() && !use_test_command).then(|| self.ctx.bus.subscribe());
+
+        // 7. Spawn under a single lock acquisition.
+        //    `send_prompt` is NOT called here — see step 8 below.
         //
         //    Two-phase note (pr-review-phase-6-tasks-3-to-7.md §B2):
         //    step 3 above holds the sessions mutex across the budget
@@ -949,7 +931,7 @@ impl Ccom {
         //    path below (A1 fix).
         let new_id = {
             let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            let id = match mgr.spawn_with_role(spawn_cfg, None, Some(caller_id)) {
+            match mgr.spawn_with_role(spawn_cfg, None, Some(caller_id)) {
                 Ok(id) => id,
                 Err(e) => {
                     // Restore the budget if we decremented it in step 3.
@@ -970,23 +952,50 @@ impl Ccom {
                         "spawn_session: spawn failed: {e}"
                     ))]));
                 }
-            };
-            if let Some(prompt) = args.initial_prompt.as_deref() {
-                match sanitize_prompt_text(prompt) {
-                    Ok(clean) => {
-                        if let Err(e) = mgr.send_prompt(id, &clean) {
-                            log::warn!("spawn_session({id}): initial prompt send failed: {e}");
-                        }
-                    }
-                    Err(reason) => {
-                        log::warn!(
-                            "spawn_session({id}): initial prompt rejected by sanitizer: {reason}"
-                        );
+            }
+        };
+
+        // 8. Wait for the new session to reach Idle before sending the
+        //    initial_prompt. Without this wait the submit sequence (\r)
+        //    races Claude's startup — the text lands in the PTY buffer
+        //    before Claude has rendered its input prompt and is ignored.
+        //    `Idle` is emitted by `update_statuses` once the session has
+        //    had no PTY activity for >5s, which is exactly when Claude
+        //    is sitting at its input prompt ready for input.
+        //    (Smoke test finding: workers 1+2 showed prompt in input box
+        //    but unsubmitted; only the last worker — already past the
+        //    race window — submitted correctly.)
+        if let Some((rx, clean)) = prompt_rx.zip(clean_prompt) {
+            const IDLE_WAIT_SECS: u64 = 30;
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(IDLE_WAIT_SECS);
+            let mut became_idle = false;
+            'wait: while std::time::Instant::now() < deadline {
+                while let Ok(ev) = rx.try_recv() {
+                    if matches!(
+                        &ev,
+                        crate::session::SessionEvent::StatusChanged {
+                            session_id,
+                            status: crate::session::SessionStatus::Idle,
+                        } if *session_id == new_id
+                    ) {
+                        became_idle = true;
+                        break 'wait;
                     }
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            id
-        };
+            if !became_idle {
+                log::warn!(
+                    "spawn_session({new_id}): did not become Idle within {IDLE_WAIT_SECS}s, \
+                     sending initial_prompt anyway"
+                );
+            }
+            let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = mgr.send_prompt(new_id, &clean) {
+                log::warn!("spawn_session({new_id}): initial_prompt send failed: {e}");
+            }
+        }
 
         let wire = SpawnSessionWire {
             session_id: new_id,
