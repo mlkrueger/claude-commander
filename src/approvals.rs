@@ -400,6 +400,13 @@ pub async fn handle_hook_request(
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), decision_rx).await {
         Ok(Ok(ApprovalDecision::Allow)) => {
             let _ = response_tx.send(ApprovalHookResponse::Allow);
+            bus.publish(SessionEvent::ToolApprovalResolved {
+                request_id,
+                session_id,
+                driver_id,
+                decision: ApprovalDecision::Allow,
+                scope: ApprovalScope::Once,
+            });
         }
         Ok(Ok(ApprovalDecision::Deny)) => {
             let _ = response_tx.send(ApprovalHookResponse::Deny);
@@ -457,6 +464,10 @@ pub async fn run_coordinator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate environment variables so that parallel
+    /// test threads don't race on `set_var` / `remove_var`.
+    static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn registry_open_and_resolve_round_trip() {
@@ -608,7 +619,8 @@ mod tests {
     #[test]
     fn registry_reaper_clears_stale_entries() {
         // Override the reaper threshold to 0s so every entry is immediately stale.
-        // SAFETY: single-threaded test; no concurrent env access.
+        // SAFETY: TEST_ENV_MUTEX serializes env mutation across parallel test threads.
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::set_var("CCOM_APPROVAL_REAPER_SECS", "0") };
 
         let registry = ApprovalRegistry::new();
@@ -632,7 +644,7 @@ mod tests {
         assert_eq!(rx_a.blocking_recv().unwrap(), ApprovalDecision::Deny);
 
         // Clean up env so other tests are not affected.
-        // SAFETY: single-threaded test; no concurrent env access.
+        // SAFETY: TEST_ENV_MUTEX serializes env mutation across parallel test threads.
         unsafe { std::env::remove_var("CCOM_APPROVAL_REAPER_SECS") };
     }
 
@@ -641,7 +653,8 @@ mod tests {
         use crate::session::{EventBus, SessionEvent};
 
         // Use a 0-second timeout so the test does not wait 590s.
-        // SAFETY: single-threaded test; no concurrent env access.
+        // SAFETY: TEST_ENV_MUTEX serializes env mutation across parallel test threads.
+        let _guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::set_var("CCOM_APPROVAL_TIMEOUT_SECS", "0") };
 
         let bus = Arc::new(EventBus::new());
@@ -692,7 +705,7 @@ mod tests {
         }
 
         // Clean up.
-        // SAFETY: single-threaded test; no concurrent env access.
+        // SAFETY: TEST_ENV_MUTEX serializes env mutation across parallel test threads.
         unsafe { std::env::remove_var("CCOM_APPROVAL_TIMEOUT_SECS") };
     }
 }
