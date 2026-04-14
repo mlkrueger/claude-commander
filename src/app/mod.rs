@@ -194,6 +194,10 @@ pub struct App {
     /// unread until Task 4's `caller_scope` body replaces the stub.
     #[allow(dead_code)]
     pub(crate) attachment_map: Arc<Mutex<HashMap<usize, HashSet<usize>>>>,
+    /// Phase 7 Task 5: approval registry owned at App-level and shared
+    /// with `McpCtx`. Allows the TUI thread to wire per-session
+    /// approval coordinators after spawning, without going through MCP.
+    pub(crate) approvals: Arc<crate::approvals::ApprovalRegistry>,
 }
 
 const ATTENTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -240,6 +244,11 @@ impl App {
         // `ccom-mcp` thread can request user confirmation.
         let (confirm_bridge, confirm_rx) = crate::mcp::ConfirmBridge::new();
 
+        // Phase 7 Task 5: create the registry at App-level so both the
+        // MCP handlers (via McpCtx) and the TUI-thread coordinator-startup
+        // path can share the same Arc.
+        let approvals = crate::approvals::ApprovalRegistry::new();
+
         // Start the embedded MCP server. Failure is non-fatal — the
         // TUI remains functional, just without the read-only tools.
         let mcp = {
@@ -252,9 +261,9 @@ impl App {
                 // ctx so `spawn_session` can spawn new sessions
                 // whose PTY output reaches the main TUI event loop.
                 event_tx: Some(event_tx.clone()),
-                // Phase 7 Tasks 1+2+3: approval registry shared between
+                // Phase 7 Tasks 1+2+3+5: approval registry shared between
                 // the socket listener tasks and the MCP handlers.
-                approvals: Some(crate::approvals::ApprovalRegistry::new()),
+                approvals: Some(Arc::clone(&approvals)),
             });
             match crate::mcp::McpServer::start(ctx) {
                 Ok(server) => {
@@ -306,6 +315,7 @@ impl App {
             picker_selected: 0,
             pending_driver_role: None,
             attachment_map,
+            approvals,
         }
     }
 
@@ -491,7 +501,13 @@ impl App {
             self.pending_driver_role = Some(role);
         }
         match spawn_res {
-            Ok(_id) => {
+            Ok(id) => {
+                // Phase 7 Task 5: wire the approval coordinator for every
+                // Claude session. The coordinator bridges the per-session
+                // Unix socket to the ApprovalRegistry + event bus.
+                if install_hook {
+                    self.start_approval_coordinator(id);
+                }
                 self.update_file_tree_for_selected();
             }
             Err(e) => {
@@ -499,6 +515,36 @@ impl App {
                 self.status_message = Some(format!("Failed to spawn session: {e}"));
             }
         }
+    }
+
+    /// Phase 7 Task 5: start the approval coordinator for session `id`.
+    ///
+    /// Called after every Claude session spawn. Uses the MCP server's
+    /// tokio runtime handle to schedule the coordinator task, because the
+    /// TUI main thread has no tokio runtime of its own.
+    pub(crate) fn start_approval_coordinator(&mut self, session_id: usize) {
+        let Some(mcp) = self.mcp.as_ref() else { return };
+        let handle = mcp.runtime_handle();
+        let rx = self
+            .sessions_lock()
+            .get_mut(session_id)
+            .and_then(|s| s.ensure_approval_socket_running(handle));
+        let Some(rx) = rx else {
+            log::debug!("session {session_id}: no approval socket rx, skipping coordinator");
+            return;
+        };
+        let sessions = Arc::clone(&self.sessions);
+        let approvals = Arc::clone(&self.approvals);
+        let bus = Arc::clone(&self.event_bus);
+        let attachments = Arc::clone(&self.attachment_map);
+        handle.spawn(crate::approvals::run_coordinator(
+            rx,
+            sessions,
+            approvals,
+            bus,
+            attachments,
+        ));
+        log::debug!("session {session_id}: approval coordinator started");
     }
 
     fn approve_selected(&mut self) {

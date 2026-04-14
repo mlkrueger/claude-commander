@@ -243,9 +243,10 @@ impl ApprovalRegistry {
 
 /// Handle a single hook request arriving from the socket listener.
 ///
-/// Looks up the session by Claude UUID, finds its driver, registers a
-/// pending approval, publishes an event, awaits the driver's decision,
-/// and replies on `request.response_tx`.
+/// Looks up the session by `ccom_session_id`, finds its driver via
+/// `spawned_by` or the dynamic attachment map, registers a pending
+/// approval, publishes an event, awaits the driver's decision, and
+/// replies on `request.response_tx`.
 ///
 /// IMPORTANT: This function must NOT hold any mutex across `.await` points.
 pub async fn handle_hook_request(
@@ -253,6 +254,7 @@ pub async fn handle_hook_request(
     sessions: Arc<Mutex<crate::session::SessionManager>>,
     approvals: Arc<ApprovalRegistry>,
     bus: Arc<crate::session::EventBus>,
+    attachments: Arc<Mutex<std::collections::HashMap<usize, std::collections::HashSet<usize>>>>,
 ) {
     use crate::session::SessionEvent;
 
@@ -273,18 +275,29 @@ pub async fn handle_hook_request(
     // `Session.claude_session_id`, which is only populated after the Stop
     // hook fires — i.e. after the first turn ends. PreToolUse fires before
     // any Stop hook, so find_by_uuid would always return None on first use.
+    //
+    // Driver resolution priority:
+    //   1. spawned_by (permanent parent/child relationship set at spawn time)
+    //   2. dynamic attachment map (user-initiated TUI attachment)
     let (session_id, driver_id) = {
         let mgr = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        // Find the driver for this session (spawned_by chain).
-        // Attachment-based lookup is handled by the MCP scope filter.
-        let driver_id = match mgr.get(ccom_session_id).and_then(|s| s.spawned_by) {
-            Some(did) => did,
+        let via_spawn = mgr.get(ccom_session_id).and_then(|s| s.spawned_by);
+        let driver_id = via_spawn.or_else(|| {
+            let map = attachments.lock().unwrap_or_else(|p| p.into_inner());
+            map.iter()
+                .find(|(_, attached)| attached.contains(&ccom_session_id))
+                .map(|(did, _)| *did)
+        });
+        match driver_id {
+            Some(did) => (ccom_session_id, did),
             None => {
+                log::debug!(
+                    "session {ccom_session_id}: no driver found, passing through tool call"
+                );
                 let _ = response_tx.send(ApprovalHookResponse::Passthrough);
                 return;
             }
-        };
-        (ccom_session_id, driver_id)
+        }
     };
 
     // --- Register the pending approval (no mutex held across await) ---
@@ -322,6 +335,31 @@ pub async fn handle_hook_request(
             approvals.cancel(request_id);
             let _ = response_tx.send(ApprovalHookResponse::Deny);
         }
+    }
+}
+
+// --- Coordinator ----------------------------------------------------------
+
+/// Drain `rx` and dispatch each incoming hook request to
+/// [`handle_hook_request`] as an independent task. Exits when `rx` is
+/// closed (i.e. the session's approval socket is torn down on cleanup).
+///
+/// One coordinator is spawned per session on the `ccom-mcp` tokio runtime.
+pub async fn run_coordinator(
+    mut rx: tokio::sync::mpsc::Receiver<ApprovalHookRequest>,
+    sessions: Arc<Mutex<crate::session::SessionManager>>,
+    approvals: Arc<ApprovalRegistry>,
+    bus: Arc<crate::session::EventBus>,
+    attachments: Arc<Mutex<std::collections::HashMap<usize, std::collections::HashSet<usize>>>>,
+) {
+    while let Some(request) = rx.recv().await {
+        tokio::spawn(handle_hook_request(
+            request,
+            Arc::clone(&sessions),
+            Arc::clone(&approvals),
+            Arc::clone(&bus),
+            Arc::clone(&attachments),
+        ));
     }
 }
 

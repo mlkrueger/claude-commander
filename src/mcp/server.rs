@@ -32,6 +32,10 @@ pub struct McpServer {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
     cancel: CancellationToken,
+    /// Handle to the `ccom-mcp` thread's tokio runtime. Used by App to
+    /// schedule coordinator tasks (approval routing) from the TUI thread,
+    /// which has no tokio runtime of its own.
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl McpServer {
@@ -46,6 +50,7 @@ impl McpServer {
         // "return Ok(port=0)" hack. The main thread must see
         // startup failures, not silently get a zero port.
         let (port_tx, port_rx) = std::sync::mpsc::sync_channel::<Result<u16, String>>(1);
+        let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel::<tokio::runtime::Handle>(1);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let cancel = CancellationToken::new();
         let cancel_for_thread = cancel.clone();
@@ -64,9 +69,20 @@ impl McpServer {
                         return;
                     }
                 };
+                // Send the handle before blocking so callers can schedule
+                // tasks onto this runtime from the TUI thread.
+                let _ = handle_tx.send(rt.handle().clone());
                 rt.block_on(run_server(ctx, port_tx, shutdown_rx, cancel_for_thread));
             })?;
 
+        let runtime_handle = match handle_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(h) => h,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "ccom-mcp thread did not send runtime handle: {e}"
+                ));
+            }
+        };
         let port = match port_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(Ok(port)) => port,
             Ok(Err(msg)) => return Err(anyhow::anyhow!("ccom-mcp startup failed: {msg}")),
@@ -78,6 +94,7 @@ impl McpServer {
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
             cancel,
+            runtime_handle,
         })
     }
 
@@ -232,6 +249,12 @@ impl McpServer {
     /// Assigned loopback port.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Handle to the `ccom-mcp` thread's tokio runtime. Use this from the
+    /// TUI thread to schedule approval-coordinator tasks.
+    pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
+        &self.runtime_handle
     }
 
     /// Graceful shutdown: signal axum to stop accepting new
