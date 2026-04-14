@@ -181,6 +181,31 @@ pub struct SubscribeArgs {
     pub event_types: Option<Vec<String>>,
 }
 
+/// Arguments for the `respond_to_tool_approval` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RespondToToolApprovalArgs {
+    /// The request id returned by `list_tool_approvals` or the
+    /// `tool_approval_pending` event.
+    pub request_id: u64,
+    /// `"allow"` or `"deny"`.
+    pub decision: String,
+    /// `"once"` (default) or `"allow_always"`. When `"allow_always"`
+    /// and decision is `"allow"`, a rule is written to the session's
+    /// approvals state file so future identical calls are auto-approved
+    /// by the hook binary without a socket roundtrip.
+    pub scope: Option<String>,
+}
+
+/// Wire-format reply for `respond_to_tool_approval`.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct RespondToToolApprovalWire {
+    pub request_id: u64,
+    pub session_id: usize,
+    pub tool: String,
+    pub decision: String,
+    pub scope: String,
+}
+
 /// Wire-format representation of a filtered `SessionEvent` forwarded
 /// over the MCP notification channel. Mirrors the domain enum but
 /// uses a flat JSON shape with an explicit `type` discriminator so
@@ -1015,6 +1040,129 @@ impl Ccom {
         };
         let json = serde_json::to_string(&wire)
             .map_err(|e| McpError::internal_error(format!("spawn_session serialize: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Respond to a pending tool-use approval request from a child session. \
+                       Only driver sessions (identified by the X-Ccom-Caller header) may call \
+                       this tool — solo callers are rejected. \
+                       `decision` must be 'allow' or 'deny'. \
+                       `scope` is 'once' (default) or 'allow_always'; when 'allow_always' \
+                       and decision is 'allow', an allow-always rule is written to the \
+                       session's state file so future identical calls are auto-approved \
+                       by the hook binary without a socket roundtrip."
+    )]
+    async fn respond_to_tool_approval(
+        &self,
+        Parameters(args): Parameters<RespondToToolApprovalArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::approvals::{ApprovalDecision, ApprovalScope, ResolveError};
+        use crate::session::{SessionEvent, SessionRole};
+
+        // 1. Registry must be wired up.
+        let approvals = match &self.ctx.approvals {
+            Some(a) => Arc::clone(a),
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "approval registry not available",
+                )]));
+            }
+        };
+
+        // 2. Caller must identify itself via X-Ccom-Caller.
+        let caller_id = match caller_id_from_ctx(&ctx) {
+            Some(id) => id,
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "respond_to_tool_approval requires X-Ccom-Caller header",
+                )]));
+            }
+        };
+
+        // 3. Caller must be a driver (not solo / unknown).
+        let is_driver = {
+            let mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            matches!(
+                mgr.get(caller_id).map(|s| &s.role),
+                Some(SessionRole::Driver { .. })
+            )
+        };
+        if !is_driver {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "respond_to_tool_approval: caller is not a driver session",
+            )]));
+        }
+
+        // 4. Parse decision.
+        let decision = match args.decision.as_str() {
+            "allow" => ApprovalDecision::Allow,
+            "deny" => ApprovalDecision::Deny,
+            other => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "invalid decision {other:?}: must be 'allow' or 'deny'"
+                ))]));
+            }
+        };
+
+        // 5. Parse scope.
+        let scope = match args.scope.as_deref().unwrap_or("once") {
+            "once" => ApprovalScope::Once,
+            "allow_always" => ApprovalScope::AllowAlways,
+            other => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "invalid scope {other:?}: must be 'once' or 'allow_always'"
+                ))]));
+            }
+        };
+
+        // 6. Resolve the pending approval.
+        let meta =
+            match approvals.resolve(args.request_id, caller_id, decision.clone(), scope.clone()) {
+                Ok(m) => m,
+                Err(ResolveError::NotFound) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "request {} not found",
+                        args.request_id
+                    ))]));
+                }
+                Err(ResolveError::DriverMismatch) => {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "request belongs to a different driver",
+                    )]));
+                }
+            };
+
+        // 7. Persist allow-always rule to the session's state file.
+        if scope == ApprovalScope::AllowAlways && decision == ApprovalDecision::Allow {
+            let fp = crate::approvals_state::input_fingerprint(&meta.args);
+            if let Err(e) =
+                crate::approvals_state::add_allow_always(&meta.claude_uuid, &meta.tool, Some(&fp))
+            {
+                log::warn!("respond_to_tool_approval: failed to write allow-always rule: {e}");
+            }
+        }
+
+        // 8. Publish resolution event.
+        self.ctx.bus.publish(SessionEvent::ToolApprovalResolved {
+            request_id: args.request_id,
+            session_id: meta.session_id,
+            driver_id: caller_id,
+            decision: decision.clone(),
+            scope: scope.clone(),
+        });
+
+        let wire = RespondToToolApprovalWire {
+            request_id: args.request_id,
+            session_id: meta.session_id,
+            tool: meta.tool.clone(),
+            decision: args.decision.clone(),
+            scope: args.scope.unwrap_or_else(|| "once".to_string()),
+        };
+        let json = serde_json::to_string(&wire).map_err(|e| {
+            McpError::internal_error(format!("respond_to_tool_approval serialize: {e}"), None)
+        })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
