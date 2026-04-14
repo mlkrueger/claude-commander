@@ -201,6 +201,34 @@ impl McpServer {
         Ok((server, rx))
     }
 
+    /// Phase 7 Tasks 3+4 test seam: like
+    /// [`Self::start_with_confirm_and_event_tx`] but also wires an
+    /// `ApprovalRegistry` into the ctx so integration tests can exercise
+    /// the `respond_to_tool_approval` handler with a pre-populated
+    /// registry.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn start_with_approvals(
+        sessions: Arc<Mutex<crate::session::SessionManager>>,
+        bus: Arc<crate::session::EventBus>,
+        approvals: Arc<crate::approvals::ApprovalRegistry>,
+    ) -> anyhow::Result<(
+        Self,
+        std::sync::mpsc::Receiver<super::confirm::ConfirmRequest>,
+    )> {
+        let (bridge, rx) = super::confirm::ConfirmBridge::new();
+        let ctx = Arc::new(McpCtx {
+            sessions,
+            bus,
+            confirm: Some(bridge),
+            attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            event_tx: None,
+            approvals: Some(approvals),
+        });
+        let server = Self::start(ctx)?;
+        Ok((server, rx))
+    }
+
     /// Assigned loopback port.
     pub fn port(&self) -> u16 {
         self.port

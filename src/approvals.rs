@@ -85,6 +85,8 @@ pub struct PendingApproval {
 /// bookkeeping like writing the state file for AllowAlways).
 #[derive(Debug)]
 pub struct PendingApprovalMeta {
+    /// ccom's own session index for the worker session that was waiting.
+    pub session_id: usize,
     pub claude_uuid: String,
     pub tool: String,
     pub args: serde_json::Value,
@@ -198,6 +200,7 @@ impl ApprovalRegistry {
         // coordinator may have already timed out and dropped its receiver).
         let _ = entry.response_tx.send(decision);
         Ok(PendingApprovalMeta {
+            session_id: entry.session_id,
             claude_uuid: entry.claude_uuid,
             tool: entry.tool,
             args: entry.args,
@@ -344,6 +347,7 @@ mod tests {
         let result = registry.resolve(request_id, 42, ApprovalDecision::Allow, ApprovalScope::Once);
         assert!(result.is_ok());
         let meta = result.unwrap();
+        assert_eq!(meta.session_id, 1);
         assert_eq!(meta.tool, "Bash");
         assert_eq!(meta.claude_uuid, "claude-uuid-1");
         assert_eq!(meta.scope, ApprovalScope::Once);

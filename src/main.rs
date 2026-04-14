@@ -1,5 +1,6 @@
 mod app;
 mod approvals;
+mod approvals_state;
 mod claude;
 mod driver_config;
 mod event;
