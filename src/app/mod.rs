@@ -167,6 +167,11 @@ pub struct App {
     pub setup_banner_dismissed: bool,
     pub mouse_captured: bool,
     pub toggle_mouse_capture: bool,
+    /// Set by the Resize handler so main.rs can re-assert EnableMouseCapture,
+    /// which some terminals silently drop after a resize event.
+    pub reapply_mouse_capture: bool,
+    /// Tick count when the current status_message was set (for auto-expiry).
+    pub status_message_tick: u64,
     pub new_session: Option<NewSessionState>,
     pub theme: Theme,
     pub tick_count: u64,
@@ -331,6 +336,8 @@ impl App {
             setup_banner_dismissed: false,
             mouse_captured: true,
             toggle_mouse_capture: false,
+            reapply_mouse_capture: false,
+            status_message_tick: 0,
             new_session: None,
             theme: Theme::new(ThemeName::Default),
             tick_count: 0,
@@ -364,6 +371,12 @@ impl App {
             }
             Event::Tick => {
                 self.tick_count = self.tick_count.wrapping_add(1);
+                // Auto-expire status messages after ~3 seconds (15 ticks × 200ms).
+                if self.status_message.is_some()
+                    && self.tick_count.wrapping_sub(self.status_message_tick) > 15
+                {
+                    self.status_message = None;
+                }
                 if self.last_attention_check.elapsed() > ATTENTION_CHECK_INTERVAL {
                     self.check_all_attention();
                     self.last_attention_check = Instant::now();
@@ -443,6 +456,10 @@ impl App {
                         session.try_resize(inner_cols, inner_rows);
                     }
                 }
+                // Re-assert mouse capture after resize — some terminals
+                // (notably macOS Terminal and older iTerm2) silently drop
+                // mouse tracking mode when the window is resized.
+                self.reapply_mouse_capture = true;
             }
         }
     }

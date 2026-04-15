@@ -377,7 +377,51 @@ impl App {
 
     fn handle_session_view_key(&mut self, key: KeyEvent, session_id: usize) {
         if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d') {
+            // Reset scroll state so the dashboard's detail panel shows live content.
+            if self.session_view_scroll > 0 {
+                let mgr = self.sessions_lock();
+                if let Some(session) = mgr.get(session_id) {
+                    let mut parser = crate::session::lock_parser(&session.parser);
+                    parser.screen_mut().set_scrollback(0);
+                }
+            }
+            self.session_view_scroll = 0;
+            self.user_scrolled = false;
             self.mode = AppMode::Dashboard;
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('g') {
+            // Diagnostic: probe the session's vt100 screen state so we can
+            // see whether Claude Code is in alternate-screen mode, what
+            // mouse protocol it requested, and how many rows of scrollback
+            // are actually populated. Trick for row count: set_scrollback
+            // clamps to the underlying VecDeque len, so after asking for
+            // usize::MAX, screen.scrollback() returns the true length.
+            let info = {
+                let mgr = self.sessions_lock();
+                mgr.get(session_id).map(|session| {
+                    let mut parser = crate::session::lock_parser(&session.parser);
+                    let prev = parser.screen().scrollback();
+                    parser.screen_mut().set_scrollback(usize::MAX);
+                    let sb_len = parser.screen().scrollback();
+                    parser.screen_mut().set_scrollback(prev);
+                    let screen = parser.screen();
+                    format!(
+                        "alt_screen={} mouse_mode={:?} mouse_enc={:?} sb_rows={} sb_offset={}",
+                        screen.alternate_screen(),
+                        screen.mouse_protocol_mode(),
+                        screen.mouse_protocol_encoding(),
+                        sb_len,
+                        prev,
+                    )
+                })
+            };
+            if let Some(info) = info {
+                log::info!("session {session_id} screen probe: {info}");
+                self.status_message = Some(format!("probe: {info}"));
+                self.status_message_tick = self.tick_count;
+            }
             return;
         }
 
@@ -647,6 +691,14 @@ impl App {
     pub(super) fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::MouseEventKind;
 
+        log::debug!(
+            "mouse event: kind={:?} col={} row={} mode={:?}",
+            mouse.kind,
+            mouse.column,
+            mouse.row,
+            std::mem::discriminant(&self.mode)
+        );
+
         let scroll_lines: usize = 3;
         match mouse.kind {
             MouseEventKind::ScrollUp => match &self.mode {
@@ -673,32 +725,46 @@ impl App {
                     }
                 },
                 AppMode::SessionView(id) => {
-                    // Probe the vt100 parser's max scrollback without
-                    // leaving it in a transient state. Previously we
-                    // set scrollback to `usize::MAX`, read the clamped
-                    // value back, then reset to 0 — but the 0 reset
-                    // caused visible flicker because render() on the
-                    // next tick sets scrollback to
-                    // `self.session_view_scroll` while the parser is
-                    // still at 0. Instead: probe max, then leave the
-                    // parser at the NEW scroll position so there's
-                    // no transient mid-state the renderer can observe.
+                    // Two cases:
+                    //   1. Child asked for mouse tracking (e.g. less, vim,
+                    //      tmux, htop). Forward the SGR wheel escape so the
+                    //      program handles it natively.
+                    //   2. Child didn't ask for mouse (Claude Code, plain
+                    //      shells). Scroll the vt100 primary-screen
+                    //      scrollback locally via session_view_scroll,
+                    //      which the render path feeds to set_scrollback().
                     let id = *id;
-                    let next_scroll = {
-                        let mgr = self.sessions_lock();
-                        mgr.get(id).map(|session| {
-                            let mut parser = crate::session::lock_parser(&session.parser);
-                            parser.screen_mut().set_scrollback(usize::MAX);
-                            let max = parser.screen().scrollback();
-                            let desired = self.session_view_scroll + scroll_lines;
-                            let clamped = desired.min(max);
-                            parser.screen_mut().set_scrollback(clamped);
-                            clamped
+                    let probe = {
+                        let mut mgr = self.sessions_lock();
+                        mgr.get_mut(id).map(|session| {
+                            let mouse_mode = {
+                                let parser = crate::session::lock_parser(&session.parser);
+                                parser.screen().mouse_protocol_mode()
+                            };
+                            if mouse_mode != vt100::MouseProtocolMode::None {
+                                let col = mouse.column.saturating_add(1);
+                                let row = mouse.row.saturating_add(1);
+                                let bytes = format!("\x1b[<64;{col};{row}M").into_bytes();
+                                for _ in 0..scroll_lines {
+                                    session.try_write(&bytes);
+                                }
+                                None
+                            } else {
+                                let mut parser = crate::session::lock_parser(&session.parser);
+                                let prev = parser.screen().scrollback();
+                                parser.screen_mut().set_scrollback(usize::MAX);
+                                let len = parser.screen().scrollback();
+                                parser.screen_mut().set_scrollback(prev);
+                                Some(len)
+                            }
                         })
                     };
-                    if let Some(next) = next_scroll {
-                        self.session_view_scroll = next;
-                        self.user_scrolled = next > 0;
+                    if let Some(Some(sb_rows)) = probe {
+                        self.session_view_scroll = self
+                            .session_view_scroll
+                            .saturating_add(scroll_lines)
+                            .min(sb_rows);
+                        self.user_scrolled = true;
                     }
                 }
                 AppMode::Editor => {
@@ -736,21 +802,34 @@ impl App {
                     }
                 },
                 AppMode::SessionView(id) => {
-                    // Sync the vt100 parser's scrollback to the new
-                    // position so the next render doesn't observe a
-                    // transient mid-state. See the ScrollUp comment
-                    // above for the flicker history.
                     let id = *id;
-                    let next = self.session_view_scroll.saturating_sub(scroll_lines);
-                    {
-                        let mgr = self.sessions_lock();
-                        if let Some(session) = mgr.get(id) {
-                            let mut parser = crate::session::lock_parser(&session.parser);
-                            parser.screen_mut().set_scrollback(next);
+                    let forwarded = {
+                        let mut mgr = self.sessions_lock();
+                        mgr.get_mut(id).is_some_and(|session| {
+                            let mouse_mode = {
+                                let parser = crate::session::lock_parser(&session.parser);
+                                parser.screen().mouse_protocol_mode()
+                            };
+                            if mouse_mode != vt100::MouseProtocolMode::None {
+                                let col = mouse.column.saturating_add(1);
+                                let row = mouse.row.saturating_add(1);
+                                let bytes = format!("\x1b[<65;{col};{row}M").into_bytes();
+                                for _ in 0..scroll_lines {
+                                    session.try_write(&bytes);
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                    };
+                    if !forwarded {
+                        self.session_view_scroll =
+                            self.session_view_scroll.saturating_sub(scroll_lines);
+                        if self.session_view_scroll == 0 {
+                            self.user_scrolled = false;
                         }
                     }
-                    self.session_view_scroll = next;
-                    self.user_scrolled = next > 0;
                 }
                 AppMode::Editor => {
                     if let Some(editor) = &mut self.editor {
