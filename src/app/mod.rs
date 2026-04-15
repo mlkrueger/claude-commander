@@ -212,6 +212,12 @@ pub struct App {
     /// driver session id. The TUI uses this to render the `▲ <n>` hint
     /// in the status line and the `▲` marker in the session list.
     pub(crate) pending_approvals_per_driver: HashMap<usize, u32>,
+    /// Maps child `session_id` → `(request_id, driver_id)` for native
+    /// Claude Code dialogs (YesNo / AllowOnce) that have been promoted to
+    /// synthetic registry entries so the driver can resolve them via MCP.
+    /// Entries are inserted when `WaitingForApproval` is detected and
+    /// removed when the status leaves that state or the driver resolves it.
+    pub(crate) pending_pty_approvals: HashMap<usize, (u64, usize)>,
     /// Phase 7 Task 8: subscriber for `ToolApprovalRequested` /
     /// `ToolApprovalResolved` events published by the approval
     /// coordinator. Drained each tick in `handle_event`.
@@ -346,6 +352,7 @@ impl App {
             attachment_map,
             approvals,
             pending_approvals_per_driver: HashMap::new(),
+            pending_pty_approvals: HashMap::new(),
             approval_event_rx,
         }
     }
@@ -485,6 +492,75 @@ impl App {
                         .entry(driver_id)
                         .or_insert(0);
                     *cnt = cnt.saturating_sub(1);
+                }
+                SessionEvent::StatusChanged {
+                    session_id,
+                    ref status,
+                } => {
+                    use crate::session::SessionStatus;
+                    match status {
+                        SessionStatus::WaitingForApproval(kind) => {
+                            // Only promote to a synthetic approval if this
+                            // session is driver-owned AND not already tracked.
+                            if self.pending_pty_approvals.contains_key(&session_id) {
+                                // Already registered — nothing to do.
+                                continue;
+                            }
+                            let (driver_id, cwd) = {
+                                let mgr = self.sessions_lock();
+                                let session = match mgr.get(session_id) {
+                                    Some(s) => s,
+                                    None => continue,
+                                };
+                                let driver_id = match session.spawned_by {
+                                    Some(did) => did,
+                                    None => continue, // not a child session
+                                };
+                                (driver_id, session.working_dir.clone())
+                            };
+                            let request_id = self.approvals.open_pty_dialog_request(
+                                session_id,
+                                driver_id,
+                                kind.clone(),
+                                cwd,
+                            );
+                            self.pending_pty_approvals
+                                .insert(session_id, (request_id, driver_id));
+                            self.event_bus.publish(SessionEvent::ToolApprovalRequested {
+                                request_id,
+                                session_id,
+                                driver_id,
+                                tool: format!("NativeDialog({kind})"),
+                                args: serde_json::json!({ "kind": kind }),
+                                cwd: std::path::PathBuf::new(),
+                                timestamp: std::time::SystemTime::now(),
+                            });
+                        }
+                        _ => {
+                            // Status left WaitingForApproval (or changed to a
+                            // different kind). Cancel any tracked PTY approval
+                            // so stale entries don't linger in the registry.
+                            if let Some((request_id, driver_id)) =
+                                self.pending_pty_approvals.remove(&session_id)
+                            {
+                                if self.approvals.cancel_if_pending(request_id) {
+                                    // Entry was still open — the user resolved
+                                    // the dialog manually in the TUI. Publish
+                                    // Resolved so the driver badge updates.
+                                    self.event_bus.publish(SessionEvent::ToolApprovalResolved {
+                                        request_id,
+                                        session_id,
+                                        driver_id,
+                                        decision: crate::approvals::ApprovalDecision::Deny,
+                                        scope: crate::approvals::ApprovalScope::Once,
+                                    });
+                                }
+                                // If cancel_if_pending returned false, the driver
+                                // already called respond_to_tool_approval — the
+                                // Resolved event was already published there.
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }

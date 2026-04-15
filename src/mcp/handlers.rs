@@ -188,6 +188,17 @@ pub struct SubscribeArgs {
     pub event_types: Option<Vec<String>>,
 }
 
+/// Arguments for the `list_pending_approvals` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ListPendingApprovalsArgs {
+    /// Seconds to wait for at least one approval to appear before
+    /// returning an empty array. Default 30, max 55 (capped to stay
+    /// under Claude Code's MCP tool timeout). Use wait_secs=30 after
+    /// sending a prompt to a child to avoid the race where the child
+    /// hasn't hit its first tool call yet.
+    pub wait_secs: Option<u64>,
+}
+
 /// Arguments for the `respond_to_tool_approval` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RespondToToolApprovalArgs {
@@ -561,9 +572,13 @@ impl Ccom {
                 let wire = SendPromptWire {
                     turn_id: turn_id.0,
                     driver_instructions: "The child may need to use tools that require \
-                        your approval. Call list_pending_approvals now and after each \
-                        of your turns to check for waiting requests. Do not assume the \
-                        child completed its task without checking."
+                        your approval. Call list_pending_approvals(wait_secs=30) to \
+                        wait for the child's first tool call. For EACH pending approval \
+                        you receive: show the user the tool name and arguments, ask \
+                        whether to allow or deny, then call respond_to_tool_approval \
+                        with their answer. Never auto-approve — always ask the user \
+                        first. Keep calling list_pending_approvals in a loop until the \
+                        child exits."
                         .to_string(),
                 };
                 let json = serde_json::to_string(&wire).map_err(|e| {
@@ -1167,11 +1182,14 @@ impl Ccom {
         let wire = SpawnSessionWire {
             session_id: new_id,
             label: clean_label,
-            driver_instructions: "Child tool calls require your approval before they can \
-                proceed. Call list_pending_approvals at the start of each turn to check \
-                for waiting requests, then respond_to_tool_approval for each one. \
-                Do not assume the child completed its task — keep polling until the \
-                child session exits or reports back."
+            driver_instructions: "Child tool calls require your approval before they \
+                can proceed. Call list_pending_approvals(wait_secs=30) to wait for \
+                the child's first tool call. For EACH pending approval you receive: \
+                show the user the tool name and arguments, ask whether to allow or \
+                deny, then call respond_to_tool_approval with their answer. Never \
+                auto-approve — always ask the user first. After handling all pending \
+                approvals, call list_pending_approvals(wait_secs=30) again in a loop \
+                until the child exits."
                 .to_string(),
         };
         let json = serde_json::to_string(&wire)
@@ -1270,13 +1288,37 @@ impl Ccom {
                 }
             };
 
-        // 7. Persist allow-always rule to the session's state file.
-        if scope == ApprovalScope::AllowAlways && decision == ApprovalDecision::Allow {
-            let fp = crate::approvals_state::input_fingerprint(&meta.args);
-            if let Err(e) =
-                crate::approvals_state::add_allow_always(&meta.claude_uuid, &meta.tool, Some(&fp))
-            {
-                log::warn!("respond_to_tool_approval: failed to write allow-always rule: {e}");
+        // 7a. PTY-dialog approvals: send keypresses to the child's terminal
+        //     instead of signalling a hook coordinator.
+        //     "YesNo" dialogs show "1. Yes / 2. No" — send "1" to allow,
+        //     "2" to deny. All other dialog kinds (AllowOnce, Unknown, …)
+        //     use Enter (\r) to accept or Escape to cancel.
+        if meta.is_pty_dialog {
+            let keypress: &[u8] = match decision {
+                ApprovalDecision::Allow => match meta.tool.as_str() {
+                    s if s.contains("YesNo") => b"1\r",
+                    _ => b"\r",
+                },
+                ApprovalDecision::Deny => match meta.tool.as_str() {
+                    s if s.contains("YesNo") => b"2\r",
+                    _ => b"\x1b",
+                },
+            };
+            let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(session) = mgr.get_mut(meta.session_id) {
+                session.try_write(keypress);
+            }
+        } else {
+            // 7b. Hook-based approvals: persist allow-always rule if requested.
+            if scope == ApprovalScope::AllowAlways && decision == ApprovalDecision::Allow {
+                let fp = crate::approvals_state::input_fingerprint(&meta.args);
+                if let Err(e) = crate::approvals_state::add_allow_always(
+                    &meta.claude_uuid,
+                    &meta.tool,
+                    Some(&fp),
+                ) {
+                    log::warn!("respond_to_tool_approval: failed to write allow-always rule: {e}");
+                }
             }
         }
 
@@ -1312,11 +1354,18 @@ impl Ccom {
                        `args` (tool input as provided by the child), \
                        `cwd` (working directory of the child at call time), \
                        `age_secs` (how long the child has been waiting). \
-                       Returns an empty array when no approvals are pending. \
-                       Call this at the start of each turn to check for pending requests."
+                       Set `wait_secs` (default 30, max 55) to long-poll: the call \
+                       blocks until at least one approval appears or the timeout \
+                       expires, whichever comes first. This avoids the race where \
+                       the driver polls before the child has had time to hit its \
+                       first tool call. After sending a prompt to a child, call \
+                       list_pending_approvals with wait_secs=30, then handle every \
+                       entry returned, then call it again in a loop until all child \
+                       sessions have exited."
     )]
     async fn list_pending_approvals(
         &self,
+        Parameters(args): Parameters<ListPendingApprovalsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         use crate::session::SessionRole;
@@ -1355,11 +1404,42 @@ impl Ccom {
             )]));
         }
 
-        let pending = approvals.pending_for_driver(caller_id);
-        let json = serde_json::to_string(&pending).map_err(|e| {
-            McpError::internal_error(format!("list_pending_approvals serialize: {e}"), None)
-        })?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        // Long-poll: wait up to `wait_secs` for at least one approval
+        // to appear. Capped at 55s to stay safely under Claude Code's
+        // 60s MCP tool timeout.
+        //
+        // Early-exit condition: if all driver-owned child sessions have
+        // exited there is nothing left to approve, so return immediately
+        // rather than waiting out the full deadline. This avoids the
+        // 30-second tail-latency after a child finishes its last tool call.
+        let wait_secs = args.wait_secs.unwrap_or(30).min(55);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+        loop {
+            let pending = approvals.pending_for_driver(caller_id);
+            if !pending.is_empty() || std::time::Instant::now() >= deadline {
+                let json = serde_json::to_string(&pending).map_err(|e| {
+                    McpError::internal_error(format!("list_pending_approvals serialize: {e}"), None)
+                })?;
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+            // No pending approvals — check whether any children are still alive.
+            // If every spawned_by == caller_id session has exited, there will
+            // never be another approval, so return early.
+            let any_child_alive = {
+                let mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                mgr.iter().any(|s| {
+                    s.spawned_by == Some(caller_id)
+                        && !matches!(s.status, crate::session::SessionStatus::Exited(_))
+                })
+            };
+            if !any_child_alive {
+                let json = serde_json::to_string(&pending).map_err(|e| {
+                    McpError::internal_error(format!("list_pending_approvals serialize: {e}"), None)
+                })?;
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
     }
 }
 

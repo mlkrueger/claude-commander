@@ -855,6 +855,7 @@ impl Session {
     ///   from the MCP server's runtime.
     ///
     /// Returns `None` if the session has no hook dir (non-Claude session).
+    #[allow(dead_code)]
     pub(crate) fn ensure_approval_socket_running(
         &mut self,
         handle: &tokio::runtime::Handle,
