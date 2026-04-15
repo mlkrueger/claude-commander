@@ -1281,6 +1281,66 @@ impl Ccom {
         })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(
+        description = "List all pending tool-use approval requests waiting for this driver. \
+                       Only driver sessions may call this tool. \
+                       Returns a JSON array of pending approvals, each with: \
+                       `request_id` (pass to respond_to_tool_approval), \
+                       `session_id` (which child is waiting), \
+                       `tool` (tool name e.g. 'Bash', 'Write'), \
+                       `args` (tool input as provided by the child), \
+                       `cwd` (working directory of the child at call time), \
+                       `age_secs` (how long the child has been waiting). \
+                       Returns an empty array when no approvals are pending. \
+                       Call this at the start of each turn to check for pending requests."
+    )]
+    async fn list_pending_approvals(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::session::SessionRole;
+
+        // Registry must be wired up.
+        let approvals = match &self.ctx.approvals {
+            Some(a) => Arc::clone(a),
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "approval registry not available",
+                )]));
+            }
+        };
+
+        // Caller must identify itself via X-Ccom-Caller.
+        let caller_id = match caller_id_from_ctx(&ctx) {
+            Some(id) => id,
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "list_pending_approvals requires X-Ccom-Caller header",
+                )]));
+            }
+        };
+
+        // Caller must be a driver.
+        let is_driver = {
+            let mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            matches!(
+                mgr.get(caller_id).map(|s| &s.role),
+                Some(SessionRole::Driver { .. })
+            )
+        };
+        if !is_driver {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "list_pending_approvals: caller is not a driver session",
+            )]));
+        }
+
+        let pending = approvals.pending_for_driver(caller_id);
+        let json = serde_json::to_string(&pending).map_err(|e| {
+            McpError::internal_error(format!("list_pending_approvals serialize: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[tool_handler]
