@@ -854,3 +854,378 @@ async fn attached_session_routes_to_driver_dynamically() {
 
     sessions.lock().unwrap().kill(solo_id);
 }
+/// Task 10 test 6 — two concurrent approvals from the same child are
+/// handled independently: each gets the decision it was resolved with.
+#[cfg(unix)]
+#[tokio::test]
+async fn two_concurrent_approvals_from_same_child_serialize_correctly() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_test_env();
+    let bus = Arc::new(EventBus::new());
+    let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
+
+    let driver_id = mgr.peek_next_id();
+    mgr.push_for_test(
+        Session::dummy_exited(driver_id, "driver").with_role(SessionRole::Driver {
+            spawn_budget: 5,
+            spawn_policy: SpawnPolicy::Budget,
+        }),
+    );
+
+    let child_id = mgr
+        .spawn_with_role(
+            SpawnConfig {
+                label: format!("child-concurrent-{}", std::process::id()),
+                working_dir: PathBuf::from("/tmp"),
+                command: &std::env::var("CCOM_TEST_SPAWN_CMD").unwrap_or("/bin/cat".into()),
+                args: vec![],
+                event_tx: make_event_tx(),
+                cols: 80,
+                rows: 24,
+                install_hook: true,
+                mcp_port: None,
+            },
+            None,
+            Some(driver_id),
+        )
+        .expect("spawn child");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let hook_dir = mgr
+        .get(child_id)
+        .and_then(|s| s.hook_dir())
+        .map(|p| p.to_path_buf())
+        .expect("hook_dir");
+    let socket_path = hook_dir.join("approval.sock");
+    let rx = mgr
+        .get_mut(child_id)
+        .and_then(|s| s.take_approval_rx())
+        .expect("approval_socket_rx");
+
+    let sessions = Arc::new(Mutex::new(mgr));
+    let approvals = ApprovalRegistry::new();
+    let attachments: Arc<Mutex<HashMap<usize, HashSet<usize>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(ccom::approvals::run_coordinator(
+        rx,
+        Arc::clone(&sessions),
+        Arc::clone(&approvals),
+        Arc::clone(&bus),
+        Arc::clone(&attachments),
+    ));
+
+    // Send two concurrent hook requests with different tool names.
+    let sp1 = socket_path.clone();
+    let task_bash =
+        tokio::spawn(async move { send_fake_hook_request(&sp1, child_id, "Bash").await });
+    let sp2 = socket_path.clone();
+    let task_edit =
+        tokio::spawn(async move { send_fake_hook_request(&sp2, child_id, "Edit").await });
+
+    // Wait for both pending approvals to appear in the registry.
+    for _ in 0..100 {
+        if approvals.pending_for_driver(driver_id).len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pending = approvals.pending_for_driver(driver_id);
+    assert_eq!(pending.len(), 2, "both approvals must appear in registry");
+
+    // Resolve: Bash → Allow, Edit → Deny.
+    for entry in &pending {
+        let decision = if entry.tool == "Bash" {
+            ccom::approvals::ApprovalDecision::Allow
+        } else {
+            ccom::approvals::ApprovalDecision::Deny
+        };
+        approvals
+            .resolve(
+                entry.request_id,
+                driver_id,
+                decision,
+                ccom::approvals::ApprovalScope::Once,
+            )
+            .ok();
+    }
+
+    let raw_bash = task_bash.await.expect("bash task");
+    let raw_edit = task_edit.await.expect("edit task");
+
+    let bash_resp: serde_json::Value = serde_json::from_str(&raw_bash).expect("valid JSON");
+    let edit_resp: serde_json::Value = serde_json::from_str(&raw_edit).expect("valid JSON");
+    assert_eq!(
+        bash_resp["decision"].as_str(),
+        Some("allow"),
+        "Bash must be allowed; got: {raw_bash}"
+    );
+    assert_eq!(
+        edit_resp["decision"].as_str(),
+        Some("deny"),
+        "Edit must be denied; got: {raw_edit}"
+    );
+
+    sessions.lock().unwrap().kill(child_id);
+}
+
+/// Task 10 test 7 — when a driver session exits, all its pending
+/// approvals are immediately denied so children are not left hanging.
+#[cfg(unix)]
+#[tokio::test]
+async fn driver_exit_denies_all_pending_approvals_for_its_children() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_test_env();
+    let bus = Arc::new(EventBus::new());
+    let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
+
+    let driver_id = mgr.peek_next_id();
+    mgr.push_for_test(
+        Session::dummy_exited(driver_id, "driver").with_role(SessionRole::Driver {
+            spawn_budget: 5,
+            spawn_policy: SpawnPolicy::Budget,
+        }),
+    );
+
+    let child_id = mgr
+        .spawn_with_role(
+            SpawnConfig {
+                label: format!("child-driver-exit-{}", std::process::id()),
+                working_dir: PathBuf::from("/tmp"),
+                command: &std::env::var("CCOM_TEST_SPAWN_CMD").unwrap_or("/bin/cat".into()),
+                args: vec![],
+                event_tx: make_event_tx(),
+                cols: 80,
+                rows: 24,
+                install_hook: true,
+                mcp_port: None,
+            },
+            None,
+            Some(driver_id),
+        )
+        .expect("spawn child");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let hook_dir = mgr
+        .get(child_id)
+        .and_then(|s| s.hook_dir())
+        .map(|p| p.to_path_buf())
+        .expect("hook_dir");
+    let socket_path = hook_dir.join("approval.sock");
+    let rx = mgr
+        .get_mut(child_id)
+        .and_then(|s| s.take_approval_rx())
+        .expect("approval_socket_rx");
+
+    let sessions = Arc::new(Mutex::new(mgr));
+    let approvals = ApprovalRegistry::new();
+    let attachments: Arc<Mutex<HashMap<usize, HashSet<usize>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(ccom::approvals::run_coordinator(
+        rx,
+        Arc::clone(&sessions),
+        Arc::clone(&approvals),
+        Arc::clone(&bus),
+        Arc::clone(&attachments),
+    ));
+
+    // Send a hook request without resolving it, simulating a blocked child.
+    let sp = socket_path.clone();
+    let hook_task =
+        tokio::spawn(async move { send_fake_hook_request(&sp, child_id, "Bash").await });
+
+    // Wait for the pending approval to appear.
+    for _ in 0..50 {
+        if !approvals.pending_for_driver(driver_id).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !approvals.pending_for_driver(driver_id).is_empty(),
+        "pending approval must appear before driver exit"
+    );
+
+    // Simulate driver exit: cancel all its pending approvals.
+    // The coordinator receives a closed channel and sends Deny.
+    approvals.deny_all_for_driver(driver_id);
+
+    let raw = hook_task.await.expect("hook task completed");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(
+        parsed["decision"].as_str(),
+        Some("deny"),
+        "driver exit must deny all pending approvals; got: {raw}"
+    );
+    // Registry must be empty — no ghost entries.
+    assert!(approvals.pending_for_driver(driver_id).is_empty());
+
+    sessions.lock().unwrap().kill(child_id);
+}
+
+/// Task 10 test 8 — when the coordinator times out waiting for a driver
+/// decision, the blocked hook receives a deny response.
+///
+/// Uses `CCOM_APPROVAL_TIMEOUT_SECS=1` to avoid a 590-second wait.
+#[cfg(unix)]
+#[tokio::test]
+async fn hook_timeout_denies_and_surfaces_to_tui_log() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_test_env();
+    // Short timeout so the test doesn't wait 590 seconds.
+    unsafe { std::env::set_var("CCOM_APPROVAL_TIMEOUT_SECS", "1") };
+
+    let bus = Arc::new(EventBus::new());
+    let bus_rx = bus.subscribe();
+    let mut mgr = SessionManager::with_bus(Arc::clone(&bus));
+
+    let driver_id = mgr.peek_next_id();
+    mgr.push_for_test(
+        Session::dummy_exited(driver_id, "driver").with_role(SessionRole::Driver {
+            spawn_budget: 5,
+            spawn_policy: SpawnPolicy::Budget,
+        }),
+    );
+
+    let child_id = mgr
+        .spawn_with_role(
+            SpawnConfig {
+                label: format!("child-timeout-{}", std::process::id()),
+                working_dir: PathBuf::from("/tmp"),
+                command: &std::env::var("CCOM_TEST_SPAWN_CMD").unwrap_or("/bin/cat".into()),
+                args: vec![],
+                event_tx: make_event_tx(),
+                cols: 80,
+                rows: 24,
+                install_hook: true,
+                mcp_port: None,
+            },
+            None,
+            Some(driver_id),
+        )
+        .expect("spawn child");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let hook_dir = mgr
+        .get(child_id)
+        .and_then(|s| s.hook_dir())
+        .map(|p| p.to_path_buf())
+        .expect("hook_dir");
+    let socket_path = hook_dir.join("approval.sock");
+    let rx = mgr
+        .get_mut(child_id)
+        .and_then(|s| s.take_approval_rx())
+        .expect("approval_socket_rx");
+
+    let sessions = Arc::new(Mutex::new(mgr));
+    let approvals = ApprovalRegistry::new();
+    let attachments: Arc<Mutex<HashMap<usize, HashSet<usize>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(ccom::approvals::run_coordinator(
+        rx,
+        Arc::clone(&sessions),
+        Arc::clone(&approvals),
+        Arc::clone(&bus),
+        Arc::clone(&attachments),
+    ));
+
+    // Send a hook request but intentionally do NOT resolve it.
+    // The coordinator must time out after 1s and send deny.
+    let sp = socket_path.clone();
+    let hook_task =
+        tokio::spawn(async move { send_fake_hook_request(&sp, child_id, "Bash").await });
+
+    // Wait for pending approval to appear, then just wait for the timeout.
+    for _ in 0..50 {
+        if !approvals.pending_for_driver(driver_id).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Wait for the 1s timeout + a little margin.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let raw = hook_task.await.expect("hook task completed");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(
+        parsed["decision"].as_str(),
+        Some("deny"),
+        "coordinator timeout must deny; got: {raw}"
+    );
+
+    // After timeout the coordinator publishes ToolApprovalResolved so the
+    // TUI status-line counter can clear.
+    use ccom::session::SessionEvent;
+    let resolved_seen = {
+        let mut found = false;
+        while let Ok(evt) = bus_rx.try_recv() {
+            if let SessionEvent::ToolApprovalResolved { decision, .. } = evt {
+                if decision == ccom::approvals::ApprovalDecision::Deny {
+                    found = true;
+                }
+            }
+        }
+        found
+    };
+    assert!(
+        resolved_seen,
+        "ToolApprovalResolved(Deny) must be published by coordinator on timeout"
+    );
+
+    // Registry must be empty — no ghost entries after timeout.
+    assert!(approvals.pending_for_driver(driver_id).is_empty());
+
+    unsafe { std::env::remove_var("CCOM_APPROVAL_TIMEOUT_SECS") };
+    sessions.lock().unwrap().kill(child_id);
+}
+
+/// Task 10 test 10 — state file survives concurrent writes from multiple
+/// goroutines: all rules must be present afterward.
+#[test]
+fn state_file_round_trip_under_concurrent_write() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    let uuid = format!("concurrent-write-{}", std::process::id());
+    let state_base = std::env::temp_dir().join("ccom-it-concurrent-write");
+    std::fs::create_dir_all(&state_base).unwrap();
+    let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
+    unsafe { std::env::set_var("XDG_STATE_HOME", state_base.to_str().unwrap()) };
+
+    // Two threads each write their own tool rule 5 times to the same file.
+    let uuid1 = uuid.clone();
+    let uuid2 = uuid.clone();
+    let h1 = std::thread::spawn(move || {
+        for _ in 0..5 {
+            ccom::approvals_state::add_allow_always(&uuid1, "Bash", None).expect("h1 add");
+        }
+    });
+    let h2 = std::thread::spawn(move || {
+        for _ in 0..5 {
+            ccom::approvals_state::add_allow_always(&uuid2, "Edit", None).expect("h2 add");
+        }
+    });
+    h1.join().expect("h1 join");
+    h2.join().expect("h2 join");
+
+    let state = ccom::approvals_state::read_approvals(&uuid).expect("read approvals");
+    assert!(
+        ccom::approvals_state::matches_allow_always(&state, "Bash", &serde_json::json!({})),
+        "Bash rule must be present after concurrent writes"
+    );
+    assert!(
+        ccom::approvals_state::matches_allow_always(&state, "Edit", &serde_json::json!({})),
+        "Edit rule must be present after concurrent writes"
+    );
+
+    // Cleanup.
+    let _ = std::fs::remove_dir_all(
+        ccom::approvals_state::state_file_path(&uuid)
+            .parent()
+            .unwrap(),
+    );
+    unsafe {
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+}
