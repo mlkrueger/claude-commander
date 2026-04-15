@@ -17,12 +17,12 @@ use std::time::Duration;
 
 use clap::Parser;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use std::io::Write as _;
 
 use app::App;
 use event::EventCollector;
@@ -106,7 +106,22 @@ fn main() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    // Mouse tracking setup. crossterm's EnableMouseCapture sends five modes
+    // including ?1003h (any-event motion), which some terminals treat as
+    // unsupported and silently disable ALL mouse tracking in response.
+    //
+    // We send three modes only:
+    //   ?1000h — normal tracking: button press/release (includes scroll wheel)
+    //   ?1002h — button-event tracking: required by many terminals (iTerm2,
+    //             Kitty, WezTerm) to actually deliver scroll wheel events
+    //   ?1006h — SGR extended coordinates: preferred encoding, wider range
+    //
+    // We deliberately omit ?1003h (any-event / all-motion) and ?1015h
+    // (URXVT coords, superseded by SGR).
+    write!(stdout, "\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+    log::info!("mouse capture enabled (?1000h ?1002h ?1006h)");
+    stdout.flush()?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -145,15 +160,36 @@ fn main() -> anyhow::Result<()> {
 
         if app.toggle_mouse_capture {
             app.toggle_mouse_capture = false;
+            let mut out = io::stdout();
             if app.mouse_captured {
-                execute!(io::stdout(), DisableMouseCapture)?;
+                // Disable: inverses of ?1000h ?1002h ?1006h in reverse order.
+                write!(out, "\x1b[?1006l\x1b[?1002l\x1b[?1000l")?;
+                out.flush()?;
                 app.mouse_captured = false;
-                app.status_message =
-                    Some("Mouse capture OFF — select text freely, Alt+M to re-enable".to_string());
+                app.status_message = Some(
+                    "Mouse capture OFF — text selection enabled. Alt+M to re-enable".to_string(),
+                );
+                app.status_message_tick = app.tick_count;
+                log::info!("mouse capture disabled");
             } else {
-                execute!(io::stdout(), EnableMouseCapture)?;
+                write!(out, "\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+                out.flush()?;
                 app.mouse_captured = true;
-                app.status_message = Some("Mouse capture ON — scroll with mouse".to_string());
+                app.status_message = Some("Mouse capture ON — scroll captured by ccom".to_string());
+                app.status_message_tick = app.tick_count;
+                log::info!("mouse capture re-enabled");
+            }
+        }
+
+        // Some terminals silently reset mouse tracking mode after a resize.
+        // Re-assert capture after every resize event so scroll stays captured.
+        if app.reapply_mouse_capture {
+            app.reapply_mouse_capture = false;
+            if app.mouse_captured {
+                let mut out = io::stdout();
+                write!(out, "\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+                out.flush()?;
+                log::info!("mouse capture re-asserted after resize");
             }
         }
 
@@ -183,7 +219,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    let mut out = io::stdout();
+    write!(out, "\x1b[?1006l\x1b[?1002l\x1b[?1000l")?; // disable mouse tracking
+    execute!(out, LeaveAlternateScreen)?;
 
     Ok(())
 }
