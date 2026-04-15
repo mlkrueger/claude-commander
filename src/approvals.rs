@@ -349,12 +349,26 @@ pub async fn handle_hook_request(
         Ok(Ok(ApprovalDecision::Deny)) => {
             let _ = response_tx.send(ApprovalHookResponse::Deny);
         }
-        Ok(Err(_)) | Err(_) => {
-            // Channel closed (driver exited / cancel_all_for_driver) or
-            // timeout: remove the stale entry so it doesn't show as a
-            // ghost approval in pending_for_driver, publish events so
-            // the TUI status-line counter clears and surfaces a
-            // user-visible notification, then deny.
+        Ok(Err(_)) => {
+            // Channel closed: the driver exited and cancel_all_for_driver
+            // dropped the response_tx.  Deny silently — no timeout
+            // notification; the driver exit event itself already updates
+            // the TUI.
+            approvals.cancel(request_id);
+            bus.publish(crate::session::SessionEvent::ToolApprovalResolved {
+                request_id,
+                session_id,
+                driver_id,
+                decision: ApprovalDecision::Deny,
+                scope: ApprovalScope::Once,
+            });
+            let _ = response_tx.send(ApprovalHookResponse::Deny);
+        }
+        Err(_) => {
+            // Actual coordinator timeout (590s): remove the stale entry,
+            // publish both ToolApprovalResolved and ToolApprovalTimedOut
+            // so the TUI counter clears and surfaces a user-visible
+            // notification, then deny.
             approvals.cancel(request_id);
             bus.publish(crate::session::SessionEvent::ToolApprovalResolved {
                 request_id,

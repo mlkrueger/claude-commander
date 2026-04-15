@@ -415,7 +415,11 @@ impl App {
                 // Phase 7 Task 8: drop stale pending-approval count for
                 // an exited driver — any in-flight requests are now
                 // unresolvable.
+                // Phase 7 Task 9: cancel all pending approvals so that
+                // coordinator tasks wake up and deny immediately rather
+                // than blocking until the 590s timeout fires.
                 if was_driver {
+                    self.approvals.cancel_all_for_driver(session_id);
                     self.pending_approvals_per_driver.remove(&session_id);
                 }
                 if let Some(session) = self.sessions_lock().get_mut(session_id) {
