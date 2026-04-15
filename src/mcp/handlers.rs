@@ -136,6 +136,10 @@ pub struct SendPromptArgs {
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct SendPromptWire {
     pub turn_id: u64,
+    /// Reminder shown in every send_prompt response so the driver's
+    /// LLM knows it must poll for approval requests rather than
+    /// assuming the child will complete autonomously.
+    pub driver_instructions: String,
 }
 
 /// Arguments for the `kill_session` tool.
@@ -166,6 +170,9 @@ pub struct SpawnSessionArgs {
 pub struct SpawnSessionWire {
     pub session_id: usize,
     pub label: String,
+    /// Reminder shown in every spawn response so the driver's LLM
+    /// knows it must poll for approval requests.
+    pub driver_instructions: String,
 }
 
 /// Arguments for the `subscribe` tool.
@@ -551,7 +558,14 @@ impl Ccom {
             Ok(turn_id) => {
                 // `TurnId`'s inner `u64` is `pub(crate)` — same idiom
                 // as `StoredTurnWire::from`.
-                let wire = SendPromptWire { turn_id: turn_id.0 };
+                let wire = SendPromptWire {
+                    turn_id: turn_id.0,
+                    driver_instructions: "The child may need to use tools that require \
+                        your approval. Call list_pending_approvals now and after each \
+                        of your turns to check for waiting requests. Do not assume the \
+                        child completed its task without checking."
+                        .to_string(),
+                };
                 let json = serde_json::to_string(&wire).map_err(|e| {
                     McpError::internal_error(format!("send_prompt serialize: {e}"), None)
                 })?;
@@ -1153,6 +1167,12 @@ impl Ccom {
         let wire = SpawnSessionWire {
             session_id: new_id,
             label: clean_label,
+            driver_instructions: "Child tool calls require your approval before they can \
+                proceed. Call list_pending_approvals at the start of each turn to check \
+                for waiting requests, then respond_to_tool_approval for each one. \
+                Do not assume the child completed its task — keep polling until the \
+                child session exits or reports back."
+                .to_string(),
         };
         let json = serde_json::to_string(&wire)
             .map_err(|e| McpError::internal_error(format!("spawn_session serialize: {e}"), None))?;
