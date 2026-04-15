@@ -61,6 +61,8 @@ pub struct Theme {
     pub status_ok: Color,
     /// Warning/attention status
     pub status_warn: Color,
+    /// High-usage / near-limit status (80–90%)
+    pub status_orange: Color,
     /// Error/exited status
     pub status_err: Color,
     /// Idle/muted status
@@ -79,6 +81,7 @@ impl Theme {
                 selected_fg: Color::Black,
                 status_ok: Color::Green,
                 status_warn: Color::Yellow,
+                status_orange: Color::Rgb(255, 140, 0),
                 status_err: Color::Red,
                 status_idle: Color::DarkGray,
             },
@@ -91,6 +94,7 @@ impl Theme {
                 selected_fg: Color::Black,
                 status_ok: Color::Rgb(0, 255, 0),
                 status_warn: Color::Rgb(180, 255, 0),
+                status_orange: Color::Rgb(255, 140, 0),
                 status_err: Color::Rgb(255, 80, 0),
                 status_idle: Color::Rgb(0, 80, 0),
             },
@@ -102,7 +106,8 @@ impl Theme {
                 selected_bg: Color::Rgb(255, 160, 0), // tron orange
                 selected_fg: Color::Black,
                 status_ok: Color::Rgb(0, 255, 255),
-                status_warn: Color::Rgb(255, 160, 0),
+                status_warn: Color::Rgb(255, 200, 0),
+                status_orange: Color::Rgb(255, 160, 0),
                 status_err: Color::Rgb(255, 50, 50),
                 status_idle: Color::Rgb(0, 60, 80),
             },
@@ -115,6 +120,7 @@ impl Theme {
                 selected_fg: Color::Black,
                 status_ok: Color::Rgb(255, 200, 80),
                 status_warn: Color::Rgb(255, 255, 100),
+                status_orange: Color::Rgb(255, 140, 0),
                 status_err: Color::Rgb(255, 60, 0),
                 status_idle: Color::Rgb(120, 80, 0),
             },
@@ -127,6 +133,7 @@ impl Theme {
                 selected_fg: Color::White,
                 status_ok: Color::Rgb(80, 200, 255),
                 status_warn: Color::Rgb(255, 220, 80),
+                status_orange: Color::Rgb(255, 160, 60),
                 status_err: Color::Rgb(255, 80, 80),
                 status_idle: Color::Rgb(30, 50, 100),
             },
@@ -139,6 +146,7 @@ impl Theme {
                 selected_fg: Color::White,
                 status_ok: Color::Rgb(255, 100, 200),
                 status_warn: Color::Rgb(255, 200, 100),
+                status_orange: Color::Rgb(255, 140, 0),
                 status_err: Color::Rgb(255, 50, 50),
                 status_idle: Color::Rgb(100, 10, 60),
             },
@@ -151,6 +159,7 @@ impl Theme {
                 selected_fg: Color::White,
                 status_ok: Color::Green,
                 status_warn: Color::Yellow,
+                status_orange: Color::Rgb(255, 140, 0),
                 status_err: Color::Red,
                 status_idle: Color::DarkGray,
             },
