@@ -30,6 +30,9 @@ pub struct CommandBar<'a> {
     /// with pending approvals, this holds the count so the status
     /// line can render `" ▲ <n> pending approval(s)"`.
     pending_approvals: Option<u32>,
+    /// Phase 7 Task 9: most recent timeout notification (within the
+    /// last 30 seconds), rendered in the status line when set.
+    timeout_message: Option<String>,
 }
 
 impl<'a> CommandBar<'a> {
@@ -39,6 +42,7 @@ impl<'a> CommandBar<'a> {
             usage: None,
             theme,
             pending_approvals: None,
+            timeout_message: None,
         }
     }
 
@@ -53,6 +57,14 @@ impl<'a> CommandBar<'a> {
         if count > 0 {
             self.pending_approvals = Some(count);
         }
+        self
+    }
+
+    /// Phase 7 Task 9: attach a timeout notification message. Rendered
+    /// in the status line when set; callers pass `None` when there is no
+    /// recent timeout.
+    pub fn with_timeout_message(mut self, msg: Option<&str>) -> Self {
+        self.timeout_message = msg.map(|s| s.to_string());
         self
     }
 }
@@ -110,24 +122,30 @@ impl Widget for CommandBar<'_> {
             }
         };
 
-        // Phase 7 Task 8: prefix the hint when this is a driver view
-        // with pending approvals.
-        let mut spans: Vec<Span> = if let Some(count) = self.pending_approvals {
-            let n = count;
-            let label = if n == 1 {
+        // Phase 7 Task 8+9: prefix the hint when there are pending
+        // approvals and/or a recent timeout notification.
+        let mut spans: Vec<Span> = Vec::new();
+        if let Some(count) = self.pending_approvals {
+            let label = if count == 1 {
                 " \u{25b2} 1 pending approval  ".to_string()
             } else {
-                format!(" \u{25b2} {n} pending approvals  ")
+                format!(" \u{25b2} {count} pending approvals  ")
             };
-            vec![Span::styled(
+            spans.push(Span::styled(
                 label,
                 ratatui::style::Style::default()
                     .fg(th.driver_color())
                     .add_modifier(ratatui::style::Modifier::DIM),
-            )]
-        } else {
-            Vec::new()
-        };
+            ));
+        }
+        if let Some(msg) = self.timeout_message {
+            spans.push(Span::styled(
+                format!(" \u{26a0} {msg}  "),
+                ratatui::style::Style::default()
+                    .fg(th.status_warn)
+                    .add_modifier(ratatui::style::Modifier::DIM),
+            ));
+        }
 
         spans.extend(shortcuts.iter().enumerate().flat_map(|(i, (key, desc))| {
             let mut s = vec![

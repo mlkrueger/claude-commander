@@ -217,6 +217,20 @@ impl ApprovalRegistry {
             .remove(&request_id);
     }
 
+    /// Cancel all pending approvals that belong to `driver_id`.
+    ///
+    /// Intended for when a driver session exits so its orphaned approvals
+    /// don't block children indefinitely. Dropping each `PendingApproval`
+    /// closes its `response_tx` oneshot; the awaiting coordinator task
+    /// detects the closed channel and sends `ApprovalHookResponse::Deny`
+    /// back to the blocked hook binary.
+    pub fn cancel_all_for_driver(&self, driver_id: usize) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|_, entry| entry.driver_id != driver_id);
+    }
+
     /// Return wire-safe snapshots of all pending approvals for the given
     /// driver. Used by `list_tool_approvals` MCP tool.
     pub fn pending_for_driver(&self, driver_id: usize) -> Vec<PendingApprovalWire> {
@@ -315,14 +329,20 @@ pub async fn handle_hook_request(
         request_id,
         session_id,
         driver_id,
-        tool: tool_name,
-        args: tool_input,
-        cwd,
+        tool: tool_name.clone(),
+        args: tool_input.clone(),
+        cwd: cwd.clone(),
         timestamp: SystemTime::now(),
     });
 
-    // --- Await driver decision (590s, slightly under Claude's 600s) ---
-    match tokio::time::timeout(std::time::Duration::from_secs(590), decision_rx).await {
+    // --- Await driver decision (590s default, configurable for tests) ---
+    // `CCOM_APPROVAL_TIMEOUT_SECS` overrides the timeout. This matches
+    // the hook binary's own configurable deadline (Task 9 plan).
+    let timeout_secs = std::env::var("CCOM_APPROVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(590);
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), decision_rx).await {
         Ok(Ok(ApprovalDecision::Allow)) => {
             let _ = response_tx.send(ApprovalHookResponse::Allow);
         }
@@ -330,15 +350,112 @@ pub async fn handle_hook_request(
             let _ = response_tx.send(ApprovalHookResponse::Deny);
         }
         Ok(Err(_)) | Err(_) => {
-            // Channel closed or timeout: remove the stale entry so it
-            // doesn't show as a ghost approval in pending_for_driver.
+            // Channel closed (driver exited / cancel_all_for_driver) or
+            // timeout: remove the stale entry so it doesn't show as a
+            // ghost approval in pending_for_driver, publish events so
+            // the TUI status-line counter clears and surfaces a
+            // user-visible notification, then deny.
             approvals.cancel(request_id);
+            bus.publish(crate::session::SessionEvent::ToolApprovalResolved {
+                request_id,
+                session_id,
+                driver_id,
+                decision: ApprovalDecision::Deny,
+                scope: ApprovalScope::Once,
+            });
+            bus.publish(crate::session::SessionEvent::ToolApprovalTimedOut {
+                session_id,
+                driver_id,
+                tool: tool_name.clone(),
+            });
             let _ = response_tx.send(ApprovalHookResponse::Deny);
         }
     }
 }
 
 // --- Coordinator ----------------------------------------------------------
+
+// --- Reaper ---------------------------------------------------------------
+
+/// Perform one reaper sweep: find registry entries older than `stale_secs`
+/// seconds, remove them, and publish denial events.
+///
+/// Entries this stale were not cleaned up by the coordinator's own timeout
+/// (which fires at ~590s). Sweeping them prevents ghost entries from
+/// accumulating if a coordinator task exits unexpectedly.
+///
+/// Returns the number of entries removed.
+pub async fn reap_once(
+    approvals: &ApprovalRegistry,
+    bus: &crate::session::EventBus,
+    stale_secs: u64,
+) -> usize {
+    use std::time::SystemTime;
+
+    // Collect and remove stale entries while holding the lock, then
+    // publish events after releasing it.
+    let stale: Vec<(u64, usize, usize, String)> = {
+        let mut map = approvals.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let now = SystemTime::now();
+        let mut collected = Vec::new();
+        map.retain(|_, entry| {
+            let age_secs = now
+                .duration_since(entry.created_at)
+                .unwrap_or_default()
+                .as_secs();
+            if age_secs >= stale_secs {
+                collected.push((
+                    entry.request_id,
+                    entry.session_id,
+                    entry.driver_id,
+                    entry.tool.clone(),
+                ));
+                false // remove
+            } else {
+                true // keep
+            }
+        });
+        collected
+    };
+
+    for (request_id, session_id, driver_id, tool) in &stale {
+        log::warn!(
+            "approval reaper: sweeping stale request {request_id} \
+             (session {session_id}, tool {tool})"
+        );
+        bus.publish(crate::session::SessionEvent::ToolApprovalResolved {
+            request_id: *request_id,
+            session_id: *session_id,
+            driver_id: *driver_id,
+            decision: ApprovalDecision::Deny,
+            scope: ApprovalScope::Once,
+        });
+        bus.publish(crate::session::SessionEvent::ToolApprovalTimedOut {
+            session_id: *session_id,
+            driver_id: *driver_id,
+            tool: tool.clone(),
+        });
+    }
+
+    stale.len()
+}
+
+/// Background task: sweep stale registry entries every 60 seconds.
+///
+/// The coordinator's own timeout (590s) removes entries on a per-request
+/// basis. `run_reaper` is a safety-net for entries that somehow survive
+/// beyond `CCOM_APPROVAL_TIMEOUT_SECS + 120` seconds.
+pub async fn run_reaper(approvals: Arc<ApprovalRegistry>, bus: Arc<crate::session::EventBus>) {
+    let sweep_interval = std::time::Duration::from_secs(60);
+    loop {
+        tokio::time::sleep(sweep_interval).await;
+        let timeout_secs = std::env::var("CCOM_APPROVAL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(590);
+        reap_once(&approvals, &bus, timeout_secs + 120).await;
+    }
+}
 
 /// Drain `rx` and dispatch each incoming hook request to
 /// [`handle_hook_request`] as an independent task. Exits when `rx` is
@@ -364,6 +481,41 @@ pub async fn run_coordinator(
 }
 
 // --- Unit tests -----------------------------------------------------------
+
+#[cfg(test)]
+impl ApprovalRegistry {
+    /// Test-only variant of `open_request` that sets a custom `created_at`
+    /// timestamp so the reaper tests can create artificially old entries.
+    pub fn open_request_at(
+        &self,
+        session_id: usize,
+        claude_uuid: String,
+        driver_id: usize,
+        tool: String,
+        args: serde_json::Value,
+        cwd: PathBuf,
+        created_at: std::time::SystemTime,
+    ) -> (u64, oneshot::Receiver<ApprovalDecision>) {
+        let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        let entry = PendingApproval {
+            request_id,
+            session_id,
+            claude_uuid,
+            driver_id,
+            tool,
+            args,
+            cwd,
+            created_at,
+            response_tx: tx,
+        };
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(request_id, entry);
+        (request_id, rx)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -462,5 +614,108 @@ mod tests {
 
         let for_99 = registry.pending_for_driver(99);
         assert!(for_99.is_empty());
+    }
+
+    // --- Reaper tests -------------------------------------------------------
+
+    #[tokio::test]
+    async fn registry_reaper_clears_stale_entries() {
+        use crate::session::EventBus;
+
+        let registry = ApprovalRegistry::new();
+        let bus = Arc::new(EventBus::new());
+        let mut bus_rx = bus.subscribe();
+
+        // Insert one fresh entry and one that is 300s old (> 120s stale threshold).
+        let fresh_time = std::time::SystemTime::now();
+        let stale_time = fresh_time - std::time::Duration::from_secs(300);
+
+        let (_fresh_id, _fresh_rx) = registry.open_request_at(
+            1,
+            "uuid-fresh".to_string(),
+            10,
+            "Bash".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/tmp"),
+            fresh_time,
+        );
+        let (stale_id, _stale_rx) = registry.open_request_at(
+            2,
+            "uuid-stale".to_string(),
+            20,
+            "Edit".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/tmp"),
+            stale_time,
+        );
+
+        // stale_secs = 120 → entries older than 120s are stale.
+        let removed = reap_once(&registry, &bus, 120).await;
+        assert_eq!(removed, 1, "only the stale entry must be removed");
+
+        // Fresh entry must still be present.
+        assert_eq!(
+            registry.pending_for_driver(10).len(),
+            1,
+            "fresh entry must survive"
+        );
+        // Stale entry must be gone.
+        assert!(
+            registry.pending_for_driver(20).is_empty(),
+            "stale entry must be removed"
+        );
+
+        // ToolApprovalResolved(Deny) must have been published for the stale entry.
+        let mut saw_resolved = false;
+        while let Ok(evt) = bus_rx.try_recv() {
+            if let crate::session::SessionEvent::ToolApprovalResolved {
+                request_id,
+                decision: ApprovalDecision::Deny,
+                ..
+            } = &evt
+            {
+                if *request_id == stale_id {
+                    saw_resolved = true;
+                }
+            }
+        }
+        assert!(saw_resolved, "ToolApprovalResolved(Deny) must be published");
+    }
+
+    #[tokio::test]
+    async fn reaper_publishes_timed_out_event() {
+        use crate::session::{EventBus, SessionEvent};
+
+        let registry = ApprovalRegistry::new();
+        let bus = Arc::new(EventBus::new());
+        let mut bus_rx = bus.subscribe();
+
+        let stale_time = std::time::SystemTime::now() - std::time::Duration::from_secs(200);
+        registry.open_request_at(
+            3,
+            "uuid-to".to_string(),
+            30,
+            "Write".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/tmp"),
+            stale_time,
+        );
+
+        reap_once(&registry, &bus, 120).await;
+
+        let mut saw_timed_out = false;
+        while let Ok(evt) = bus_rx.try_recv() {
+            if let SessionEvent::ToolApprovalTimedOut {
+                session_id: 3,
+                tool,
+                ..
+            } = &evt
+            {
+                if tool == "Write" {
+                    saw_timed_out = true;
+                }
+            }
+        }
+        assert!(saw_timed_out, "ToolApprovalTimedOut must be published");
     }
 }

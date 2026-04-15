@@ -294,6 +294,10 @@ impl From<&crate::session::SessionEvent> for SessionEventWire {
                 session_id: *session_id,
                 status: "ToolApprovalResolved".to_string(),
             },
+            SessionEvent::ToolApprovalTimedOut { session_id, .. } => Self::StatusChanged {
+                session_id: *session_id,
+                status: "ToolApprovalTimedOut".to_string(),
+            },
         }
     }
 }

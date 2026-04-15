@@ -209,6 +209,10 @@ pub struct App {
     /// `ToolApprovalResolved` events published by the approval
     /// coordinator. Drained each tick in `handle_event`.
     pub(crate) approval_event_rx: std::sync::mpsc::Receiver<SessionEvent>,
+    /// Phase 7 Task 9: recent timeout notifications rendered in the
+    /// command bar. Each entry is `(timestamp, human-readable message)`.
+    /// Capped at 5 entries; entries older than 30 seconds are not shown.
+    pub(crate) timeout_log: std::collections::VecDeque<(std::time::Instant, String)>,
 }
 
 const ATTENTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -335,6 +339,7 @@ impl App {
             approvals,
             pending_approvals_per_driver: HashMap::new(),
             approval_event_rx,
+            timeout_log: std::collections::VecDeque::new(),
         }
     }
 
@@ -457,9 +462,33 @@ impl App {
                         .or_insert(0);
                     *cnt = cnt.saturating_sub(1);
                 }
+                // Phase 7 Task 9: record a user-visible timeout notification.
+                SessionEvent::ToolApprovalTimedOut {
+                    session_id, tool, ..
+                } => {
+                    let msg =
+                        format!("session {session_id}: {tool} timed out (no driver response)");
+                    self.timeout_log.push_back((std::time::Instant::now(), msg));
+                    if self.timeout_log.len() > 5 {
+                        self.timeout_log.pop_front();
+                    }
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Return the most recent timeout notification message if it was
+    /// recorded within the last 30 seconds, otherwise `None`.
+    pub(crate) fn current_timeout_message(&self) -> Option<&str> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        self.timeout_log.back().and_then(|(t, msg)| {
+            if t.elapsed() < TTL {
+                Some(msg.as_str())
+            } else {
+                None
+            }
+        })
     }
 
     pub fn spawn_session(&mut self, working_dir: PathBuf) {

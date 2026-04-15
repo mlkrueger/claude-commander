@@ -340,6 +340,13 @@ async fn run_server(
         return;
     }
 
+    // Phase 7 Task 9: if the approvals registry is present, spawn a
+    // background reaper that sweeps ghost entries every 60 seconds.
+    if let Some(approvals) = ctx.approvals.clone() {
+        let bus = Arc::clone(&ctx.bus);
+        tokio::spawn(crate::approvals::run_reaper(approvals, bus));
+    }
+
     // Phase 6 Task 3: the `spawn_session` handler needs to know the
     // port so it can write a `.mcp.json` for newly spawned children.
     // Build the factory closure AFTER bind so we can hand the port

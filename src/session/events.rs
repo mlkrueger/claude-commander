@@ -97,13 +97,23 @@ pub enum SessionEvent {
     },
     /// A pending tool approval has been resolved (allow or deny) by
     /// the driver. Published by the `respond_to_tool_approval` MCP
-    /// handler after `ApprovalRegistry::resolve` succeeds.
+    /// handler after `ApprovalRegistry::resolve` succeeds, OR by the
+    /// approval coordinator when the 590s wait times out.
     ToolApprovalResolved {
         request_id: u64,
         session_id: usize,
         driver_id: usize,
         decision: ApprovalDecision,
         scope: ApprovalScope,
+    },
+    /// A pending tool approval was never answered: the coordinator
+    /// timed out waiting for the driver, or the registry reaper swept
+    /// the entry. Published alongside `ToolApprovalResolved { Deny }`
+    /// so the TUI can surface a user-visible timeout notification.
+    ToolApprovalTimedOut {
+        session_id: usize,
+        driver_id: usize,
+        tool: String,
     },
 }
 

@@ -264,8 +264,15 @@ fn main() {
         nonce,
     };
 
-    // 6. Send request and read response (590s timeout — just under Claude's 600s default)
-    let timeout = Duration::from_secs(590);
+    // 6. Send request and read response.
+    //    Default: 590s — just under Claude Code's 600s hook timeout.
+    //    Override: CCOM_APPROVAL_TIMEOUT_SECS (for testing / custom setups).
+    let timeout_secs = std::env::var("CCOM_APPROVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(590);
+    let timeout = Duration::from_secs(timeout_secs);
+
     match ask_via_socket(&socket_path, &request, timeout) {
         Some(decision) if decision == "allow" => {
             print_allow();
@@ -273,14 +280,18 @@ fn main() {
         Some(decision) if decision == "deny" => {
             print_deny("ccom: driver denied");
         }
-        Some(_) | None => {
-            // passthrough or socket not present / error
-            // If socket connection failed entirely, also passthrough
-            if !socket_path.exists() {
-                // Socket not present → passthrough
-                return;
+        Some(_) => {
+            // "passthrough" → no output; Claude handles it natively.
+        }
+        None => {
+            // Socket connection failed or read timed out.
+            if socket_path.exists() {
+                // Socket was present: the coordinator must have timed out
+                // waiting for the driver (or crashed). Deny so the child
+                // session is not left blocked indefinitely.
+                print_deny("ccom: driver timeout");
             }
-            // "passthrough" decision → no output
+            // Socket not present → passthrough (hook not active for this session).
         }
     }
 }

@@ -170,7 +170,9 @@ impl App {
                     PanelFocus::SessionList => CommandBarMode::Dashboard,
                     PanelFocus::FileTree => CommandBarMode::FileTree,
                 };
-                let command_bar = CommandBar::new(bar_mode, th);
+                // Phase 7 Task 9: surface recent timeouts in dashboard too.
+                let command_bar = CommandBar::new(bar_mode, th)
+                    .with_timeout_message(self.current_timeout_message());
                 frame.render_widget(command_bar, layout.command_bar);
             }
         }
@@ -220,7 +222,7 @@ impl App {
                 session_pct: self.rate_limit.as_ref().and_then(|r| r.session_pct),
                 weekly_pct: self.rate_limit.as_ref().and_then(|r| r.weekly_pct),
             };
-            // Phase 7 Task 8: show pending-approval hint for driver sessions.
+            // Phase 7 Task 8+9: pending-approval hint + timeout notice.
             let pending = if is_driver {
                 self.pending_approval_count(id)
             } else {
@@ -228,7 +230,8 @@ impl App {
             };
             let command_bar = CommandBar::new(CommandBarMode::SessionView, th)
                 .with_usage(usage)
-                .with_pending_approvals(pending);
+                .with_pending_approvals(pending)
+                .with_timeout_message(self.current_timeout_message());
             frame.render_widget(command_bar, cmd_area);
         }
     }
