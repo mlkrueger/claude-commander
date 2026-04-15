@@ -100,8 +100,9 @@ pub struct PendingApprovalWire {
     pub session_id: usize,
     pub driver_id: usize,
     pub tool: String,
+    pub args: serde_json::Value,
     pub cwd: String,
-    pub created_at_secs: u64,
+    pub age_secs: u64,
 }
 
 // --- Registry -------------------------------------------------------------
@@ -288,8 +289,9 @@ impl ApprovalRegistry {
     }
 
     /// Return wire-safe snapshots of all pending approvals for the given
-    /// driver. Used by `list_tool_approvals` MCP tool.
+    /// driver. Used by `list_pending_approvals` MCP tool.
     pub fn pending_for_driver(&self, driver_id: usize) -> Vec<PendingApprovalWire> {
+        let now = SystemTime::now();
         let map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         map.values()
             .filter(|e| e.driver_id == driver_id)
@@ -298,10 +300,10 @@ impl ApprovalRegistry {
                 session_id: e.session_id,
                 driver_id: e.driver_id,
                 tool: e.tool.clone(),
+                args: e.args.clone(),
                 cwd: e.cwd.to_string_lossy().into_owned(),
-                created_at_secs: e
-                    .created_at
-                    .duration_since(SystemTime::UNIX_EPOCH)
+                age_secs: now
+                    .duration_since(e.created_at)
                     .unwrap_or_default()
                     .as_secs(),
             })
