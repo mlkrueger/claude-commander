@@ -15,7 +15,9 @@ use crate::event::Event;
 use crate::fs::git::{self, GitStatusMap};
 use crate::fs::tree::FileTree;
 use crate::pty::detector::PromptDetector;
-use crate::session::{EventBus, SessionManager, SessionRole, SessionStatus, SpawnConfig};
+use crate::session::{
+    EventBus, SessionEvent, SessionManager, SessionRole, SessionStatus, SpawnConfig,
+};
 use crate::setup::{self, SetupItem};
 use crate::ui::panels::editor::EditorState;
 use crate::ui::theme::{Theme, ThemeName};
