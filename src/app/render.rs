@@ -7,6 +7,7 @@ use crate::ui::layout::AppLayout;
 use crate::ui::panels::command_bar::{self, CommandBar, CommandBarMode};
 use crate::ui::panels::editor::EditorPanel;
 use crate::ui::panels::file_tree::FileTreePanel;
+use crate::ui::panels::session_detail::SessionDetailPanel;
 use crate::ui::panels::session_list::SessionListPanel;
 use crate::ui::panels::session_picker::SessionPickerPanel;
 use crate::ui::panels::session_view::SessionViewPanel;
@@ -102,20 +103,20 @@ impl App {
         .with_git_status(self.git_status.as_ref());
         frame.render_widget(tree_panel, layout.file_tree);
 
-        {
-            // Snapshot the driver-attachment map before taking the
-            // session lock so rendering holds exactly one lock at a
-            // time. The map is small (driver count × attached ids)
-            // so the clone is cheap.
+        // Build session list and grab the selected session's parser Arc
+        // for the detail panel — all while holding the session lock once.
+        let detail_parser = {
             let attachments = self
                 .attachment_map
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone();
             let mgr = self.sessions_lock();
+            let selected_idx = mgr.selected_index().unwrap_or(0);
+
             let session_list = SessionListPanel::new(
                 mgr.as_slice(),
-                mgr.selected_index().unwrap_or(0),
+                selected_idx,
                 self.focus == PanelFocus::SessionList,
                 th,
                 tick,
@@ -123,8 +124,13 @@ impl App {
             .with_attachments(attachments)
             .with_pending_approvals(self.pending_approvals_per_driver.clone());
             frame.render_widget(session_list, layout.main);
-        }
 
+            // Clone the Arc so the lock can be released before rendering.
+            mgr.as_slice().get(selected_idx).map(|s| s.parser.clone())
+        };
+
+        // Usage panel (left column, below file tree).
+        // If there's a setup banner, show it as the first row of that area.
         let show_banner = !self.setup_banner_dismissed && !self.setup_items.is_empty();
         let usage_area = if show_banner && layout.usage_graph.height > 1 {
             let banner = ratatui::text::Line::from(vec![
@@ -150,7 +156,7 @@ impl App {
                 x: layout.usage_graph.x,
                 y: layout.usage_graph.y + 1,
                 width: layout.usage_graph.width,
-                height: layout.usage_graph.height - 1,
+                height: layout.usage_graph.height.saturating_sub(1),
             }
         } else {
             layout.usage_graph
@@ -158,6 +164,10 @@ impl App {
 
         let usage_panel = UsageGraphPanel::new(th, tick).with_rate_limit(self.rate_limit.as_ref());
         frame.render_widget(usage_panel, usage_area);
+
+        // Session detail panel (right column, below session list).
+        let detail_panel = SessionDetailPanel::new(th, tick).with_parser(detail_parser);
+        frame.render_widget(detail_panel, layout.session_detail);
 
         match &self.mode {
             AppMode::RenamePrompt => {
@@ -170,7 +180,8 @@ impl App {
                     PanelFocus::SessionList => CommandBarMode::Dashboard,
                     PanelFocus::FileTree => CommandBarMode::FileTree,
                 };
-                let command_bar = CommandBar::new(bar_mode, th);
+                let command_bar = CommandBar::new(bar_mode, th)
+                    .with_status_message(self.status_message.as_deref());
                 frame.render_widget(command_bar, layout.command_bar);
             }
         }
@@ -228,7 +239,8 @@ impl App {
             };
             let command_bar = CommandBar::new(CommandBarMode::SessionView, th)
                 .with_usage(usage)
-                .with_pending_approvals(pending);
+                .with_pending_approvals(pending)
+                .with_status_message(self.status_message.as_deref());
             frame.render_widget(command_bar, cmd_area);
         }
     }

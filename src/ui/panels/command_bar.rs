@@ -30,6 +30,9 @@ pub struct CommandBar<'a> {
     /// with pending approvals, this holds the count so the status
     /// line can render `" ▲ <n> pending approval(s)"`.
     pending_approvals: Option<u32>,
+    /// Transient status message (e.g. "Mouse capture OFF"). When set it
+    /// replaces the shortcut hints for one render cycle.
+    status_message: Option<String>,
 }
 
 impl<'a> CommandBar<'a> {
@@ -39,7 +42,13 @@ impl<'a> CommandBar<'a> {
             usage: None,
             theme,
             pending_approvals: None,
+            status_message: None,
         }
+    }
+
+    pub fn with_status_message(mut self, msg: Option<&str>) -> Self {
+        self.status_message = msg.map(|s| s.to_string());
+        self
     }
 
     pub fn with_usage(mut self, usage: UsageStats) -> Self {
@@ -60,6 +69,16 @@ impl<'a> CommandBar<'a> {
 impl Widget for CommandBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let th = self.theme;
+
+        // Status message takes priority — show it in place of shortcuts.
+        if let Some(msg) = self.status_message {
+            let line = Line::from(vec![Span::styled(
+                format!(" {msg}"),
+                ratatui::style::Style::default().fg(th.status_warn),
+            )]);
+            buf.set_line(area.x, area.y, &line, area.width);
+            return;
+        }
 
         let shortcuts = match self.mode {
             CommandBarMode::Dashboard => vec![

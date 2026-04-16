@@ -6,6 +6,27 @@ use ratatui::widgets::{Block, Borders, Widget};
 use crate::claude::rate_limit::RateLimitInfo;
 use crate::ui::theme::{self, Theme};
 
+/// Number of discrete blocks in the usage bar. Each block = 5%.
+const BLOCKS: u16 = 20;
+/// Filled block character.
+const FILLED: char = '\u{2588}'; // █
+/// Empty block character.
+const EMPTY: char = '\u{2591}'; // ░
+
+/// Color zone boundaries (block index, 0-based).
+/// Blocks 0–15  (0–80%):   status_ok (green)
+/// Blocks 16–17 (80–90%):  status_orange
+/// Blocks 18–19 (90–100%): status_err (red)
+fn block_color(block_idx: u16, th: &Theme) -> Color {
+    if block_idx >= 18 {
+        th.status_err
+    } else if block_idx >= 16 {
+        th.status_orange
+    } else {
+        th.status_ok
+    }
+}
+
 pub struct UsageGraphPanel<'a> {
     rate_limit: Option<&'a RateLimitInfo>,
     theme: &'a Theme,
@@ -42,23 +63,21 @@ impl Widget for UsageGraphPanel<'_> {
             theme::paint_rainbow_border(buf, area, self.tick);
         }
 
-        if inner.width < 10 || inner.height < 3 {
+        if inner.width < 10 || inner.height < 2 {
             return;
         }
 
         let mut y = inner.y;
-        let x = inner.x;
-        let w = inner.width;
 
         if let Some(rl) = &self.rate_limit {
             // Current session (5-hour window)
-            y = render_usage_section(
+            y = render_usage_row(
                 buf,
-                x,
+                inner.x,
                 y,
-                w,
+                inner.width,
                 inner.bottom(),
-                "Current session",
+                "Sess",
                 rl.session_resets.as_deref(),
                 rl.session_pct,
                 th,
@@ -66,13 +85,13 @@ impl Widget for UsageGraphPanel<'_> {
 
             // Current week (7-day window)
             if y < inner.bottom() {
-                y = render_usage_section(
+                y = render_usage_row(
                     buf,
-                    x,
+                    inner.x,
                     y,
-                    w,
+                    inner.width,
                     inner.bottom(),
-                    "Current week",
+                    "Week",
                     rl.weekly_resets.as_deref(),
                     rl.weekly_pct,
                     th,
@@ -80,26 +99,14 @@ impl Widget for UsageGraphPanel<'_> {
             }
 
             // Session cost
-            if y < inner.bottom()
-                && let Some(cost) = rl.cost_usd
-            {
-                render_text(
-                    buf,
-                    x,
-                    y,
-                    w,
-                    "Session cost",
-                    Style::default().fg(th.text).add_modifier(Modifier::BOLD),
-                );
-                y += 1;
-                if y < inner.bottom() {
-                    let cost_text = format!("${:.2}", cost);
+            if y < inner.bottom() {
+                if let Some(cost) = rl.cost_usd {
                     render_text(
                         buf,
-                        x + 1,
+                        inner.x,
                         y,
-                        w.saturating_sub(1),
-                        &cost_text,
+                        inner.width,
+                        &format!("${cost:.2}"),
                         Style::default().fg(th.dim),
                     );
                 }
@@ -107,25 +114,27 @@ impl Widget for UsageGraphPanel<'_> {
         } else {
             render_text(
                 buf,
-                x,
+                inner.x,
                 y,
-                w,
-                "No usage data available",
+                inner.width,
+                "No data",
                 Style::default().fg(th.dim),
             );
         }
     }
 }
 
-/// Render a usage section (title, reset info, progress bar) and return the next y position.
+/// Render one usage section: a label + 20-block bar on one line,
+/// then a reset/percentage info line below it.
+/// Returns the y position after this section (with a blank separator).
 #[allow(clippy::too_many_arguments)]
-fn render_usage_section(
+fn render_usage_row(
     buf: &mut Buffer,
     x: u16,
     y: u16,
     width: u16,
     max_y: u16,
-    title: &str,
+    label: &str,
     resets: Option<&str>,
     pct: Option<f64>,
     th: &Theme,
@@ -134,91 +143,58 @@ fn render_usage_section(
         return y;
     }
 
-    // Title line
-    render_text(
-        buf,
-        x,
-        y,
-        width,
-        title,
-        Style::default().fg(th.text).add_modifier(Modifier::BOLD),
-    );
-    let mut cy = y + 1;
-
-    // Reset info line
-    if cy < max_y {
-        let reset_text = match resets {
-            Some(r) => format!("Resets {r}"),
-            None => String::new(),
-        };
-        if !reset_text.is_empty() {
-            render_text(
-                buf,
-                x + 1,
-                cy,
-                width.saturating_sub(1),
-                &reset_text,
-                Style::default().fg(th.dim),
-            );
-        }
-        cy += 1;
-    }
-
-    // Progress bar line
-    if cy < max_y {
-        render_progress_bar(buf, x + 1, cy, width.saturating_sub(2), pct, th);
-        cy += 1;
-    }
-
-    // Blank line after section
-    cy + 1
-}
-
-/// Render a horizontal progress bar with percentage label.
-fn render_progress_bar(buf: &mut Buffer, x: u16, y: u16, width: u16, pct: Option<f64>, th: &Theme) {
-    if width < 8 {
-        return;
-    }
-
-    // Format the label that goes on the right side
-    let label = match pct {
-        Some(p) => format!("{:.0}% used", p),
-        None => "ok".to_string(),
-    };
-    let label_width = label.len() as u16 + 1; // +1 for spacing
-
-    let bar_width = width.saturating_sub(label_width);
-    if bar_width < 4 {
-        return;
-    }
-
     let fill_pct = pct.unwrap_or(0.0).clamp(0.0, 100.0);
-    let filled = ((fill_pct / 100.0) * bar_width as f64).round() as u16;
+    let empty_color = Color::Rgb(50, 50, 50);
 
-    let bar_color = if pct.is_none() {
-        th.status_ok
-    } else if fill_pct > 80.0 {
-        th.status_err
-    } else if fill_pct > 50.0 {
-        th.status_warn
+    // --- Row 1: label + blocks ---
+    //
+    // Pre-budget layout so the row never overflows regardless of pct value:
+    //   label_width  = 5  ("Sess ")
+    //   pct_width    = 4  ("100%" worst case — no leading space, fixed width)
+    //   bar_blocks   = min(BLOCKS, width - label_width - pct_width)
+    //
+    // This keeps the row exactly `width` chars at any percentage.
+    const LABEL_W: u16 = 5;
+    const PCT_W: u16 = 4; // "100%" is the widest value
+    let bar_blocks = BLOCKS.min(width.saturating_sub(LABEL_W + PCT_W));
+
+    // Recompute filled count against the actual bar width we'll display.
+    let filled_blocks = if bar_blocks > 0 {
+        ((fill_pct / 100.0) * bar_blocks as f64).round() as u16
     } else {
-        th.status_ok
+        0
     };
 
-    let empty_color = Color::Rgb(60, 60, 60);
-
-    // Draw the bar
     let mut cx = x;
-    for i in 0..bar_width {
+
+    // Label (e.g. "Sess ")
+    let label_display = format!("{label:<4} ");
+    for ch in label_display.chars() {
+        if cx < x + width {
+            buf[(cx, y)]
+                .set_char(ch)
+                .set_style(Style::default().fg(th.dim).add_modifier(Modifier::BOLD));
+            cx += 1;
+        }
+    }
+
+    // Block bar
+    for i in 0..bar_blocks {
         if cx >= x + width {
             break;
         }
-        let (ch, color) = if pct.is_none() {
-            ('\u{2500}', th.dim) // ─ unknown state
-        } else if i < filled {
-            ('\u{2501}', bar_color) // ━
+        // Map this block's index into the full 0–BLOCKS range for colour lookup.
+        let zone_idx = if bar_blocks > 0 {
+            i * BLOCKS / bar_blocks
         } else {
-            ('\u{2501}', empty_color) // ━
+            i
+        };
+        let (ch, color) = if pct.is_none() {
+            ('\u{2500}', th.dim)
+        } else if i < filled_blocks {
+            (FILLED, block_color(zone_idx, th))
+        } else {
+            (EMPTY, empty_color)
         };
         buf[(cx, y)]
             .set_char(ch)
@@ -226,29 +202,40 @@ fn render_progress_bar(buf: &mut Buffer, x: u16, y: u16, width: u16, pct: Option
         cx += 1;
     }
 
-    // Space before label
-    if cx < x + width {
-        cx += 1;
-    }
-
-    // Draw the label
-    let label_color = if pct.is_none() {
-        th.status_ok
-    } else if fill_pct > 80.0 {
-        th.status_err
-    } else if fill_pct > 50.0 {
-        th.status_warn
-    } else {
-        th.text
+    // Percentage label — always exactly PCT_W chars wide, right-aligned.
+    let pct_str = match pct {
+        Some(p) => format!("{p:>3.0}%"), // e.g. "  0%", " 62%", "100%"
+        None => "  — ".to_string(),
     };
-    for ch in label.chars() {
+    let pct_color = match pct {
+        Some(p) if p >= 90.0 => th.status_err,
+        Some(p) if p >= 80.0 => th.status_orange,
+        _ => th.dim,
+    };
+    for ch in pct_str.chars() {
         if cx < x + width {
             buf[(cx, y)]
                 .set_char(ch)
-                .set_style(Style::default().fg(label_color));
+                .set_style(Style::default().fg(pct_color));
             cx += 1;
         }
     }
+
+    // --- Row 2: reset time ---
+    let mut cy = y + 1;
+    if cy < max_y {
+        let info = match resets {
+            Some(r) => format!("  resets {r}"),
+            None => String::new(),
+        };
+        if !info.is_empty() {
+            render_text(buf, x, cy, width, &info, Style::default().fg(th.dim));
+        }
+        cy += 1;
+    }
+
+    // Blank separator
+    cy + 1
 }
 
 fn render_text(buf: &mut Buffer, x: u16, y: u16, max_width: u16, text: &str, style: Style) {

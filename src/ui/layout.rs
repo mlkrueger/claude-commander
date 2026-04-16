@@ -1,14 +1,20 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
+/// Height of the bottom row (usage panel + session detail panel).
+/// Both panels share this height so their top edges align.
+const BOTTOM_HEIGHT: u16 = 9;
+
 pub struct AppLayout {
     pub file_tree: Rect,
-    pub main: Rect,
     pub usage_graph: Rect,
+    pub main: Rect,
+    pub session_detail: Rect,
     pub command_bar: Rect,
 }
 
 impl AppLayout {
     pub fn new(area: Rect) -> Self {
+        // Outer: content area on top, command bar on bottom.
         let vert = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -17,32 +23,37 @@ impl AppLayout {
             ])
             .split(area);
 
+        // Content area: left column | right column.
         let horiz = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(30), // file tree
-                Constraint::Min(40),    // main area
+                Constraint::Length(30), // left column (file tree + usage)
+                Constraint::Min(40),    // right column (sessions + detail)
             ])
             .split(vert[0]);
 
-        // Split main area: session list on top, usage graph on bottom
-        let main_split = Layout::default()
+        // Left column: file tree on top, usage panel on bottom.
+        let left_split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(6),     // session list (takes most space)
-                Constraint::Length(13), // usage graph + rate limit gauges
-            ])
+            .constraints([Constraint::Min(3), Constraint::Length(BOTTOM_HEIGHT)])
+            .split(horiz[0]);
+
+        // Right column: session list on top, session detail on bottom.
+        let right_split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(BOTTOM_HEIGHT)])
             .split(horiz[1]);
 
         Self {
-            file_tree: horiz[0],
-            main: main_split[0],
-            usage_graph: main_split[1],
+            file_tree: left_split[0],
+            usage_graph: left_split[1],
+            main: right_split[0],
+            session_detail: right_split[1],
             command_bar: vert[1],
         }
     }
 
-    /// Layout without file tree (for session view full-screen)
+    /// Layout without file tree (for session view full-screen).
     pub fn session_view(area: Rect) -> (Rect, Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
