@@ -53,6 +53,7 @@ pub fn state_file_path(claude_uuid: &str) -> PathBuf {
 
 /// Read the current approvals state for a session.
 /// Returns an empty `ApprovalsState` if the file does not exist.
+#[allow(dead_code)]
 pub fn read_approvals(claude_uuid: &str) -> io::Result<ApprovalsState> {
     let path = state_file_path(claude_uuid);
     if !path.exists() {
@@ -139,6 +140,7 @@ pub fn input_fingerprint(tool_input: &serde_json::Value) -> String {
 
 /// Check whether `state` contains an allow-always rule that matches
 /// `tool` + `tool_input`.
+#[allow(dead_code)]
 pub fn matches_allow_always(
     state: &ApprovalsState,
     tool: &str,

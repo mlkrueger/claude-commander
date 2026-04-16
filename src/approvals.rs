@@ -44,7 +44,9 @@ pub struct ApprovalHookRequest {
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub cwd: String,
+    #[allow(dead_code)]
     pub tool_use_id: String,
+    #[allow(dead_code)]
     pub nonce: u64,
     /// Oneshot sender for the coordinator to reply back to the socket
     /// listener task.
@@ -74,9 +76,17 @@ pub struct PendingApproval {
     pub args: serde_json::Value,
     pub cwd: PathBuf,
     pub created_at: SystemTime,
+    /// If true, this approval corresponds to a native Claude Code dialog
+    /// visible in the child's PTY (e.g. "Do you want to proceed? 1. Yes
+    /// 2. No"). When resolved, the MCP handler sends PTY keypresses to
+    /// the child rather than signalling a hook coordinator.
+    /// If false, `response_tx` is live and must be signalled.
+    pub is_pty_dialog: bool,
     /// Oneshot channel to deliver the driver's `ApprovalDecision` back
     /// to the socket listener, which is blocking on this while Claude
     /// Code waits for the hook to exit.
+    /// For PTY-dialog approvals this channel has no live receiver —
+    /// the send is a no-op and the error is intentionally ignored.
     response_tx: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -90,7 +100,10 @@ pub struct PendingApprovalMeta {
     pub claude_uuid: String,
     pub tool: String,
     pub args: serde_json::Value,
+    #[allow(dead_code)]
     pub scope: ApprovalScope,
+    /// Mirrors `PendingApproval::is_pty_dialog`.
+    pub is_pty_dialog: bool,
 }
 
 /// Snapshot of a pending approval for serialization over MCP.
@@ -103,6 +116,10 @@ pub struct PendingApprovalWire {
     pub args: serde_json::Value,
     pub cwd: String,
     pub age_secs: u64,
+    /// True when this approval is a native Claude Code dialog in the
+    /// child's PTY. Resolving it sends PTY keypresses; `allow_always`
+    /// scope is not meaningful for PTY dialogs.
+    pub is_pty_dialog: bool,
 }
 
 // --- Registry -------------------------------------------------------------
@@ -158,6 +175,7 @@ impl ApprovalRegistry {
             args,
             cwd,
             created_at: SystemTime::now(),
+            is_pty_dialog: false,
             response_tx: tx,
         };
         self.pending
@@ -165,6 +183,63 @@ impl ApprovalRegistry {
             .unwrap_or_else(|p| p.into_inner())
             .insert(request_id, entry);
         (request_id, rx)
+    }
+
+    /// Register a synthetic approval for a native Claude Code dialog that
+    /// is currently visible in `session_id`'s PTY (e.g. "Do you want to
+    /// proceed? 1. Yes / 2. No").
+    ///
+    /// Unlike `open_request`, there is no coordinator waiting on a oneshot
+    /// channel. Instead, when the driver calls `respond_to_tool_approval`,
+    /// the MCP handler sends PTY keypresses directly to the child session.
+    ///
+    /// Returns the assigned `request_id`.
+    pub fn open_pty_dialog_request(
+        &self,
+        session_id: usize,
+        driver_id: usize,
+        dialog_kind: String,
+        cwd: PathBuf,
+    ) -> u64 {
+        let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        // Dummy channel — nobody reads the receiver.
+        let (tx, _rx) = oneshot::channel();
+        let entry = PendingApproval {
+            request_id,
+            session_id,
+            claude_uuid: String::new(),
+            driver_id,
+            tool: format!("NativeDialog({dialog_kind})"),
+            args: serde_json::json!({ "kind": dialog_kind }),
+            cwd,
+            created_at: SystemTime::now(),
+            is_pty_dialog: true,
+            response_tx: tx,
+        };
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(request_id, entry);
+        request_id
+    }
+
+    /// Remove a pending approval by request id if it is still present.
+    /// Returns `true` if an entry was found and removed, `false` if it
+    /// was already gone (resolved or never existed).
+    ///
+    /// Used when a PTY dialog disappears without the driver calling
+    /// `respond_to_tool_approval` (e.g. the user approved manually in
+    /// the TUI, or the session exited).
+    pub fn cancel_if_pending(&self, request_id: u64) -> bool {
+        let mut map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = map.remove(&request_id) {
+            // For hook approvals this unblocks the coordinator (deny).
+            // For PTY approvals the receiver is already dropped — ignored.
+            let _ = entry.response_tx.send(ApprovalDecision::Deny);
+            true
+        } else {
+            false
+        }
     }
 
     /// Called by the `respond_to_tool_approval` MCP handler. Consumes the
@@ -194,11 +269,13 @@ impl ApprovalRegistry {
             map.insert(request_id, entry);
             return Err(ResolveError::DriverMismatch);
         }
+        let is_pty_dialog = entry.is_pty_dialog;
         // Release the lock before the oneshot send so we don't hold it
         // while the coordinator wakes up and accesses the registry.
         drop(map);
         // Send the decision to the coordinator (ignore send error — the
-        // coordinator may have already timed out and dropped its receiver).
+        // coordinator may have already timed out and dropped its receiver,
+        // or this is a PTY-dialog entry with no live receiver).
         let _ = entry.response_tx.send(decision);
         Ok(PendingApprovalMeta {
             session_id: entry.session_id,
@@ -206,6 +283,7 @@ impl ApprovalRegistry {
             tool: entry.tool,
             args: entry.args,
             scope,
+            is_pty_dialog,
         })
     }
 
@@ -306,6 +384,7 @@ impl ApprovalRegistry {
                     .duration_since(e.created_at)
                     .unwrap_or_default()
                     .as_secs(),
+                is_pty_dialog: e.is_pty_dialog,
             })
             .collect()
     }
