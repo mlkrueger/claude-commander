@@ -565,7 +565,18 @@ impl Ccom {
         };
 
         // 2. Scope-check against the TUI's SessionManager and dispatch.
-        match self.ctx.send_prompt(args.session_id, &sanitized) {
+        //    Use the delayed-submit variant: Claude Code's input box
+        //    drops the `\r` when text + CR arrive in a single PTY
+        //    burst, which leaves the prompt sitting unsubmitted in the
+        //    child's input box. The wrapper inserts a ~250ms gap
+        //    between the two writes. See
+        //    `McpCtx::send_prompt_with_submit_delay` for the full
+        //    rationale.
+        match self
+            .ctx
+            .send_prompt_with_submit_delay(args.session_id, &sanitized)
+            .await
+        {
             Ok(turn_id) => {
                 // `TurnId`'s inner `u64` is `pub(crate)` — same idiom
                 // as `StoredTurnWire::from`.
@@ -1173,9 +1184,31 @@ impl Ccom {
                      sending initial_prompt anyway"
                 );
             }
-            let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = mgr.send_prompt(new_id, &clean) {
-                log::warn!("spawn_session({new_id}): initial_prompt send failed: {e}");
+            // Two-phase write with a 250ms gap: Claude Code's input
+            // box silently drops the `\r` when text + CR arrive in a
+            // single PTY burst (paste heuristic — the CR becomes a
+            // literal newline instead of a submit). The Idle wait
+            // above handles the startup race; this gap handles the
+            // paste race that remains even when the input box is
+            // fully rendered. See `SessionManager::submit_prompt`.
+            let turn_id_opt = {
+                let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                match mgr.send_prompt_text(new_id, &clean) {
+                    Ok(tid) => Some(tid),
+                    Err(e) => {
+                        log::warn!(
+                            "spawn_session({new_id}): initial_prompt text write failed: {e}"
+                        );
+                        None
+                    }
+                }
+            };
+            if let Some(turn_id) = turn_id_opt {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let mut mgr = self.ctx.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = mgr.submit_prompt(new_id, turn_id) {
+                    log::warn!("spawn_session({new_id}): initial_prompt submit failed: {e}");
+                }
             }
         }
 

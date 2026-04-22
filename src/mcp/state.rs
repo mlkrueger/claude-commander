@@ -139,10 +139,17 @@ impl McpCtx {
 
     /// Scope-checked wrapper over [`SessionManager::send_prompt`].
     ///
+    /// Writes the prompt text and the submit byte (`\r`) in one burst
+    /// with no gap between them. Callers on the MCP path should prefer
+    /// [`send_prompt_with_submit_delay`](Self::send_prompt_with_submit_delay)
+    /// instead — see that method for why. This chained form is kept
+    /// for tests and callers that explicitly don't want the delay.
+    ///
     /// Returns [`SendPromptRejection::NotFound`] if the session id is
     /// unknown to the TUI's manager, *before* the text reaches the
     /// PTY. Caller is expected to have already sanitized `text` via
     /// [`super::sanitize::sanitize_prompt_text`].
+    #[allow(dead_code)] // used by tests; binary now goes through the delayed variant
     pub fn send_prompt(
         &self,
         session_id: usize,
@@ -157,6 +164,50 @@ impl McpCtx {
         // to `NotFound` for a single uniform rejection shape.
         mgr.send_prompt(session_id, text)
             .map_err(|_| SendPromptRejection::NotFound)
+    }
+
+    /// Scope-checked send that separates the text write from the `\r`
+    /// submit write by a short delay.
+    ///
+    /// **Why the delay.** Claude Code's TUI input box silently drops
+    /// the `\r` when text and CR arrive in the same sub-millisecond
+    /// PTY burst — the whole thing gets treated like a pasted block
+    /// and the trailing CR is kept as a literal newline instead of a
+    /// submit. Symptom: prompt text shows up in the child's input box
+    /// but is never submitted. Any gap comparable to human
+    /// paste-then-Enter timing (~250ms) is enough to side-step it.
+    /// See [`SessionManager::submit_prompt`] for the full rationale.
+    ///
+    /// Lock discipline: the sessions mutex is released during the
+    /// sleep so MCP handlers stay compliant with the "don't hold
+    /// `sessions.lock()` across `.await`" contract.
+    pub async fn send_prompt_with_submit_delay(
+        &self,
+        session_id: usize,
+        text: &str,
+    ) -> Result<TurnId, SendPromptRejection> {
+        let turn_id = {
+            let mut mgr = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if mgr.get(session_id).is_none() {
+                return Err(SendPromptRejection::NotFound);
+            }
+            mgr.send_prompt_text(session_id, text)
+                .map_err(|_| SendPromptRejection::NotFound)?
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        {
+            let mut mgr = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            // Session may have exited while we slept — treat that as
+            // NotFound (same shape the scope check would use). The
+            // text we wrote before the sleep is harmlessly stranded
+            // in whatever PTY state the exit left behind.
+            if mgr.get(session_id).is_none() {
+                return Err(SendPromptRejection::NotFound);
+            }
+            mgr.submit_prompt(session_id, turn_id)
+                .map_err(|_| SendPromptRejection::NotFound)?;
+        }
+        Ok(turn_id)
     }
 
     /// Resolve a caller ccom session id to its [`Scope`] — the set
