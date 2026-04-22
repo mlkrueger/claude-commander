@@ -6,7 +6,6 @@ pub fn claude_args() -> Vec<&'static str> {
     vec![]
 }
 
-#[allow(dead_code)]
 pub fn claude_fork_args(session_id: &str) -> Vec<String> {
     vec![
         "--resume".to_string(),
@@ -15,7 +14,6 @@ pub fn claude_fork_args(session_id: &str) -> Vec<String> {
     ]
 }
 
-#[allow(dead_code)]
 pub fn claude_resume_args(session_id: &str) -> Vec<String> {
     vec!["--resume".to_string(), session_id.to_string()]
 }

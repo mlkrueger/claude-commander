@@ -84,6 +84,11 @@ pub struct NewSessionState {
     pub flags_input: String,
     pub focused: usize,
     pub status_message: Option<String>,
+    /// When `Some`, a file-picker overlay is open on top of the modal.
+    /// The tree navigates directories starting at `$HOME`; selecting
+    /// a directory writes its path into `dir_input` and closes the
+    /// picker, returning focus to the modal.
+    pub picker: Option<FileTree>,
 }
 
 impl NewSessionState {
@@ -94,6 +99,7 @@ impl NewSessionState {
             flags_input: String::new(),
             focused: 1,
             status_message: None,
+            picker: None,
         }
     }
 
@@ -587,6 +593,17 @@ impl App {
         extra_args: Vec<String>,
         initial_prompt: Option<String>,
     ) {
+        self.spawn_session_kind_labeled(kind, working_dir, extra_args, initial_prompt, None);
+    }
+
+    pub fn spawn_session_kind_labeled(
+        &mut self,
+        kind: SessionKind,
+        working_dir: PathBuf,
+        extra_args: Vec<String>,
+        initial_prompt: Option<String>,
+        label_override: Option<String>,
+    ) {
         let next_id = self.sessions_lock().peek_next_id();
         let (cmd_owned, args, label): (String, Vec<String>, String) = match kind {
             SessionKind::Claude => {
@@ -601,12 +618,16 @@ impl App {
                 (
                     launcher::claude_command().to_string(),
                     a,
-                    format!("claude-{next_id}"),
+                    label_override.unwrap_or_else(|| format!("claude-{next_id}")),
                 )
             }
             SessionKind::Terminal => {
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-                (shell, extra_args, format!("term-{next_id}"))
+                (
+                    shell,
+                    extra_args,
+                    label_override.unwrap_or_else(|| format!("term-{next_id}")),
+                )
             }
         };
         let cmd: &str = &cmd_owned;
@@ -678,6 +699,61 @@ impl App {
                 self.status_message = Some(format!("Failed to spawn session: {e}"));
             }
         }
+    }
+
+    /// Resume a dead session in-place: spawn a new Claude session with
+    /// `--resume <uuid>` using the same label and working directory,
+    /// then remove the old exited entry so it doesn't linger.
+    /// Only acts when the selected session is Exited and has a captured UUID.
+    pub fn resume_selected(&mut self) {
+        let info = {
+            let mgr = self.sessions_lock();
+            mgr.selected().and_then(|s| {
+                if matches!(s.status, crate::session::SessionStatus::Exited(_)) {
+                    s.claude_session_id
+                        .as_ref()
+                        .map(|uuid| (uuid.clone(), s.working_dir.clone(), s.label.clone(), s.id))
+                } else {
+                    None
+                }
+            })
+        };
+        let Some((uuid, working_dir, label, old_id)) = info else {
+            self.status_message =
+                Some("No resumable session selected (needs exited + UUID)".into());
+            return;
+        };
+        let args = launcher::claude_resume_args(&uuid);
+        self.spawn_session_kind_labeled(SessionKind::Claude, working_dir, args, None, Some(label));
+        // Remove the old exited entry now that the replacement is live.
+        self.sessions_lock().remove_exited(old_id);
+    }
+
+    /// Fork the selected session: spawn a new Claude session with
+    /// `--resume <uuid> --fork-session`. Works on running or dead sessions
+    /// as long as a UUID has been captured.
+    pub fn fork_selected(&mut self) {
+        let info = {
+            let mgr = self.sessions_lock();
+            mgr.selected().and_then(|s| {
+                s.claude_session_id
+                    .as_ref()
+                    .map(|uuid| (uuid.clone(), s.working_dir.clone(), s.label.clone()))
+            })
+        };
+        let Some((uuid, working_dir, label)) = info else {
+            self.status_message = Some("No forkable session selected (needs captured UUID)".into());
+            return;
+        };
+        let args = launcher::claude_fork_args(&uuid);
+        let fork_label = format!("fork-{label}");
+        self.spawn_session_kind_labeled(
+            SessionKind::Claude,
+            working_dir,
+            args,
+            None,
+            Some(fork_label),
+        );
     }
 
     /// Phase 7 Task 5: start the approval coordinator for session `id`.
@@ -945,7 +1021,7 @@ impl App {
             let completed = search_dir.join(&matches[0]);
             let home = dirs::home_dir().unwrap_or_default();
             let display = match completed.strip_prefix(&home).ok() {
-                Some(rel) => format!("~{}/", rel.display()),
+                Some(rel) => format!("~/{}/", rel.display()),
                 None => format!("{}/", completed.display()),
             };
             state.dir_input = display;
@@ -956,7 +1032,7 @@ impl App {
                 let completed = search_dir.join(&common);
                 let home = dirs::home_dir().unwrap_or_default();
                 let display = match completed.strip_prefix(&home).ok() {
-                    Some(rel) => format!("~{}", rel.display()),
+                    Some(rel) => format!("~/{}", rel.display()),
                     None => format!("{}", completed.display()),
                 };
                 state.dir_input = display;

@@ -190,6 +190,13 @@ impl App {
             self.draw_help_modal(frame);
         } else if self.mode == AppMode::NewSessionModal {
             self.draw_new_session_modal(frame);
+            if self
+                .new_session
+                .as_ref()
+                .is_some_and(|s| s.picker.is_some())
+            {
+                self.draw_new_session_picker(frame);
+            }
         } else if self.mode == AppMode::QuitConfirm {
             self.draw_quit_confirm(frame);
         }
@@ -488,11 +495,98 @@ impl App {
                 Span::styled(" Create ", th.shortcut_desc()),
                 Span::styled("[Tab]", th.shortcut_key()),
                 Span::styled(" Complete ", th.shortcut_desc()),
+                Span::styled("[^F]", th.shortcut_key()),
+                Span::styled(" Browse ", th.shortcut_desc()),
                 Span::styled("[Esc]", th.shortcut_key()),
                 Span::styled(" Cancel", th.shortcut_desc()),
             ]);
             frame.render_widget(help, Rect::new(inner.x, row, inner.width, 1));
         }
+    }
+
+    fn draw_new_session_picker(&self, frame: &mut Frame) {
+        use ratatui::style::Style;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear};
+        let th = &self.theme;
+
+        let Some(state) = &self.new_session else {
+            return;
+        };
+        let Some(picker) = &state.picker else {
+            return;
+        };
+
+        let area = frame.area();
+        let width = 70u16.min(area.width.saturating_sub(4));
+        let height = 22u16.min(area.height.saturating_sub(2));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let modal_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, modal_area);
+
+        let title = format!(" Pick Directory — {} ", picker.root.path.display());
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(th.border_focused());
+        let inner = block.inner(modal_area);
+        frame.render_widget(block, modal_area);
+        if th.is_rainbow() {
+            crate::ui::theme::paint_rainbow_border(frame.buffer_mut(), modal_area, self.tick_count);
+        }
+
+        // Reserve the bottom row for help.
+        let list_height = inner.height.saturating_sub(2) as usize;
+        let nodes = picker.visible_nodes();
+        let selected = picker.selected;
+
+        // Scroll window so the selected row stays visible.
+        let scroll = if nodes.len() <= list_height {
+            0
+        } else if selected < list_height / 2 {
+            0
+        } else if selected + list_height / 2 >= nodes.len() {
+            nodes.len().saturating_sub(list_height)
+        } else {
+            selected - list_height / 2
+        };
+
+        for (row_idx, (path, depth)) in nodes.iter().enumerate().skip(scroll).take(list_height) {
+            let y = inner.y + (row_idx - scroll) as u16;
+            let is_sel = row_idx == selected;
+            let is_dir = path.is_dir();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            let marker = if is_dir { "▸ " } else { "  " };
+            let indent = "  ".repeat(*depth);
+            let text = format!(" {indent}{marker}{name}");
+            let style = if is_sel {
+                Style::default().fg(th.text).bg(th.selected_bg)
+            } else if is_dir {
+                Style::default().fg(th.text)
+            } else {
+                Style::default().fg(th.dim)
+            };
+            let line = Line::styled(text, style);
+            frame.render_widget(line, Rect::new(inner.x, y, inner.width, 1));
+        }
+
+        let help_y = inner.y + inner.height.saturating_sub(1);
+        let help = Line::from(vec![
+            Span::styled(" [↑↓]", th.shortcut_key()),
+            Span::styled(" Move ", th.shortcut_desc()),
+            Span::styled("[Space]", th.shortcut_key()),
+            Span::styled(" Expand ", th.shortcut_desc()),
+            Span::styled("[Enter]", th.shortcut_key()),
+            Span::styled(" Select ", th.shortcut_desc()),
+            Span::styled("[Esc]", th.shortcut_key()),
+            Span::styled(" Cancel", th.shortcut_desc()),
+        ]);
+        frame.render_widget(help, Rect::new(inner.x, help_y, inner.width, 1));
     }
 
     fn draw_quit_confirm(&self, frame: &mut Frame) {
@@ -707,6 +801,8 @@ impl App {
                     ("a", "Approve tool request"),
                     ("d", "Deny tool request"),
                     ("c", "Send commit prompt"),
+                    ("f", "Fork session (new branch from same history)"),
+                    ("R", "Resume dead session"),
                     ("K", "Kill session"),
                     ("x", "Clear dead sessions"),
                     ("r", "Rename session"),
