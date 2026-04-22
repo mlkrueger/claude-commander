@@ -124,6 +124,26 @@ mod detector_tests {
         let result = detector.check(parser.screen());
         assert!(result.is_none());
     }
+
+    // Regression: Claude's own response text can mention "deny",
+    // "approve", "permission", etc. when explaining tool permissions.
+    // The detector must not trip on prose — only on actual dialog UI.
+    // Prior regex matched bare `deny` / `approve` / `permission` and
+    // pinned sessions to WaitingForApproval during docs-style replies.
+    #[test]
+    fn test_prompt_detector_ignores_prose_about_permissions() {
+        let detector = ccom::pty::detector::PromptDetector::new();
+        let parser = make_parser_with_text(
+            b"Permissions (allow/ask/deny). A deny in settings.json blocks \
+              even if another tries to approve it. Useful for compliance \
+              rules that are too dynamic for static permission patterns.",
+        );
+        let result = detector.check(parser.screen());
+        assert!(
+            result.is_none(),
+            "detector false-matched on prose about permissions: {result:?}"
+        );
+    }
 }
 
 // Test editor state
