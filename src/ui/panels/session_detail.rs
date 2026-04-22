@@ -76,6 +76,9 @@ impl Widget for SessionDetailPanel<'_> {
         // the pane when the session is idle. Walks up from the last
         // non-blank row while rows look like chrome (box-drawing edges,
         // separators, prompt chevron, spinner) and anchors just above.
+        if std::env::var("CCOM_CHROME_DEBUG").is_ok() {
+            debug_dump_bottom(screen, last_content_row, 30);
+        }
         let content_end_row = trim_trailing_input_box(screen, last_content_row);
 
         // Show the bottom `inner.height` rows of content, anchored so
@@ -225,6 +228,27 @@ fn convert_color(color: vt100::Color) -> Color {
         vt100::Color::Idx(idx) => Color::Indexed(idx),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
+}
+
+fn debug_dump_bottom(screen: &vt100::Screen, last_content_row: usize, n: usize) {
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/ccom_chrome_debug.txt")
+    else {
+        return;
+    };
+    let floor = last_content_row.saturating_sub(n);
+    for row in (floor..=last_content_row).rev() {
+        let first = first_nonspace_char(screen, row as u16);
+        let repr = match first {
+            Some(ch) => format!("U+{:04X} {:?}", ch as u32, ch),
+            None => "BLANK".to_string(),
+        };
+        let _ = writeln!(f, "row {row:3}: {repr}");
+    }
+    let _ = writeln!(f, "---");
 }
 
 fn render_str(buf: &mut Buffer, x: u16, y: u16, max_width: u16, text: &str, style: Style) {
