@@ -548,22 +548,21 @@ impl App {
                             // so stale entries don't linger in the registry.
                             if let Some((request_id, driver_id)) =
                                 self.pending_pty_approvals.remove(&session_id)
+                                && self.approvals.cancel_if_pending(request_id)
                             {
-                                if self.approvals.cancel_if_pending(request_id) {
-                                    // Entry was still open — the user resolved
-                                    // the dialog manually in the TUI. Publish
-                                    // Resolved so the driver badge updates.
-                                    self.event_bus.publish(SessionEvent::ToolApprovalResolved {
-                                        request_id,
-                                        session_id,
-                                        driver_id,
-                                        decision: crate::approvals::ApprovalDecision::Deny,
-                                        scope: crate::approvals::ApprovalScope::Once,
-                                    });
-                                }
-                                // If cancel_if_pending returned false, the driver
-                                // already called respond_to_tool_approval — the
-                                // Resolved event was already published there.
+                                // Entry was still open — the user resolved
+                                // the dialog manually in the TUI. Publish
+                                // Resolved so the driver badge updates.
+                                // (If cancel_if_pending returns false, the driver
+                                // already called respond_to_tool_approval — Resolved
+                                // was already published there.)
+                                self.event_bus.publish(SessionEvent::ToolApprovalResolved {
+                                    request_id,
+                                    session_id,
+                                    driver_id,
+                                    decision: crate::approvals::ApprovalDecision::Deny,
+                                    scope: crate::approvals::ApprovalScope::Once,
+                                });
                             }
                         }
                     }

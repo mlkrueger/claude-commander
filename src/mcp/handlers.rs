@@ -1130,21 +1130,21 @@ impl Ccom {
                 .unwrap_or_else(|p| p.into_inner())
                 .get_mut(new_id)
                 .and_then(|s| s.take_approval_rx());
-            if let Some(rx) = rx {
-                if let Some(approvals) = self.ctx.approvals.as_ref() {
-                    let sessions = Arc::clone(&self.ctx.sessions);
-                    let approvals = Arc::clone(approvals);
-                    let bus = Arc::clone(&self.ctx.bus);
-                    let attachments = Arc::clone(&self.ctx.attachments);
-                    tokio::spawn(crate::approvals::run_coordinator(
-                        rx,
-                        sessions,
-                        approvals,
-                        bus,
-                        attachments,
-                    ));
-                    log::debug!("spawn_session({new_id}): approval coordinator started");
-                }
+            if let Some(rx) = rx
+                && let Some(approvals) = self.ctx.approvals.as_ref()
+            {
+                let sessions = Arc::clone(&self.ctx.sessions);
+                let approvals = Arc::clone(approvals);
+                let bus = Arc::clone(&self.ctx.bus);
+                let attachments = Arc::clone(&self.ctx.attachments);
+                tokio::spawn(crate::approvals::run_coordinator(
+                    rx,
+                    sessions,
+                    approvals,
+                    bus,
+                    attachments,
+                ));
+                log::debug!("spawn_session({new_id}): approval coordinator started");
             }
         }
 

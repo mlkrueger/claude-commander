@@ -815,10 +815,10 @@ impl SessionManager {
                 );
                 // Capture UUID on the exit path too, in case the session
                 // exited before check_hook_signals had a chance to drain it.
-                if session.claude_session_id.is_none() {
-                    if let Some(uuid) = signal.claude_session_id {
-                        session.claude_session_id = Some(uuid);
-                    }
+                if session.claude_session_id.is_none()
+                    && let Some(uuid) = signal.claude_session_id
+                {
+                    session.claude_session_id = Some(uuid);
                 }
                 let mut sink = StoreAndBus {
                     session_id,

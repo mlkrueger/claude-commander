@@ -32,7 +32,8 @@ const TICK_INTERVAL: Duration = Duration::from_millis(200);
 #[derive(Parser)]
 #[command(
     name = "ccom",
-    about = "Claude Commander — manage multiple Claude Code sessions"
+    about = "Claude Commander — manage multiple Claude Code sessions",
+    version
 )]
 struct Cli {
     /// Working directory for new sessions

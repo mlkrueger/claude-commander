@@ -716,7 +716,7 @@ mod key_encoding_tests {
         // Test the common_prefix function indirectly through the module
         // Since it's private, we just verify the tab_complete behavior works
         // by testing the path completion logic exists
-        assert!(true); // placeholder — the function is private
+        // the function is private; behavior is verified indirectly by tab_complete tests
     }
 }
 

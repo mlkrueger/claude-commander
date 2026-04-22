@@ -12,6 +12,12 @@
 //! `CCOM_TEST_PRETOOLUSE_HOOK_CMD=echo` to avoid needing the real
 //! Claude binary or the real hook binary.
 
+// TEST_MUTEX is a std::sync::Mutex held across await points in async tests.
+// This is intentional: tokio tests default to single-threaded, so there is
+// no risk of deadlock, and the guard correctly serializes process-global
+// env var mutations across the entire test body.
+#![allow(clippy::await_holding_lock)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
@@ -249,10 +255,10 @@ impl McpClient {
 
 fn parse_sse_jsonrpc(raw: &str) -> Option<serde_json::Value> {
     for line in raw.lines().rev() {
-        if let Some(rest) = line.strip_prefix("data:") {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest.trim()) {
-                return Some(v);
-            }
+        if let Some(rest) = line.strip_prefix("data:")
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(rest.trim())
+        {
+            return Some(v);
         }
     }
     None
@@ -1159,10 +1165,10 @@ async fn hook_timeout_denies_and_surfaces_to_tui_log() {
     let resolved_seen = {
         let mut found = false;
         while let Ok(evt) = bus_rx.try_recv() {
-            if let SessionEvent::ToolApprovalResolved { decision, .. } = evt {
-                if decision == ccom::approvals::ApprovalDecision::Deny {
-                    found = true;
-                }
+            if let SessionEvent::ToolApprovalResolved { decision, .. } = evt
+                && decision == ccom::approvals::ApprovalDecision::Deny
+            {
+                found = true;
             }
         }
         found

@@ -543,9 +543,7 @@ impl App {
         let selected = picker.selected;
 
         // Scroll window so the selected row stays visible.
-        let scroll = if nodes.len() <= list_height {
-            0
-        } else if selected < list_height / 2 {
+        let scroll = if nodes.len() <= list_height || selected < list_height / 2 {
             0
         } else if selected + list_height / 2 >= nodes.len() {
             nodes.len().saturating_sub(list_height)

@@ -139,10 +139,10 @@ fn approvals_path(claude_session_id: &str) -> std::path::PathBuf {
 fn check_allow_always(state: &ApprovalsState, tool_name: &str, tool_input: &Value) -> bool {
     let fp = fingerprint(tool_input);
     for entry in &state.allow_always {
-        if entry.tool == tool_name {
-            if entry.input_fingerprint.is_empty() || entry.input_fingerprint == fp {
-                return true;
-            }
+        if entry.tool == tool_name
+            && (entry.input_fingerprint.is_empty() || entry.input_fingerprint == fp)
+        {
+            return true;
         }
     }
     false
@@ -174,9 +174,9 @@ fn ask_via_socket(
 
     let reader = BufReader::new(stream);
     let mut response_line = String::new();
-    reader.lines().next().and_then(|l| l.ok()).map(|l| {
+    if let Some(l) = reader.lines().next().and_then(|l| l.ok()) {
         response_line = l;
-    });
+    }
 
     let resp: SocketResponse = serde_json::from_str(&response_line).ok()?;
     Some(resp.decision)
@@ -229,15 +229,13 @@ fn main() {
 
     // 3. Check allow-always state file
     let approvals_path = approvals_path(claude_session_id);
-    if approvals_path.exists() {
-        if let Ok(contents) = std::fs::read_to_string(&approvals_path) {
-            if let Ok(state) = serde_json::from_str::<ApprovalsState>(&contents) {
-                if check_allow_always(&state, tool_name, tool_input) {
-                    print_allow();
-                    return;
-                }
-            }
-        }
+    if approvals_path.exists()
+        && let Ok(contents) = std::fs::read_to_string(&approvals_path)
+        && let Ok(state) = serde_json::from_str::<ApprovalsState>(&contents)
+        && check_allow_always(&state, tool_name, tool_input)
+    {
+        print_allow();
+        return;
     }
 
     // 4. Connect to Unix socket
@@ -283,7 +281,6 @@ fn main() {
             // If socket connection failed entirely, also passthrough
             if !socket_path.exists() {
                 // Socket not present → passthrough
-                return;
             }
             // "passthrough" decision → no output
         }

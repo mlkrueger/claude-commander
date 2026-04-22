@@ -99,17 +99,17 @@ impl Widget for UsageGraphPanel<'_> {
             }
 
             // Session cost
-            if y < inner.bottom() {
-                if let Some(cost) = rl.cost_usd {
-                    render_text(
-                        buf,
-                        inner.x,
-                        y,
-                        inner.width,
-                        &format!("${cost:.2}"),
-                        Style::default().fg(th.dim),
-                    );
-                }
+            if y < inner.bottom()
+                && let Some(cost) = rl.cost_usd
+            {
+                render_text(
+                    buf,
+                    inner.x,
+                    y,
+                    inner.width,
+                    &format!("${cost:.2}"),
+                    Style::default().fg(th.dim),
+                );
             }
         } else {
             render_text(

@@ -179,7 +179,7 @@ fn row_contains_char(screen: &vt100::Screen, row: u16, target: char) -> bool {
         let Some(cell) = screen.cell(row, col) else {
             break;
         };
-        if cell.contents().chars().next() == Some(target) {
+        if cell.contents().starts_with(target) {
             return true;
         }
     }

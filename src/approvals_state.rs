@@ -108,8 +108,7 @@ pub fn add_allow_always(
         });
     }
 
-    let json = serde_json::to_string_pretty(&state)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(&state).map_err(io::Error::other)?;
 
     // Atomic write: temp file → rename.
     let tmp_path = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), rand_nonce()));
