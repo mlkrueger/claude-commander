@@ -289,25 +289,71 @@ impl SessionManager {
     // references.
     #[allow(dead_code)]
     pub fn send_prompt(&mut self, id: usize, text: &str) -> anyhow::Result<TurnId> {
-        let turn_id = {
-            let session = self
-                .get_mut(id)
-                .ok_or_else(|| anyhow::anyhow!("session {id} not found"))?;
-            let turn_id = session.allocate_turn_id();
-            session.try_write(text.as_bytes());
-            session.try_write(SUBMIT_SEQUENCE);
-            turn_id
-        };
-        // Notify the response boundary detector that a new turn has
-        // started for this session. From this point until the
-        // detector observes the idle marker, bytes from the PTY are
-        // accumulated as this turn's body.
+        let turn_id = self.send_prompt_text(id, text)?;
+        self.submit_prompt(id, turn_id)?;
+        Ok(turn_id)
+    }
+
+    /// Write the prompt payload (no submit byte) and allocate a
+    /// `TurnId`. Intended to be paired with a later [`submit_prompt`]
+    /// call after a brief delay — see that method's docs for why the
+    /// two are split.
+    ///
+    /// Does NOT publish `PromptSubmitted` or notify the response
+    /// boundary detector — those fire from `submit_prompt` so the
+    /// "turn has started" signal aligns with the actual submission.
+    #[allow(dead_code)]
+    pub fn send_prompt_text(&mut self, id: usize, text: &str) -> anyhow::Result<TurnId> {
+        let session = self
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("session {id} not found"))?;
+        let turn_id = session.allocate_turn_id();
+        session.try_write(text.as_bytes());
+        Ok(turn_id)
+    }
+
+    /// Write the submit byte (`\r`) for a previously-sent prompt,
+    /// then publish `PromptSubmitted` and prime the response boundary
+    /// detector.
+    ///
+    /// **Why this is split from the text write.** Claude Code's TUI
+    /// input box will silently swallow the `\r` if both writes arrive
+    /// in a single PTY burst (sub-millisecond apart). Symptom: the
+    /// prompt text appears in the child's input box but is never
+    /// submitted — the user has to press Enter manually. It reproduces
+    /// reliably when a driver calls `send_prompt` shortly after
+    /// spawning a child (input box still rendering) and intermittently
+    /// mid-session. Cause is a combination of startup races and
+    /// paste/batch heuristics inside Claude Code's input reader: a
+    /// large text insert immediately followed by `\r` looks like a
+    /// pasted block whose trailing CR should be kept as a literal
+    /// newline, not treated as "submit."
+    ///
+    /// Interactive typing doesn't hit this because humans put tens to
+    /// hundreds of milliseconds between the last character and Enter;
+    /// an earlier spawn-specific fix waited for the whole session to
+    /// go Idle (~5s of PTY silence) before sending, which is accurate
+    /// but slow and doesn't help when a second `send_prompt` arrives
+    /// for an already-live child.
+    ///
+    /// The two-phase split lets callers introduce a small gap
+    /// (~250ms in the MCP handler) between the text write and this
+    /// submit write, which is enough to side-step the paste
+    /// heuristic without making the call feel sluggish. Callers that
+    /// don't need the gap can keep using `send_prompt`, which chains
+    /// both immediately — existing tests rely on that chained form.
+    #[allow(dead_code)]
+    pub fn submit_prompt(&mut self, id: usize, turn_id: TurnId) -> anyhow::Result<()> {
+        let session = self
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("session {id} not found"))?;
+        session.try_write(SUBMIT_SEQUENCE);
         self.boundary_detector.on_prompt_submitted(id, turn_id);
         self.bus.publish(SessionEvent::PromptSubmitted {
             session_id: id,
             turn_id,
         });
-        Ok(turn_id)
+        Ok(())
     }
 
     /// Feed raw PTY bytes to the response boundary detector for the
