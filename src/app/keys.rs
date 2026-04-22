@@ -185,6 +185,8 @@ impl App {
                     self.mode = AppMode::RenamePrompt;
                 }
             }
+            KeyCode::Char('f') => self.fork_selected(),
+            KeyCode::Char('R') => self.resume_selected(),
             KeyCode::Char('K') => self.kill_selected(),
             KeyCode::Char('c') => self.send_commit_prompt(),
             KeyCode::Char('x') => self.clear_dead_sessions(),
@@ -582,6 +584,16 @@ impl App {
     }
 
     fn handle_new_session_modal_key(&mut self, key: KeyEvent) {
+        // Picker overlay absorbs all keys while it's open.
+        if self
+            .new_session
+            .as_ref()
+            .is_some_and(|s| s.picker.is_some())
+        {
+            self.handle_new_session_picker_key(key);
+            return;
+        }
+
         let focused = match &self.new_session {
             Some(s) => s.focused,
             None => return,
@@ -613,6 +625,9 @@ impl App {
             }
             KeyCode::Tab if focused == 1 => {
                 self.tab_complete_path();
+            }
+            KeyCode::Char('f') if focused == 1 && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_new_session_picker();
             }
             KeyCode::Left | KeyCode::Right if focused == 0 => {
                 if let Some(state) = &mut self.new_session {
@@ -647,6 +662,50 @@ impl App {
                         2 => state.flags_input.push(c),
                         _ => {}
                     }
+                    state.status_message = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn open_new_session_picker(&mut self) {
+        let Some(state) = &mut self.new_session else {
+            return;
+        };
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+        state.picker = Some(crate::fs::tree::FileTree::new(home));
+        state.status_message = None;
+    }
+
+    fn handle_new_session_picker_key(&mut self, key: KeyEvent) {
+        let Some(state) = &mut self.new_session else {
+            return;
+        };
+        let Some(picker) = &mut state.picker else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                state.picker = None;
+            }
+            KeyCode::Up => picker.move_up(),
+            KeyCode::Down => picker.move_down(),
+            KeyCode::Char(' ') => picker.toggle_selected(),
+            KeyCode::Enter => {
+                if let Some(path) = picker.selected_path()
+                    && path.is_dir()
+                {
+                    let p = path.to_path_buf();
+                    let home = dirs::home_dir().unwrap_or_default();
+                    let display = match p.strip_prefix(&home).ok() {
+                        Some(rel) if rel.as_os_str().is_empty() => "~".to_string(),
+                        Some(rel) => format!("~/{}", rel.display()),
+                        None => format!("{}", p.display()),
+                    };
+                    state.dir_input = display;
+                    state.picker = None;
                     state.status_message = None;
                 }
             }

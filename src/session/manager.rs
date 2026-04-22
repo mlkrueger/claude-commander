@@ -680,6 +680,31 @@ impl SessionManager {
         self.assert_invariant();
     }
 
+    /// Remove a single exited session by id without sending a kill signal
+    /// or publishing any event (the session already exited).  Used by
+    /// `resume_selected` to drop the old entry after spawning the
+    /// replacement.  Returns `false` if the id is unknown or the session
+    /// has not yet exited.
+    pub fn remove_exited(&mut self, id: usize) -> bool {
+        let Some(idx) = self.sessions.iter().position(|s| s.id == id) else {
+            return false;
+        };
+        if !matches!(self.sessions[idx].status, SessionStatus::Exited(_)) {
+            return false;
+        }
+        self.sessions.remove(idx);
+        if self.sessions.is_empty() {
+            self.selected = 0;
+        } else if idx < self.selected {
+            self.selected -= 1;
+        } else if self.selected >= self.sessions.len() {
+            self.selected = self.sessions.len() - 1;
+        }
+        self.boundary_detector.forget_session(id);
+        self.assert_invariant();
+        true
+    }
+
     /// Refresh context-usage percentage for every live session.
     pub fn refresh_contexts(&mut self) {
         for session in &mut self.sessions {
