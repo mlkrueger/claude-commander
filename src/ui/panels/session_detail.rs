@@ -156,7 +156,21 @@ fn is_chrome_row(screen: &vt100::Screen, row: u16) -> bool {
         return true;
     }
     // Status line "5h:7% | 7d:21%" starts with a digit and contains '%'
-    first.is_ascii_digit() && row_contains_char(screen, row, '%')
+    (first.is_ascii_digit() && row_contains_char(screen, row, '%'))
+        // PR status line is exactly "PR #<digits>" with nothing after
+        || (first == 'P' && {
+            let t = row_trimmed_text(screen, row);
+            t.starts_with("PR #") && t[4..].chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+fn row_trimmed_text(screen: &vt100::Screen, row: u16) -> String {
+    let cols = screen.size().1;
+    let s: String = (0..cols)
+        .filter_map(|col| screen.cell(row, col))
+        .map(|cell| cell.contents().chars().next().unwrap_or(' '))
+        .collect();
+    s.trim().to_string()
 }
 
 fn row_contains_char(screen: &vt100::Screen, row: u16, target: char) -> bool {
