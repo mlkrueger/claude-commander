@@ -72,10 +72,16 @@ impl Widget for SessionDetailPanel<'_> {
         // space rendering empty terminal lines at the bottom.
         let last_content_row = last_nonempty_row(screen, screen_rows);
 
+        // Trim Claude Code's trailing input box so it doesn't dominate
+        // the pane when the session is idle. Walks up from the last
+        // non-blank row while rows look like chrome (box-drawing edges,
+        // separators, prompt chevron, spinner) and anchors just above.
+        let content_end_row = trim_trailing_input_box(screen, last_content_row);
+
         // Show the bottom `inner.height` rows of content, anchored so
         // the most recent output is at the bottom of the panel.
         let panel_rows = inner.height as usize;
-        let end_row = (last_content_row + 1).min(screen_rows as usize);
+        let end_row = (content_end_row + 1).min(screen_rows as usize);
         let start_row = end_row.saturating_sub(panel_rows);
 
         for (panel_y, screen_y) in (start_row..end_row).enumerate() {
@@ -100,6 +106,83 @@ impl Widget for SessionDetailPanel<'_> {
             }
         }
     }
+}
+
+/// If the bottom of the screen is occupied by Claude Code's chrome
+/// (input box, status line, shortcut hint), return the row just above
+/// that trailing block. Otherwise return `last_content_row`.
+///
+/// Heuristic: walk up from `last_content_row` while rows look like
+/// chrome — first non-space char is a box-drawing corner/edge, or a
+/// `?` / `!` hint prefix. The first row that doesn't match is treated
+/// as real content, and we anchor one row below it.
+fn trim_trailing_input_box(screen: &vt100::Screen, last_content_row: usize) -> usize {
+    // Bound the scan so a screen that's entirely chrome can't nuke the pane.
+    const MAX_LOOKBACK: usize = 24;
+    let lookback_floor = last_content_row.saturating_sub(MAX_LOOKBACK);
+    let mut row = last_content_row;
+    let mut trimmed_any = false;
+    loop {
+        if !is_chrome_row(screen, row as u16) {
+            return if trimmed_any { row } else { last_content_row };
+        }
+        trimmed_any = true;
+        if row == 0 || row == lookback_floor {
+            return last_content_row;
+        }
+        row -= 1;
+    }
+}
+
+/// True if the row looks like Claude Code UI chrome rather than
+/// assistant/tool output: blank, or starts with a box-drawing char,
+/// or starts with a recognized hint prefix.
+fn is_chrome_row(screen: &vt100::Screen, row: u16) -> bool {
+    let Some(first) = first_nonspace_char(screen, row) else {
+        return true; // blank
+    };
+    if matches!(
+        first,
+        '╭' | '╮' | '╰' | '╯' | '│' | '─'
+            | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼'
+            | '═' | '║' | '╔' | '╗' | '╚' | '╝'
+            | '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'
+            | '▘' | '▗' // Claude logo quadrant blocks
+            | '_' | '›' | '❯' | '>' | '?' | '!'
+            | '◐' // spinner (topmost idle row)
+            | '·' // status bar separator (U+00B7)
+            | '✢' | '✳' | '✶' | '✻' | '✽' | '⏺' // spinner frames / status indicator
+    ) {
+        return true;
+    }
+    // Status line "5h:7% | 7d:21%" starts with a digit and contains '%'
+    first.is_ascii_digit() && row_contains_char(screen, row, '%')
+}
+
+fn row_contains_char(screen: &vt100::Screen, row: u16, target: char) -> bool {
+    let cols = screen.size().1;
+    for col in 0..cols {
+        let Some(cell) = screen.cell(row, col) else {
+            break;
+        };
+        if cell.contents().chars().next() == Some(target) {
+            return true;
+        }
+    }
+    false
+}
+
+/// First non-space character in a row, or None if the row is blank.
+fn first_nonspace_char(screen: &vt100::Screen, row: u16) -> Option<char> {
+    let cols = screen.size().1;
+    for col in 0..cols {
+        let cell = screen.cell(row, col)?;
+        let ch = cell.contents().chars().next().unwrap_or(' ');
+        if ch != ' ' {
+            return Some(ch);
+        }
+    }
+    None
 }
 
 /// Return the index of the last row that contains at least one non-space char.
