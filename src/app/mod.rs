@@ -89,6 +89,9 @@ pub struct NewSessionState {
     /// a directory writes its path into `dir_input` and closes the
     /// picker, returning focus to the modal.
     pub picker: Option<FileTree>,
+    /// When opened from a session view, holds the originating session id
+    /// so that after spawn we stay in SessionView rather than going to Dashboard.
+    pub return_to_session: Option<usize>,
 }
 
 impl NewSessionState {
@@ -100,6 +103,7 @@ impl NewSessionState {
             focused: 1,
             status_message: None,
             picker: None,
+            return_to_session: None,
         }
     }
 
@@ -972,8 +976,14 @@ impl App {
 
         let extra_args = state.extra_args();
         let kind = state.kind;
+        let return_to = state.return_to_session;
         self.spawn_session_kind(kind, dir, extra_args, None);
-        self.mode = AppMode::Dashboard;
+        let new_id = self.sessions_lock().selected().map(|s| s.id).unwrap_or(0);
+        self.mode = if return_to.is_some() {
+            AppMode::SessionView(new_id)
+        } else {
+            AppMode::Dashboard
+        };
     }
 
     fn tab_complete_path(&mut self) {

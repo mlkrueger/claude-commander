@@ -111,6 +111,7 @@ impl Widget for CommandBar<'_> {
             CommandBarMode::SessionPicker => vec![
                 ("\u{2191}\u{2193}/jk", "navigate"),
                 ("Enter", "switch"),
+                ("n", "new session"),
                 ("Esc", "cancel"),
             ],
             CommandBarMode::Editor => vec![

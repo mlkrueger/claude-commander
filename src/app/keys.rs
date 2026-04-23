@@ -428,16 +428,13 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('s') {
-            let (len, pos) = {
-                let mgr = self.sessions_lock();
-                let len = mgr.len();
-                let pos = mgr.iter().position(|s| s.id == session_id).unwrap_or(0);
-                (len, pos)
-            };
-            if len > 1 {
-                self.picker_selected = pos;
-                self.mode = AppMode::SessionPicker(session_id);
-            }
+            let pos = self
+                .sessions_lock()
+                .iter()
+                .position(|s| s.id == session_id)
+                .unwrap_or(0);
+            self.picker_selected = pos;
+            self.mode = AppMode::SessionPicker(session_id);
             return;
         }
 
@@ -498,6 +495,18 @@ impl App {
                 if let Some(id) = id {
                     self.mode = AppMode::SessionView(id);
                 }
+            }
+            KeyCode::Char('n') => {
+                let dir = self
+                    .sessions_lock()
+                    .get(from_session_id)
+                    .map(|s| s.working_dir.clone())
+                    .unwrap_or_else(|| self.working_dir.clone());
+                self.spawn_session_kind(crate::app::SessionKind::Claude, dir, vec![], None);
+                // spawn_with_role auto-selects the new session; mirror that
+                // into picker_selected so Enter immediately enters it.
+                let new_idx = self.sessions_lock().len().saturating_sub(1);
+                self.picker_selected = new_idx;
             }
             _ => {}
         }
@@ -601,8 +610,12 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
+                let return_to = self.new_session.as_ref().and_then(|s| s.return_to_session);
                 self.new_session = None;
-                self.mode = AppMode::Dashboard;
+                self.mode = match return_to {
+                    Some(id) => AppMode::SessionView(id),
+                    None => AppMode::Dashboard,
+                };
             }
             KeyCode::Enter => {
                 self.spawn_from_modal();
