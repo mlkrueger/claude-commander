@@ -9,6 +9,10 @@ impl App {
             return;
         }
 
+        // macOS sends Option+letter as a Unicode character rather than ESC+letter.
+        // Normalize the common ones back to ALT+letter so all handlers work correctly.
+        let key = normalize_option_key(key);
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             match &self.mode {
                 AppMode::SessionView(_) | AppMode::SessionPicker(_) => {}
@@ -916,5 +920,28 @@ impl App {
             },
             _ => {}
         }
+    }
+}
+
+/// macOS converts Option+letter into a Unicode character before it reaches the
+/// terminal, stripping the modifier. Map the characters used by ccom's Alt+
+/// shortcuts back to their ALT+letter equivalents so all key handlers work.
+fn normalize_option_key(key: KeyEvent) -> KeyEvent {
+    if !key.modifiers.is_empty() {
+        return key;
+    }
+    let letter = match key.code {
+        KeyCode::Char('ß') => 's', // Option+s
+        KeyCode::Char('∂') => 'd', // Option+d
+        KeyCode::Char('©') => 'g', // Option+g
+        KeyCode::Char('µ') => 'm', // Option+m
+        KeyCode::Char('π') => 'p', // Option+p
+        _ => return key,
+    };
+    KeyEvent {
+        code: KeyCode::Char(letter),
+        modifiers: KeyModifiers::ALT,
+        kind: key.kind,
+        state: key.state,
     }
 }
