@@ -21,7 +21,7 @@ A terminal dashboard for managing multiple [Claude Code](https://docs.anthropic.
 - **Session picker** — switch between sessions without returning to the dashboard (`Alt+s` in session view)
 - **Fork & resume** — fork a session to branch work, or resume an externally-started Claude session
 - **Per-session cost tracking** — see token cost accumulate per session in real time
-- **File tree** — browse the working directory with git status colors; open files in the built-in editor
+- **File tree** — browse the working directory with git status colors; open files in `$EDITOR`
 - **Inline prompt** — send a prompt to a session directly from the dashboard (`Alt+p`)
 - **MCP server** — embedded MCP server lets Claude sessions call back into ccom for coordinated multi-agent work
 - **Auto-update** — checks GitHub on launch and can self-update in place (`U` on the dashboard)
@@ -106,6 +106,8 @@ On first launch, ccom shows a setup screen. Press `Enter` to let ccom configure 
 |-----|--------|
 | `Alt+d` | Return to dashboard |
 | `Alt+s` | Open session picker (switch to another session) |
+| `PageUp` / `PageDown` | Scroll through history (freezes auto-follow; scroll to bottom to resume) |
+| `Mouse wheel` | Scroll through history |
 | Everything else | Forwarded to Claude |
 
 ### Session picker (`Alt+s` from session view)
@@ -122,20 +124,11 @@ On first launch, ccom shows a setup screen. Press `Enter` to let ccom configure 
 |-----|--------|
 | `↑/↓` | Navigate |
 | `Enter` / `→` | Expand directory |
-| `←` | Collapse directory |
-| `e` | Open file in built-in editor |
+| `←` | Collapse directory / navigate up to parent |
+| `e` | Open file in `$EDITOR` |
 | `n` | New Claude session in selected directory |
 | `R` | Refresh tree |
 | `Tab` | Switch back to session list |
-
-### Editor
-
-| Key | Action |
-|-----|--------|
-| `Ctrl+s` | Save |
-| `Ctrl+p` | Send file path to a Claude session |
-| `Alt+d` | Close editor |
-| `Tab` | Insert 4 spaces |
 
 ## How it works
 
