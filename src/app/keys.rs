@@ -35,6 +35,11 @@ impl App {
             return;
         }
 
+        if key.code == KeyCode::Char('U') && matches!(self.mode, AppMode::Dashboard) {
+            self.handle_update_key();
+            return;
+        }
+
         match &self.mode {
             AppMode::Dashboard => self.handle_dashboard_key(key),
             AppMode::SessionView(id) => {
@@ -920,6 +925,22 @@ impl App {
             },
             _ => {}
         }
+    }
+
+    pub(super) fn handle_update_key(&mut self) {
+        if self.update_installing || self.update_installed {
+            return;
+        }
+        let Some(version) = self.update_available.clone() else {
+            return;
+        };
+        if self.homebrew_install {
+            self.status_message = Some("Homebrew install — run: brew upgrade ccom".to_string());
+            self.status_message_tick = self.tick_count;
+            return;
+        }
+        self.update_installing = true;
+        self.update_install_rx = Some(crate::update::spawn_install(version));
     }
 }
 

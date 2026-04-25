@@ -130,10 +130,49 @@ impl App {
         };
 
         // Usage panel (left column, below file tree).
-        // If there's a setup banner, show it as the first row of that area.
-        let show_banner = !self.setup_banner_dismissed && !self.setup_items.is_empty();
-        let usage_area = if show_banner && layout.usage_graph.height > 1 {
-            let banner = ratatui::text::Line::from(vec![
+        // Stack update and setup banners above the graph, each consuming one row.
+        let mut banner_offset: u16 = 0;
+
+        let show_update =
+            self.update_available.is_some() || self.update_installing || self.update_installed;
+        if show_update && layout.usage_graph.height > banner_offset + 1 {
+            let text = if self.update_installed {
+                format!(
+                    " Updated {} — restart to apply",
+                    self.update_available.as_deref().unwrap_or("")
+                )
+            } else if self.update_installing {
+                " Downloading update...".to_string()
+            } else if let Some(v) = &self.update_available {
+                if self.homebrew_install {
+                    format!(" New {v} — brew upgrade ccom")
+                } else {
+                    format!(" New {v} — press U to update")
+                }
+            } else {
+                String::new()
+            };
+            let update_banner = ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+                &text[..text.len().min(layout.usage_graph.width as usize)],
+                ratatui::style::Style::default()
+                    .fg(th.selected_fg)
+                    .bg(th.accent),
+            )]);
+            frame.render_widget(
+                update_banner,
+                ratatui::layout::Rect {
+                    x: layout.usage_graph.x,
+                    y: layout.usage_graph.y + banner_offset,
+                    width: layout.usage_graph.width,
+                    height: 1,
+                },
+            );
+            banner_offset += 1;
+        }
+
+        let show_setup = !self.setup_banner_dismissed && !self.setup_items.is_empty();
+        if show_setup && layout.usage_graph.height > banner_offset + 1 {
+            let setup_banner = ratatui::text::Line::from(vec![
                 ratatui::text::Span::styled(
                     " Setup needed ",
                     ratatui::style::Style::default()
@@ -145,21 +184,23 @@ impl App {
                     ratatui::style::Style::default().fg(th.status_warn),
                 ),
             ]);
-            let banner_area = ratatui::layout::Rect {
-                x: layout.usage_graph.x,
-                y: layout.usage_graph.y,
-                width: layout.usage_graph.width,
-                height: 1,
-            };
-            frame.render_widget(banner, banner_area);
-            ratatui::layout::Rect {
-                x: layout.usage_graph.x,
-                y: layout.usage_graph.y + 1,
-                width: layout.usage_graph.width,
-                height: layout.usage_graph.height.saturating_sub(1),
-            }
-        } else {
-            layout.usage_graph
+            frame.render_widget(
+                setup_banner,
+                ratatui::layout::Rect {
+                    x: layout.usage_graph.x,
+                    y: layout.usage_graph.y + banner_offset,
+                    width: layout.usage_graph.width,
+                    height: 1,
+                },
+            );
+            banner_offset += 1;
+        }
+
+        let usage_area = ratatui::layout::Rect {
+            x: layout.usage_graph.x,
+            y: layout.usage_graph.y + banner_offset,
+            width: layout.usage_graph.width,
+            height: layout.usage_graph.height.saturating_sub(banner_offset),
         };
 
         let usage_panel = UsageGraphPanel::new(th, tick).with_rate_limit(self.rate_limit.as_ref());
@@ -828,6 +869,7 @@ impl App {
                 "General",
                 &[
                     ("t", "Cycle color theme"),
+                    ("U", "Update ccom (when update available)"),
                     ("C-S-m", "Toggle mouse capture"),
                     ("?", "Toggle this help"),
                     ("q", "Quit"),

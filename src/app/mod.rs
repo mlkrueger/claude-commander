@@ -232,6 +232,21 @@ pub struct App {
     /// `ToolApprovalResolved` events published by the approval
     /// coordinator. Drained each tick in `handle_event`.
     pub(crate) approval_event_rx: std::sync::mpsc::Receiver<SessionEvent>,
+
+    // --- Update machinery ---
+    /// Background channel that delivers the result of the GitHub release check.
+    /// `None` once the result has been consumed.
+    pub(crate) update_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    /// Latest release tag (e.g. `"v0.4.0"`) if newer than the running version.
+    pub update_available: Option<String>,
+    /// True while a download-and-replace is running in the background.
+    pub update_installing: bool,
+    /// Channel for the install background thread's result. `None` when idle.
+    pub(crate) update_install_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// True after a successful install — banner switches to "restart to apply".
+    pub update_installed: bool,
+    /// Cached at startup — true when running from a Homebrew Cellar path.
+    pub homebrew_install: bool,
 }
 
 const ATTENTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -319,6 +334,8 @@ impl App {
             }
         };
 
+        let update_rx = Some(crate::update::spawn_update_check());
+
         Self {
             sessions,
             event_bus,
@@ -364,6 +381,12 @@ impl App {
             pending_approvals_per_driver: HashMap::new(),
             pending_pty_approvals: HashMap::new(),
             approval_event_rx,
+            update_rx,
+            update_available: None,
+            update_installing: false,
+            update_install_rx: None,
+            update_installed: false,
+            homebrew_install: crate::update::is_homebrew_install(),
         }
     }
 
@@ -428,6 +451,34 @@ impl App {
                 if self.last_reaper_sweep.elapsed() > APPROVAL_REAPER_INTERVAL {
                     self.approvals.sweep_stale();
                     self.last_reaper_sweep = Instant::now();
+                }
+                // Drain update-check result (fires once after startup).
+                {
+                    let result = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+                    if let Some(version) = result {
+                        self.update_available = version;
+                        self.update_rx = None;
+                    }
+                }
+                // Drain update-install result.
+                {
+                    let result = self
+                        .update_install_rx
+                        .as_ref()
+                        .and_then(|rx| rx.try_recv().ok());
+                    if let Some(outcome) = result {
+                        self.update_installing = false;
+                        self.update_install_rx = None;
+                        match outcome {
+                            Ok(()) => {
+                                self.update_installed = true;
+                            }
+                            Err(e) => {
+                                self.status_message = Some(format!("Update failed: {e}"));
+                                self.status_message_tick = self.tick_count;
+                            }
+                        }
+                    }
                 }
             }
             Event::SessionExited { session_id, code } => {

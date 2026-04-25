@@ -63,7 +63,8 @@ impl Widget for TerminalWidget<'_> {
             let buf_x = area.x + cursor_x;
             let buf_y = area.y + cursor_y - self.scroll_offset as u16;
             if buf_x < area.right() && buf_y < area.bottom() {
-                buf[(buf_x, buf_y)].set_style(Style::default().fg(Color::Black).bg(Color::White));
+                let existing = buf[(buf_x, buf_y)].style();
+                buf[(buf_x, buf_y)].set_style(existing.add_modifier(Modifier::REVERSED));
             }
         }
     }

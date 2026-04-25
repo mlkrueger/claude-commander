@@ -16,6 +16,9 @@ path = "src/bin/ccom-hook-pretooluse.rs"
 
 [dependencies]
 anyhow = "1.0.102"
+flate2 = "1"
+tar = "0.4"
+ureq = "2"
 axum = "0.7"
 chrono = "0.4.44"
 clap = { version = "4.6.0", features = ["derive"] }
@@ -46,4 +49,3 @@ vt100 = "0.16.2"
 
 [dev-dependencies]
 proptest = "1"
-ureq = "2"

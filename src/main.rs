@@ -10,6 +10,7 @@ mod pty;
 mod session;
 mod setup;
 mod ui;
+mod update;
 
 use std::io;
 use std::path::PathBuf;

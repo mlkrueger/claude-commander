@@ -19,7 +19,7 @@ pub enum SetupStatus {
 
 /// Check all required configurations and return items that need attention.
 pub fn check_setup() -> Vec<SetupItem> {
-    vec![check_statusline_hook()]
+    vec![check_statusline_hook(), check_pretooluse_binary()]
 }
 
 /// Returns only items that are missing.
@@ -94,6 +94,53 @@ pub fn mark_initialized() {
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(&path, "");
+}
+
+fn check_pretooluse_binary() -> SetupItem {
+    let binary_path = find_pretooluse_binary();
+    let exists = std::path::Path::new(&binary_path).exists();
+    let status = if exists {
+        SetupStatus::Ok
+    } else {
+        SetupStatus::Missing
+    };
+
+    SetupItem {
+        name: "ccom-hook-pretooluse binary".to_string(),
+        description: "Per-session PreToolUse hook for tool approval routing".to_string(),
+        status,
+        fix_prompt: format!(
+            concat!(
+                "I need you to install the `ccom-hook-pretooluse` binary alongside `ccom`.\n\n",
+                "It should live at: `{binary_path}`\n\n",
+                "Steps:\n",
+                "1. Find the current ccom version: run `ccom --version` and note the version number.\n",
+                "2. Download the matching release tarball from GitHub:\n",
+                "   ```\n",
+                "   curl -L https://github.com/mlkrueger/claude-commander/releases/latest/download/ccom-$(uname -m | sed 's/x86_64/x86_64/;s/arm64/arm64/;s/aarch64/arm64/').tar.gz -o /tmp/ccom.tar.gz\n",
+                "   ```\n",
+                "   (adjust the label: macos-arm64, macos-x86_64, linux-x86_64, or linux-arm64)\n",
+                "3. Extract just the hook binary: `tar xf /tmp/ccom.tar.gz -C /tmp ccom-hook-pretooluse`\n",
+                "4. Move it into place: `mv /tmp/ccom-hook-pretooluse {binary_path}`\n",
+                "5. Make it executable: `chmod +x {binary_path}`\n\n",
+                "After installing, restart ccom.",
+            ),
+            binary_path = binary_path,
+        ),
+    }
+}
+
+/// Find the expected path for ccom-hook-pretooluse (sibling of current exe).
+fn find_pretooluse_binary() -> String {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        return parent
+            .join("ccom-hook-pretooluse")
+            .to_string_lossy()
+            .to_string();
+    }
+    "ccom-hook-pretooluse".to_string()
 }
 
 /// Find the statusline script, checking common locations.
