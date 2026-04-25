@@ -1,6 +1,6 @@
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, MouseEvent};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -79,20 +79,27 @@ pub struct EventCollector {
     rx: mpsc::Receiver<Event>,
     tx: MonitoredSender,
     depth: Arc<AtomicUsize>,
+    paused: Arc<AtomicBool>,
 }
 
 impl EventCollector {
     pub fn new(tick_rate: Duration) -> Self {
         let (tx, rx) = mpsc::channel();
         let depth = Arc::new(AtomicUsize::new(0));
+        let paused = Arc::new(AtomicBool::new(false));
         let monitored_tx = MonitoredSender {
             inner: tx,
             depth: Arc::clone(&depth),
         };
         let key_tx = monitored_tx.clone();
+        let paused_flag = Arc::clone(&paused);
 
         thread::spawn(move || {
             loop {
+                if paused_flag.load(Ordering::Relaxed) {
+                    thread::sleep(tick_rate);
+                    continue;
+                }
                 if event::poll(tick_rate).unwrap_or(false) {
                     match event::read() {
                         Ok(CrosstermEvent::Key(key)) => {
@@ -120,7 +127,12 @@ impl EventCollector {
             rx,
             tx: monitored_tx,
             depth,
+            paused,
         }
+    }
+
+    pub fn pause_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.paused)
     }
 
     pub fn sender(&self) -> MonitoredSender {

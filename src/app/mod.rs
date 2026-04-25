@@ -6,6 +6,7 @@ use crate::event::MonitoredSender;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,6 @@ use crate::session::{
     EventBus, SessionEvent, SessionManager, SessionRole, SessionStatus, SpawnConfig,
 };
 use crate::setup::{self, SetupItem};
-use crate::ui::panels::editor::EditorState;
 use crate::ui::theme::{Theme, ThemeName};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,10 +27,8 @@ pub enum AppMode {
     Dashboard,
     SessionView(usize),
     SessionPicker(usize),
-    Editor,
     RenamePrompt,
     NewSessionModal,
-    SendFilePrompt,
     Setup,
     QuitConfirm,
     /// Phase 5: a write-tool MCP handler is blocked on user
@@ -165,7 +163,12 @@ pub struct App {
     pub user_scrolled: bool,
     pub show_help: bool,
     pub status_message: Option<String>,
-    pub editor: Option<EditorState>,
+    pub input_paused: Arc<AtomicBool>,
+    pub needs_full_redraw: bool,
+    /// Scrollback length the last time we adjusted session_view_scroll.
+    /// Used to compensate for new rows pushed into scrollback while
+    /// user_scrolled is true, so the view stays at the same visual position.
+    pub scroll_lock_sb_len: usize,
     pub git_status: Option<GitStatusMap>,
     pub last_git_refresh: Instant,
     pub last_usage_refresh: Instant,
@@ -358,7 +361,9 @@ impl App {
             user_scrolled: false,
             show_help: false,
             status_message: None,
-            editor: None,
+            input_paused: Arc::new(AtomicBool::new(false)),
+            needs_full_redraw: false,
+            scroll_lock_sb_len: 0,
             git_status,
             last_git_refresh: Instant::now(),
             last_usage_refresh: Instant::now() - Duration::from_secs(60),
@@ -967,41 +972,36 @@ impl App {
     }
 
     fn open_editor(&mut self, path: PathBuf) {
-        match EditorState::open(path) {
-            Ok(state) => {
-                self.editor = Some(state);
-                self.mode = AppMode::Editor;
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Can't open file: {e}"));
-            }
-        }
-    }
+        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+        use crossterm::{
+            execute,
+            terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+        };
+        use std::io::Write;
 
-    fn send_file_to_session(&mut self, idx: usize) {
-        let file_path = self.editor.as_ref().map(|e| e.file_path.clone());
-        if let Some(path) = file_path {
-            // Returns Some(label) if the write went through, None if the
-            // idx didn't resolve to a live session.
-            let sent_label: Option<String> = {
-                let mut mgr = self.sessions_lock();
-                let session_id = mgr.iter().nth(idx).map(|s| s.id);
-                session_id.and_then(|id| {
-                    mgr.get_mut(id).map(|session| {
-                        let msg = format!("Read the file at {}\n", path.display());
-                        session.try_write(msg.as_bytes());
-                        session.label.clone()
-                    })
-                })
-            };
-            if let Some(label) = sent_label {
-                if let Some(editor) = &mut self.editor {
-                    editor.message = Some(format!("Sent to session {label}"));
-                }
-            } else if let Some(editor) = &mut self.editor {
-                editor.message = Some(format!("No session at index {idx}"));
-            }
-        }
+        let editor = std::env::var("EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .unwrap_or_else(|_| "vi".to_string());
+
+        self.input_paused.store(true, Ordering::Relaxed);
+
+        let _ = disable_raw_mode();
+        let mut stdout = std::io::stdout();
+        // Disable mouse tracking so the editor doesn't receive mouse events as garbage
+        let _ = write!(stdout, "\x1b[?1000l\x1b[?1002l\x1b[?1006l");
+        let _ = stdout.flush();
+        let _ = execute!(stdout, LeaveAlternateScreen);
+
+        let _ = std::process::Command::new(&editor).arg(&path).status();
+
+        let _ = enable_raw_mode();
+        let _ = execute!(stdout, EnterAlternateScreen);
+        // Re-enable mouse tracking (matches main.rs setup)
+        let _ = write!(stdout, "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        let _ = stdout.flush();
+
+        self.input_paused.store(false, Ordering::Relaxed);
+        self.needs_full_redraw = true;
     }
 
     fn spawn_from_modal(&mut self) {

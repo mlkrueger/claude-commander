@@ -17,8 +17,6 @@ pub enum CommandBarMode {
     FileTree,
     SessionView,
     SessionPicker,
-    Editor,
-    SendFile(Vec<String>), // session labels
     Setup,
 }
 
@@ -114,20 +112,11 @@ impl Widget for CommandBar<'_> {
                 ("n", "new session"),
                 ("Esc", "cancel"),
             ],
-            CommandBarMode::Editor => vec![
-                ("Ctrl+S", "save"),
-                ("Ctrl+P", "send to claude"),
-                ("Alt+D", "close"),
-                ("Arrows", "navigate"),
-            ],
             CommandBarMode::Setup => vec![
                 ("Enter/y", "fix"),
                 ("\u{2191}\u{2193}", "nav"),
                 ("Esc", "back"),
             ],
-            CommandBarMode::SendFile(ref labels) => {
-                return render_send_file(area, buf, labels, th);
-            }
         };
 
         // Phase 7 Task 8: prefix the hint when this is a driver view
@@ -218,21 +207,4 @@ fn pct_color(pct: f64, th: &Theme) -> ratatui::style::Color {
     } else {
         th.status_ok
     }
-}
-
-fn render_send_file(area: Rect, buf: &mut Buffer, labels: &[String], th: &Theme) {
-    let mut spans = vec![Span::styled("Send file to: ", th.shortcut_desc())];
-    for (i, label) in labels.iter().enumerate() {
-        spans.push(Span::styled(format!("[{i}]"), th.shortcut_key()));
-        spans.push(Span::styled(format!(" {label}"), th.shortcut_desc()));
-        if i < labels.len() - 1 {
-            spans.push(Span::raw("  "));
-        }
-    }
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled("[Esc]", th.shortcut_key()));
-    spans.push(Span::styled(" cancel", th.shortcut_desc()));
-
-    let line = Line::from(spans);
-    buf.set_line(area.x, area.y, &line, area.width);
 }

@@ -5,7 +5,6 @@ use super::{App, AppMode, PanelFocus, SessionKind};
 use crate::session::{SessionRole, SessionStatus};
 use crate::ui::layout::AppLayout;
 use crate::ui::panels::command_bar::{self, CommandBar, CommandBarMode};
-use crate::ui::panels::editor::EditorPanel;
 use crate::ui::panels::file_tree::FileTreePanel;
 use crate::ui::panels::session_detail::SessionDetailPanel;
 use crate::ui::panels::session_list::SessionListPanel;
@@ -19,9 +18,6 @@ impl App {
         let tick = self.tick_count;
 
         match &self.mode {
-            AppMode::Editor | AppMode::SendFilePrompt => {
-                self.draw_editor_mode(frame, th, tick);
-            }
             AppMode::Dashboard
             | AppMode::RenamePrompt
             | AppMode::NewSessionModal
@@ -56,34 +52,6 @@ impl App {
                 // the confirmation modal.
                 self.draw_dashboard_mode(frame, th, tick);
                 self.draw_mcp_confirm(frame);
-            }
-        }
-    }
-
-    fn draw_editor_mode(&self, frame: &mut Frame, th: &crate::ui::theme::Theme, tick: u64) {
-        let (main_area, cmd_area) = AppLayout::session_view(frame.area());
-
-        if let Some(editor) = &self.editor {
-            let panel = EditorPanel::new(editor, th, tick);
-            frame.render_widget(panel, main_area);
-
-            if let Some(msg) = &editor.message {
-                let line = ratatui::text::Line::styled(
-                    msg.clone(),
-                    ratatui::style::Style::default().fg(th.status_warn),
-                );
-                frame.render_widget(line, cmd_area);
-            } else if self.mode == AppMode::SendFilePrompt {
-                let labels: Vec<String> = self
-                    .sessions_lock()
-                    .iter()
-                    .map(|s| s.label.clone())
-                    .collect();
-                let bar = CommandBar::new(CommandBarMode::SendFile(labels), th);
-                frame.render_widget(bar, cmd_area);
-            } else {
-                let bar = CommandBar::new(CommandBarMode::Editor, th);
-                frame.render_widget(bar, cmd_area);
             }
         }
     }

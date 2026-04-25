@@ -50,10 +50,8 @@ impl App {
                 let from_id = *from_id;
                 self.handle_session_picker_key(key, from_id);
             }
-            AppMode::Editor => self.handle_editor_key(key),
             AppMode::RenamePrompt => self.handle_rename_key(key),
             AppMode::NewSessionModal => self.handle_new_session_modal_key(key),
-            AppMode::SendFilePrompt => self.handle_send_file_key(key),
             AppMode::Setup => self.handle_setup_key(key),
             AppMode::QuitConfirm => self.handle_quit_confirm_key(key),
             AppMode::McpConfirm => self.handle_mcp_confirm_key(key),
@@ -260,127 +258,6 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.show_help = !self.show_help;
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_editor_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-        match key.code {
-            KeyCode::Char('s') if ctrl => {
-                if let Some(editor) = &mut self.editor
-                    && let Err(e) = editor.save()
-                {
-                    editor.message = Some(format!("Save failed: {e}"));
-                }
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.editor = None;
-                self.mode = AppMode::Dashboard;
-            }
-            KeyCode::Char('p') if ctrl => {
-                let has_any = !self.sessions_lock().is_empty();
-                if has_any {
-                    self.mode = AppMode::SendFilePrompt;
-                } else if let Some(editor) = &mut self.editor {
-                    editor.message = Some("No sessions to send to.".to_string());
-                }
-            }
-            KeyCode::Up => {
-                if let Some(editor) = &mut self.editor {
-                    editor.move_up();
-                }
-            }
-            KeyCode::Down => {
-                if let Some(editor) = &mut self.editor {
-                    editor.move_down();
-                }
-            }
-            KeyCode::Left => {
-                if let Some(editor) = &mut self.editor {
-                    editor.move_left();
-                }
-            }
-            KeyCode::Right => {
-                if let Some(editor) = &mut self.editor {
-                    editor.move_right();
-                }
-            }
-            KeyCode::Home => {
-                if let Some(editor) = &mut self.editor {
-                    editor.move_home();
-                }
-            }
-            KeyCode::End => {
-                if let Some(editor) = &mut self.editor {
-                    editor.move_end();
-                }
-            }
-            KeyCode::PageUp => {
-                if let Some(editor) = &mut self.editor {
-                    let page = self.terminal_rows.saturating_sub(4) as usize;
-                    editor.page_up(page);
-                }
-            }
-            KeyCode::PageDown => {
-                if let Some(editor) = &mut self.editor {
-                    let page = self.terminal_rows.saturating_sub(4) as usize;
-                    editor.page_down(page);
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(editor) = &mut self.editor {
-                    editor.insert_newline();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(editor) = &mut self.editor {
-                    editor.backspace();
-                }
-            }
-            KeyCode::Delete => {
-                if let Some(editor) = &mut self.editor {
-                    editor.delete();
-                }
-            }
-            KeyCode::Tab => {
-                if let Some(editor) = &mut self.editor {
-                    for _ in 0..4 {
-                        editor.insert_char(' ');
-                    }
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(editor) = &mut self.editor {
-                    editor.insert_char(c);
-                }
-            }
-            _ => {}
-        }
-
-        if let Some(editor) = &mut self.editor {
-            let visible = self.terminal_rows.saturating_sub(4) as usize;
-            editor.ensure_cursor_visible(visible);
-        }
-    }
-
-    fn handle_send_file_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = AppMode::Editor;
-            }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
-                let idx = c.to_digit(10).unwrap() as usize;
-                self.send_file_to_session(idx);
-                self.mode = AppMode::Editor;
-            }
-            KeyCode::Enter => {
-                if !self.sessions_lock().is_empty() {
-                    self.send_file_to_session(0);
-                }
-                self.mode = AppMode::Editor;
             }
             _ => {}
         }

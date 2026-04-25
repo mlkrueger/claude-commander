@@ -133,6 +133,7 @@ fn main() -> anyhow::Result<()> {
     let event_tx = events.sender();
 
     let mut app = App::new(event_tx, working_dir.clone());
+    app.input_paused = events.pause_flag();
     app.terminal_cols = size.width;
     app.terminal_rows = size.height;
     // Phase 6 Task 2: stash the pending driver role on the App so
