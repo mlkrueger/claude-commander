@@ -229,23 +229,19 @@ impl App {
                 }
             }
             KeyCode::Left => {
-                let go_up = if let Some(path) = self.file_tree.selected_path() {
+                let go_up = if let Some(path) = self.file_tree.selected_path()
+                    && path.is_dir()
+                    && self.file_tree.is_expanded(path)
+                {
                     // Collapse if it's an expanded dir; otherwise navigate to parent root
-                    if path.is_dir() && self.file_tree.is_expanded(path) {
-                        self.file_tree.toggle_selected();
-                        false
-                    } else {
-                        true
-                    }
+                    self.file_tree.toggle_selected();
+                    false
                 } else {
                     true
                 };
-                if go_up {
-                    if let Some(parent) = self.file_tree.root.path.parent().map(|p| p.to_path_buf())
-                    {
-                        self.file_tree.set_root(parent);
-                        self.file_tree_scroll = 0;
-                    }
+                if go_up && let Some(parent) = self.file_tree.root.path.parent() {
+                    self.file_tree.set_root(parent.to_path_buf());
+                    self.file_tree_scroll = 0;
                 }
             }
             KeyCode::Char('n') => {
@@ -345,7 +341,7 @@ impl App {
         if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
             let in_alt_screen = {
                 let mgr = self.sessions_lock();
-                mgr.get(session_id).map_or(false, |session| {
+                mgr.get(session_id).is_some_and(|session| {
                     let parser = crate::session::lock_parser(&session.parser);
                     parser.screen().alternate_screen()
                 })
