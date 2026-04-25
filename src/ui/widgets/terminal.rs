@@ -7,6 +7,10 @@ use ratatui::widgets::Widget;
 pub struct TerminalWidget<'a> {
     screen: &'a vt100::Screen,
     scroll_offset: usize,
+    /// Fallback fg used when a cell reports Color::Reset (theme text color).
+    cursor_fg: Color,
+    /// Fallback bg used when a cell reports Color::Reset (theme background).
+    cursor_bg: Color,
 }
 
 impl<'a> TerminalWidget<'a> {
@@ -14,6 +18,8 @@ impl<'a> TerminalWidget<'a> {
         Self {
             screen,
             scroll_offset,
+            cursor_fg: Color::White,
+            cursor_bg: Color::Black,
         }
     }
 }
@@ -52,7 +58,8 @@ impl Widget for TerminalWidget<'_> {
             }
         }
 
-        // Render cursor if visible
+        // Render cursor: resolve Reset colors to real theme values before
+        // swapping fg/bg so the cursor is always visible against the background.
         let cursor = self.screen.cursor_position();
         let cursor_y = cursor.0;
         let cursor_x = cursor.1;
@@ -64,9 +71,24 @@ impl Widget for TerminalWidget<'_> {
             let buf_y = area.y + cursor_y - self.scroll_offset as u16;
             if buf_x < area.right() && buf_y < area.bottom() {
                 let existing = buf[(buf_x, buf_y)].style();
-                buf[(buf_x, buf_y)].set_style(existing.add_modifier(Modifier::REVERSED));
+                let cell_fg = resolve_reset(existing.fg, self.cursor_fg);
+                let cell_bg = resolve_reset(existing.bg, self.cursor_bg);
+                // Swap fg/bg explicitly; clear REVERSED so we don't double-flip.
+                let cursor_style = existing
+                    .fg(cell_bg)
+                    .bg(cell_fg)
+                    .remove_modifier(Modifier::REVERSED);
+                buf[(buf_x, buf_y)].set_style(cursor_style);
             }
         }
+    }
+}
+
+/// Replace `Color::Reset` (or `None`) with `fallback`.
+fn resolve_reset(color: Option<Color>, fallback: Color) -> Color {
+    match color {
+        None | Some(Color::Reset) => fallback,
+        Some(c) => c,
     }
 }
 
