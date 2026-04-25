@@ -409,9 +409,31 @@ impl App {
                 }
                 if let AppMode::SessionView(id) = self.mode
                     && id == session_id
-                    && !self.user_scrolled
                 {
-                    self.session_view_scroll = 0;
+                    if self.user_scrolled {
+                        // The scrollback offset is "rows from current bottom".
+                        // As new rows arrive the bottom advances, so we must
+                        // increase the offset by the same amount to keep the
+                        // same visual content on screen.
+                        let current_sb = {
+                            let mgr = self.sessions_lock();
+                            mgr.get(session_id).map_or(0, |session| {
+                                let mut parser = crate::session::lock_parser(&session.parser);
+                                parser.screen_mut().set_scrollback(usize::MAX);
+                                let len = parser.screen().scrollback();
+                                parser.screen_mut().set_scrollback(self.session_view_scroll);
+                                len
+                            })
+                        };
+                        let added = current_sb.saturating_sub(self.scroll_lock_sb_len);
+                        self.session_view_scroll = self
+                            .session_view_scroll
+                            .saturating_add(added)
+                            .min(current_sb);
+                        self.scroll_lock_sb_len = current_sb;
+                    } else {
+                        self.session_view_scroll = 0;
+                    }
                 }
             }
             Event::Tick => {

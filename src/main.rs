@@ -149,6 +149,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     loop {
+        if app.needs_full_redraw {
+            app.needs_full_redraw = false;
+            terminal.clear()?;
+        }
         terminal.draw(|frame| app.draw(frame))?;
 
         if let Some(event) = events.next_timeout(TICK_INTERVAL) {

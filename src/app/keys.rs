@@ -176,6 +176,7 @@ impl App {
                 if let Some(id) = id {
                     self.session_view_scroll = 0;
                     self.user_scrolled = false;
+                    self.scroll_lock_sb_len = 0;
                     self.mode = AppMode::SessionView(id);
                 }
             }
@@ -228,10 +229,23 @@ impl App {
                 }
             }
             KeyCode::Left => {
-                if let Some(path) = self.file_tree.selected_path()
-                    && path.is_dir()
-                {
-                    self.file_tree.toggle_selected();
+                let go_up = if let Some(path) = self.file_tree.selected_path() {
+                    // Collapse if it's an expanded dir; otherwise navigate to parent root
+                    if path.is_dir() && self.file_tree.is_expanded(path) {
+                        self.file_tree.toggle_selected();
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                if go_up {
+                    if let Some(parent) = self.file_tree.root.path.parent().map(|p| p.to_path_buf())
+                    {
+                        self.file_tree.set_root(parent);
+                        self.file_tree_scroll = 0;
+                    }
                 }
             }
             KeyCode::Char('n') => {
@@ -323,6 +337,49 @@ impl App {
             self.picker_selected = pos;
             self.mode = AppMode::SessionPicker(session_id);
             return;
+        }
+
+        // Intercept PageUp/PageDown for local scrollback when the session
+        // is not in alternate-screen mode (e.g. Claude streaming output).
+        // In alternate-screen mode (vim, htop, etc.) forward them as usual.
+        if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            let in_alt_screen = {
+                let mgr = self.sessions_lock();
+                mgr.get(session_id).map_or(false, |session| {
+                    let parser = crate::session::lock_parser(&session.parser);
+                    parser.screen().alternate_screen()
+                })
+            };
+            if !in_alt_screen {
+                let page = self.terminal_rows.saturating_sub(3) as usize;
+                match key.code {
+                    KeyCode::PageUp => {
+                        let sb_rows = {
+                            let mgr = self.sessions_lock();
+                            mgr.get(session_id).map_or(0, |session| {
+                                let mut parser = crate::session::lock_parser(&session.parser);
+                                parser.screen_mut().set_scrollback(usize::MAX);
+                                let len = parser.screen().scrollback();
+                                parser.screen_mut().set_scrollback(self.session_view_scroll);
+                                len
+                            })
+                        };
+                        self.session_view_scroll =
+                            self.session_view_scroll.saturating_add(page).min(sb_rows);
+                        self.user_scrolled = true;
+                        self.scroll_lock_sb_len = sb_rows;
+                    }
+                    KeyCode::PageDown => {
+                        self.session_view_scroll = self.session_view_scroll.saturating_sub(page);
+                        if self.session_view_scroll == 0 {
+                            self.user_scrolled = false;
+                            self.scroll_lock_sb_len = 0;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                return;
+            }
         }
 
         let bytes = key_event_to_bytes(&key);
@@ -724,15 +781,7 @@ impl App {
                             .saturating_add(scroll_lines)
                             .min(sb_rows);
                         self.user_scrolled = true;
-                    }
-                }
-                AppMode::Editor => {
-                    if let Some(editor) = &mut self.editor {
-                        for _ in 0..scroll_lines {
-                            editor.move_up();
-                        }
-                        let visible = self.terminal_rows.saturating_sub(4) as usize;
-                        editor.ensure_cursor_visible(visible);
+                        self.scroll_lock_sb_len = sb_rows;
                     }
                 }
                 _ => {}
@@ -787,16 +836,8 @@ impl App {
                             self.session_view_scroll.saturating_sub(scroll_lines);
                         if self.session_view_scroll == 0 {
                             self.user_scrolled = false;
+                            self.scroll_lock_sb_len = 0;
                         }
-                    }
-                }
-                AppMode::Editor => {
-                    if let Some(editor) = &mut self.editor {
-                        for _ in 0..scroll_lines {
-                            editor.move_down();
-                        }
-                        let visible = self.terminal_rows.saturating_sub(4) as usize;
-                        editor.ensure_cursor_visible(visible);
                     }
                 }
                 _ => {}
