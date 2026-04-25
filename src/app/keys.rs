@@ -275,6 +275,7 @@ impl App {
             }
             self.session_view_scroll = 0;
             self.user_scrolled = false;
+            self.scroll_lock_sb_len = 0;
             self.mode = AppMode::Dashboard;
             return;
         }

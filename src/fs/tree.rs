@@ -148,6 +148,26 @@ impl FileTree {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    pub fn is_expanded(&self, path: &Path) -> bool {
+        Self::find_node(&self.root, path)
+            .map(|n| n.expanded)
+            .unwrap_or(false)
+    }
+
+    fn find_node<'a>(node: &'a TreeNode, target: &Path) -> Option<&'a TreeNode> {
+        if node.path == target {
+            return Some(node);
+        }
+        if node.expanded {
+            for child in &node.children {
+                if let Some(found) = Self::find_node(child, target) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
     pub fn toggle_selected(&mut self) {
         let Some((path, _)) = self.visible_cache.get(self.selected).cloned() else {
             return;
